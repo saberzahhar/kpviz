@@ -1,0 +1,17 @@
+# KPViz — core
+dash>=2.17
+duckdb>=1.0
+matplotlib>=3.8
+PyStemmer>=2.2          # C stemmer — the fast path (snowballstemmer = fallback)
+snowballstemmer>=2.2
+orjson>=3.9             # faster jsonl parsing in scan workers (optional at runtime)
+
+# Exact tokenizers (context-window analysis; auto-degrades to flagged
+# approximations when missing/offline)
+tokenizers>=0.15
+tiktoken>=0.6
+
+# POS tagging of gold keyphrases (panels stay hidden when missing)
+spacy>=3.8,<3.9
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+fr_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl
