@@ -1270,15 +1270,21 @@ def _load_scores(con, found: dict):
     new_sigs = {}
     for rel, f in sorted(score_files.items()):
         STATE.log_line(f"loading similarity scores ({rel})")
+        # Accept both key spellings: the README documents dataset_a/doc_id_a,
+        # older trees use dataset_A/doc_id_A (JSON keys are case-sensitive).
         db.execute("""
             INSERT INTO leakage
-            SELECT dataset_A, CAST(doc_id_A AS VARCHAR),
-                   dataset_B, CAST(doc_id_B AS VARCHAR),
-                   CAST(score AS DOUBLE), label
-            FROM read_json(?, format='newline_delimited', columns={
-                'dataset_A':'VARCHAR','doc_id_A':'VARCHAR',
-                'dataset_B':'VARCHAR','doc_id_B':'VARCHAR',
-                'score':'DOUBLE','label':'VARCHAR'})""", str(f["path"]))
+            SELECT COALESCE(json_extract_string(json, '$.dataset_A'),
+                            json_extract_string(json, '$.dataset_a')),
+                   COALESCE(json_extract_string(json, '$.doc_id_A'),
+                            json_extract_string(json, '$.doc_id_a')),
+                   COALESCE(json_extract_string(json, '$.dataset_B'),
+                            json_extract_string(json, '$.dataset_b')),
+                   COALESCE(json_extract_string(json, '$.doc_id_B'),
+                            json_extract_string(json, '$.doc_id_b')),
+                   TRY_CAST(json_extract_string(json, '$.score') AS DOUBLE),
+                   json_extract_string(json, '$.label')
+            FROM read_ndjson_objects(?)""", str(f["path"]))
         done += f["size"]
         STATE.add_work("scores", done=f["size"])
         STATE.step("scores", done=done)
