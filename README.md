@@ -2,6 +2,12 @@
 
 A local, reproducible cockpit for keyphrase extraction/generation evaluation.
 
+**Paper:** Saber Zahhar, Christophe Rodrigues, Nédra Mellouli and Nicolas Travers.
+*KPViz: A Framework for Keyphrase Prediction Experiments.* JCDL '26.
+https://doi.org/10.1145/3805696.3846518
+**Demo video:** https://youtu.be/WS2iCDfloYM ·
+**Archive (code + demo data):** https://doi.org/10.5281/zenodo.22789345
+
 KPViz scans a folder of dataset, model and architecture **cards** plus the
 inference runs produced against them, derives an analytical store (DuckDB,
 byte-offset indices — your corpus is never copied), and serves a web app:
@@ -33,13 +39,15 @@ what is new, modified or deleted, in parallel across all CPU cores, with
 per-step progress and an ETA.
 
 **Demo data.** A full demo tree (five datasets, seven models, three
-architectures, seventy-five runs) is available here:
+architectures, seventy-five runs) is archived on Zenodo:
 
-> https://drive.google.com/drive/folders/136Gj3Gv_rMyZHwdmBWIge0kI1BIAlQpj?usp=drive_link
+> https://doi.org/10.5281/zenodo.22789345
+
+(mirror: https://drive.google.com/drive/folders/136Gj3Gv_rMyZHwdmBWIge0kI1BIAlQpj)
 
 Download it and place it as a `data/` folder at the repository root, then run
-`python app.py`. A smaller `sample_data/` tree is bundled for an immediate
-first look.
+`python app.py`. `app.py` needs a `data/` folder (or a `sample_data/` folder,
+or `--data PATH`) to start; the repository itself ships no data.
 
 Optional: any TeX distribution (TeX Live, MiKTeX) enables PGF-typeset PDF
 exports — the figure is then set in your paper's own fonts. Without TeX,
@@ -155,6 +163,8 @@ run costs are resolved against these — never invented.
 One pair per line; used by the data-quality workbench (e.g. train→test
 leakage against a model's own supervision data).
 
+Both key spellings are accepted (`dataset_a`/`doc_id_a` and `dataset_A`/`doc_id_A`).
+
 ```jsonc
 { "dataset_a": "kp20k", "doc_id_a": "…", "dataset_b": "kpbiomed", "doc_id_b": "…",
   "score": 0.93, "label": "near-duplicate" }
@@ -213,10 +223,36 @@ Every scan archives its exact per-step timings to `.kpviz/scan_stats/`.
 The `tools/` folder contains the verification harnesses used to check the
 platform itself (metric parity between the SQL and Python paths, LaTeX
 compilation of exports, headless scans); each takes `--data`/`--state` and
-runs against any tree.
+runs against any tree. `tools/kpviz_scaling_benchmark.py` is the self-contained
+scaling benchmark behind Table 2 of the paper (`pip install nltk PyStemmer`,
+then `python tools/kpviz_scaling_benchmark.py`); its original output is in
+`docs/benchmark_results_jcdl26.txt`.
 
 ## Status
 
 KPViz is under active development. The data contract above is stable; the
 set of insights, statistics and supported card fields will keep growing.
 Issues and suggestions are welcome.
+
+## Citation
+
+If you use KPViz, please cite:
+
+```bibtex
+@inproceedings{zahhar2026kpviz,
+  author    = {Zahhar, Saber and Rodrigues, Christophe and Mellouli, N{\'e}dra and Travers, Nicolas},
+  title     = {{KPViz}: A Framework for Keyphrase Prediction Experiments},
+  booktitle = {The 2026 ACM/IEEE Joint Conference on Digital Libraries (JCDL '26)},
+  series    = {JCDL '26},
+  year      = {2026},
+  publisher = {Association for Computing Machinery},
+  address   = {New York, NY, USA},
+  location  = {Frisco, TX, USA},
+  isbn      = {979-8-4007-2597-5},
+  doi       = {10.1145/3805696.3846518}
+}
+```
+
+## License
+
+See [LICENSE](LICENSE).

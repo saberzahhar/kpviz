@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+message: "If you use KPViz, please cite the JCDL '26 paper listed under preferred-citation."
+type: software
+title: "KPViz"
+abstract: >-
+  A local, reproducible cockpit for keyphrase extraction and generation
+  evaluation: it scans dataset, model and architecture cards plus inference
+  runs, derives an analytical store and serves explorers and research-question
+  workbenches with camera-ready LaTeX/PGF export.
+authors:
+  - family-names: Zahhar
+    given-names: Saber
+    affiliation: Devoteam
+    email: saber.zahhar@devoteam.com
+  - family-names: Rodrigues
+    given-names: Christophe
+    affiliation: De Vinci Higher Education
+  - family-names: Mellouli
+    given-names: Nédra
+    affiliation: De Vinci Higher Education
+  - family-names: Travers
+    given-names: Nicolas
+    affiliation: De Vinci Higher Education
+repository-code: "https://github.com/saberzahhar/kpviz"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.22789345"
+    description: "Zenodo archive of the code and demo data"
+keywords:
+  - keyphrase generation
+  - keyphrase extraction
+  - evaluation
+  - digital libraries
+  - reproducibility
+  - visual analytics
+preferred-citation:
+  type: conference-paper
+  title: "KPViz: A Framework for Keyphrase Prediction Experiments"
+  authors:
+    - family-names: Zahhar
+      given-names: Saber
+    - family-names: Rodrigues
+      given-names: Christophe
+    - family-names: Mellouli
+      given-names: Nédra
+    - family-names: Travers
+      given-names: Nicolas
+  collection-title: "The 2026 ACM/IEEE Joint Conference on Digital Libraries (JCDL '26)"
+  conference:
+    name: "JCDL '26"
+    city: Frisco
+    region: TX
+    country: US
+    date-start: 2026-10-13
+    date-end: 2026-10-16
+  publisher:
+    name: Association for Computing Machinery
+    city: New York
+    country: US
+  year: 2026
+  isbn: "979-8-4007-2597-5"
+  doi: "10.1145/3805696.3846518"
+  url: "https://doi.org/10.1145/3805696.3846518"
