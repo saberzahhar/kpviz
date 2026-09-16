@@ -21,6 +21,7 @@ authors:
   - family-names: Travers
     given-names: Nicolas
     affiliation: De Vinci Higher Education
+license: Apache-2.0
 repository-code: "https://github.com/saberzahhar/kpviz"
 identifiers:
   - type: doi
