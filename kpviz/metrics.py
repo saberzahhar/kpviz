@@ -183,7 +183,13 @@ class PerDoc(Mapping):
 
     def select(self, doc_ids, inside: bool = True) -> np.ndarray:
         """Scores of the documents in (or not in) `doc_ids`."""
-        mask = np.isin(self.ords, self.index.ords(doc_ids))
+        return self.select_ords(self.index.ords(doc_ids), inside)
+
+    def select_ords(self, ords: np.ndarray, inside: bool = True) -> np.ndarray:
+        """Same, from ordinals already resolved on this index: a caller that
+        filters many runs by one document set resolves the ids once
+        (RQ2 did it per run: 60 × 10 ms for 33 k flagged documents)."""
+        mask = np.isin(self.ords, ords, assume_unique=True)
         return self.vals[mask if inside else ~mask]
 
     @property

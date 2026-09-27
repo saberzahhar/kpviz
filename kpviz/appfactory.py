@@ -105,6 +105,7 @@ def build_app() -> dash.Dash:
     start_tex_probe()
     from .metrics import enable_warm, warm_async
     enable_warm()
+    scanner.enable_preload()
     if db.scan_version():
         warm_async()
 

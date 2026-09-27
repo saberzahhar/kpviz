@@ -106,7 +106,10 @@ STEPS = [
     ("finalize", "Aggregates, metrics & cache"),
 ]
 
-_EVAL_SPLIT_SQL = "lower(coalesce(d.split,'')) NOT IN ('train','training')"
+# the SQL twin of derive.is_train_split (train, training, train_large, …)
+TRAIN_SPLIT_SQL = ("regexp_matches(lower(trim(coalesce({col}, ''))), "
+                   "'^train(ing)?([_-].*)?$')")
+_EVAL_SPLIT_SQL = "NOT " + TRAIN_SPLIT_SQL.format(col="d.split")
 # stand-in for a NULL split so equality joins work (no split may equal it)
 _NULL_SPLIT = "@@kpviz_null_split@@"
 
@@ -141,7 +144,11 @@ def _mp_context():
     does not exist in an interactive session (`python -c`, a notebook). There
     we fall back to `fork` and say so in the scan log."""
     import __main__
-    main_ok = bool(getattr(__main__, "__file__", None))
+    # a *file* the children can re-import: `python - <<EOF` sets __file__
+    # to "<stdin>", which passed a plain truthiness check and crashed every
+    # forkserver child ("No such file or directory: '<stdin>'")
+    main_file = getattr(__main__, "__file__", None)
+    main_ok = bool(main_file) and os.path.isfile(main_file)
     methods = mp.get_all_start_methods()
     if main_ok:
         for name in ("forkserver", "spawn"):
@@ -152,6 +159,46 @@ def _mp_context():
                        "using fork for workers")
         return mp.get_context("fork")
     return mp.get_context()
+
+
+_FORKSERVER_PREPARED = [False]
+# the server scans again and again from one forkserver: preloading pays for
+# itself from the second scan on. A one-shot command-line scan of an
+# English-only tree is ~1 s faster without it (four workers import spaCy in
+# parallel instead of the forkserver importing it once, serially), while a
+# French tree saves ~2 s even in one shot (measured; plan D12).
+_PRELOAD_ALWAYS = [False]
+
+
+def enable_preload() -> None:
+    """Called by the server at start-up (repeat scans)."""
+    _PRELOAD_ALWAYS[0] = True
+
+
+def _prepare_forkserver(ctx, idx) -> None:
+    """Before the forkserver starts (once per process), have it import the
+    worker modules and build the tokenizers of the languages the catalog
+    declares (kpviz._preload): every worker of every later scan forks from
+    it instead of importing spaCy — and compiling French's tokenizer regex,
+    3.8 s — on its own. Ignored for spawn/fork contexts and once started."""
+    if _FORKSERVER_PREPARED[0] or ctx.get_start_method() != "forkserver":
+        return
+    if os.environ.get("KPVIZ_NO_PRELOAD"):
+        return
+    _FORKSERVER_PREPARED[0] = True
+    langs = {"en"}
+    try:
+        for card in idx.datasets.values():
+            langs.update(l[:2].lower() for l in card.languages if l)
+    except Exception:
+        pass
+    if not _PRELOAD_ALWAYS[0] and langs <= {"en"}:
+        return
+    os.environ["KPVIZ_PRELOAD_LANGS"] = ",".join(sorted(langs))
+    try:
+        ctx.set_forkserver_preload(["kpviz._preload"])
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -430,7 +477,7 @@ def _eff_chunk(size: int) -> int:
     enough that one file still fans out across the pool."""
     st = settings()
     per_worker = max(1, size // max(1, st.workers * 3))
-    return max(4 * 1024 * 1024, min(st.chunk_bytes, per_worker))
+    return max(1024 * 1024, min(st.chunk_bytes, per_worker))
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +574,7 @@ def _do_scan(full_rehash: bool):
     def get_pool():
         nonlocal pool
         if pool is None:
+            _prepare_forkserver(ctx, idx)
             pool = ProcessPoolExecutor(
                 max_workers=st.workers, mp_context=ctx,
                 initializer=derive.init_worker,
@@ -956,27 +1004,35 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
     expect = {s_: v["status"] for s_, v in (tok_info or {}).items()}
 
     def jobs_iter():
+        # every chunk of every collection, largest first (longest-processing-
+        # time scheduling): a big chunk submitted last would leave the other
+        # workers idle while it finishes
+        chunks = []
         for j in doc_jobs:
-            f, card, ds = j["f"], j["card"], j["ds"]
+            f, ds = j["f"], j["ds"]
             STATE.log_line(f"deriving documents of “{ds}”")
-            combined = len(card.annotations) > 1
             for i, (a, b) in enumerate(line_chunks(f["path"], _eff_chunk(f["size"]))):
                 per_rel[j["rel"]]["remaining"] += 1
-                yield {
-                    "path": str(f["path"]), "start": a, "end": b,
-                    "dataset": ds, "file_id": f["file_id"],
-                    "out_dir": str(st.tmp_dir), "tag": f"{ds}_{i}",
-                    "rel": j["rel"],
-                    "card": {"sections": {k: declared_langs(v if isinstance(v, dict) else None)
-                                          for k, v in card.sections.items()},
-                             "anns": {k: declared_langs(v if isinstance(v, dict) else None)
-                                      for k, v in card.annotations.items()},
-                             "combined": combined},
-                    "tokenizers": sorted(needed_tokenizers.get(ds, [])),
-                    "tok_expect": expect,
-                    "tok_cache": str(st.tokenizer_cache),
-                    "token_scope": st.token_scope, "gold_scope": st.gold_scope,
-                }
+                chunks.append((b - a, i, a, b, j))
+        chunks.sort(key=lambda c: -c[0])
+        for _size, i, a, b, j in chunks:
+            f, card, ds = j["f"], j["card"], j["ds"]
+            combined = len(card.annotations) > 1
+            yield {
+                "path": str(f["path"]), "start": a, "end": b,
+                "dataset": ds, "file_id": f["file_id"],
+                "out_dir": str(st.tmp_dir), "tag": f"{ds}_{i}",
+                "rel": j["rel"],
+                "card": {"sections": {k: declared_langs(v if isinstance(v, dict) else None)
+                                      for k, v in card.sections.items()},
+                         "anns": {k: declared_langs(v if isinstance(v, dict) else None)
+                                  for k, v in card.annotations.items()},
+                         "combined": combined},
+                "tokenizers": sorted(needed_tokenizers.get(ds, [])),
+                "tok_expect": expect,
+                "tok_cache": str(st.tokenizer_cache),
+                "token_scope": st.token_scope, "gold_scope": st.gold_scope,
+            }
 
     def on_result(res):
         info = per_rel[res["rel"]]
@@ -1049,29 +1105,44 @@ def _build_gold_pack(con, ds: str, path: Path) -> int:
     keyphrases span several languages (a multilingual @combined union) keeps
     one language per keyphrase, so predictions are matched in each one's own
     language."""
-    rows = db.q(f"""
+    # written by DuckDB itself (COPY … FORMAT JSON): the same objects the
+    # Python loop built — {"_id", "langs": {ann: lang | [langs]}, "gold":
+    # {ann: [[stems]]}} — without fetching every document's lists into
+    # Python and re-serialising them (39 k small loops for one dataset)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sql = f"""
+        COPY (
         WITH g1 AS (
-            SELECT g.doc_id, g.ann_key, g.kp_idx, g.stems, g.lang
+            SELECT g.doc_id, g.ann_key, g.kp_idx,
+                   coalesce(g.stems, []::VARCHAR[]) AS stems, g.lang
             FROM gold g
-            WHERE g.dataset = ?
+            WHERE g.dataset = $ds
               AND EXISTS (SELECT 1 FROM documents d
                           WHERE d.dataset = g.dataset AND d.doc_id = g.doc_id
                             AND ({_EVAL_SPLIT_SQL} OR len(d.flags) > 0))
             QUALIFY row_number() OVER (PARTITION BY g.doc_id, g.ann_key, g.kp_idx
-                                       ORDER BY g.kp_idx) = 1)
-        SELECT doc_id, ann_key, list(stems ORDER BY kp_idx),
-               list(coalesce(lang, '') ORDER BY kp_idx)
-        FROM g1 GROUP BY 1, 2 ORDER BY 1, 2""", ds)
-    packed: dict[str, dict] = {}
-    for doc_id, ann_key, stems, langs in rows:
-        e = packed.setdefault(doc_id, {"_id": doc_id, "langs": {}, "gold": {}})
-        distinct = {l for l in langs if l}
-        e["langs"][ann_key] = (list(langs) if len(distinct) > 1
-                               else (next(iter(distinct)) if distinct else None))
-        e["gold"][ann_key] = [list(v or []) for v in stems]
-    path.write_bytes(b"")                 # keep it readable even when empty
-    derive._write_ndjson(path, list(packed.values()))
-    return len(packed)
+                                       ORDER BY g.kp_idx) = 1),
+        pa AS (
+            SELECT doc_id, ann_key, list(stems ORDER BY kp_idx) AS gold,
+                   list(coalesce(lang, '') ORDER BY kp_idx) AS langs,
+                   list_distinct(list_filter(list(lang), x -> x IS NOT NULL
+                                             AND x <> '')) AS distinct_l
+            FROM g1 GROUP BY 1, 2),
+        pb AS (
+            SELECT doc_id, ann_key, gold,
+                   CASE WHEN len(distinct_l) > 1 THEN to_json(langs)
+                        WHEN len(distinct_l) = 1 THEN to_json(distinct_l[1])
+                        ELSE 'null'::JSON END AS lang_j
+            FROM pa)
+        SELECT doc_id AS _id,
+               map_from_entries(list({{'key': ann_key, 'value': lang_j}})) AS langs,
+               map_from_entries(list({{'key': ann_key, 'value': gold}})) AS gold
+        FROM pb GROUP BY doc_id
+        ) TO '{str(path).replace("'", "''")}' (FORMAT JSON)"""
+    with db._wlock:
+        con.execute(sql, {"ds": ds})
+    with open(path, "rb") as f:                   # one JSON object a line
+        return sum(chunk.count(b"\n") for chunk in iter(lambda: f.read(1 << 20), b""))
 
 
 def _pred_tasks(job: dict, target: int):

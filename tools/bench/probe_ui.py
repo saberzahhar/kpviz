@@ -92,7 +92,16 @@ def main() -> int:
                     status = r.response().status if r.response() else 0
                 except Exception:
                     size, status = 0, 0
-                calls.append((hit[0], time.time(), hit[1], size, status))
+                # the browser's own timing of the round trip: Playwright
+                # delivers events late while the page is busy rendering, so
+                # time.time() at delivery overstated server latency by the
+                # render time of whatever the response drew
+                try:
+                    end = r.timing.get("responseEnd", -1)
+                    dur = end / 1000.0 if end and end > 0 else time.time() - hit[0]
+                except Exception:
+                    dur = time.time() - hit[0]
+                calls.append((hit[0], hit[0] + dur, hit[1], size, status))
 
         page.on("request", on_req)
         page.on("requestfinished", on_done)

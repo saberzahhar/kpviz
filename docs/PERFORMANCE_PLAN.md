@@ -1,6 +1,6 @@
 # KPViz performance plan: memory, parallel workers, efficiency, latency
 
-Status: **revision 3**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
+Status: **revision 4**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
 
 This plan covers everything that affects how fast KPViz responds, how much memory it holds, and how well it uses the machine's cores, from the first scan to the last click of the demo. Each action names the code it touches, how to change it, the measured reason for it, and the check that closes it.
 
@@ -934,7 +934,7 @@ Status: **done** = implemented and verified on this branch; **partial** = the pa
 | B10 | URL state | after | B1 | open | — |
 | B11 | waitress | after | — | open | Flask threaded server kept |
 | C1 | One-statement scoring | 2 | A5 | done | parity grid; RQ1/RQ4 ≤ 0.13 s, RQ2 0.45 s |
-| C2 | NumPy fetch | 2 | — | done | `db.qnp`; gold packs built by one SQL aggregation |
+| C2 | NumPy fetch | 2 | — | done | `db.qnp`; gold packs written by DuckDB itself (`COPY … FORMAT JSON`, 1.25 → 0.58 s) |
 | C3 | Per-doc arrays over a doc index | 2 | C1 | done | `metrics.DocIndex`, `PerDoc`; stats vectorised, identical ranks and ties |
 | C4 | Byte LRU + single-flight | 2 | — | done | `ByteLRU`, 192 MB default |
 | C5 | No UI writes to DuckDB | 2 | C18 | done | colours in `colors.json`; `agg_cache` removed |
@@ -979,8 +979,8 @@ Status: **done** = implemented and verified on this branch; **partial** = the pa
 | D10a | Signature from derivation-relevant card fields | 2 | — | done | `test_description_edit_rederives_nothing` |
 | D10b–d | Append / per-batch / gold-hash incrementality | after | D14 | open | — |
 | D11 | Hash while reading | after | C13 | open | C13 covers correctness; the double read remains |
-| D12 | forkserver preload | after | — | deferred | experiment with named traps |
-| D13 | Longest-first, POS overlap | after | — | open | — |
+| D12 | forkserver preload | 3 | — | done | `kpviz/_preload.py`: thread pools pinned before NumPy; tokenizers of the declared languages built once; always in the server, in one-shot scans only for non-English trees (measured both ways, Section 6.6) |
+| D13 | Longest-first, POS overlap | 3 / after | — | partial | (a) document chunks of every collection submitted largest first; POS overlap open |
 | D14 | Atomic generations | 2 (cheap) / after (full) | — | partial | failed or cancelled scans invalidate caches and force a full next pass |
 | D15 | Scan lock + cancel points | 1 | — | done | `test_concurrent_start_starts_one_scan` |
 | D16 | Compaction | after | D14 | open | — |
@@ -1069,6 +1069,25 @@ Callbacks called directly on the scaled store, result cache cleared (cold) and r
 | RQ5 hyperparameters (3 datasets, Friedman) | 0.34 s | 0.10 s |
 
 In the browser (probe): first load 0.29 s; export PDF typeset through pdflatex 1.7 s, PNG 1.0 s.
+
+### 6.6 Revision 4: a real card set, and a function-level pass
+
+Verified on the authors' own cards (7 models, 3 architectures, 51,825 similarity pairs) with documents and runs synthesised around them by `tools/synth_tree.py` (62.9 k documents, 137 runs, 83 MB). Everything resolves, costs and renders; the planted problems — and only those — are flagged. The pass below was profiled with `tools/bench/profile_scan.py` (every worker task's own cProfile, merged).
+
+| Finding (function) | Fix | Effect |
+|---|---|---|
+| Every worker compiled spaCy's French tokenizer-exception regex (3.8 s each) | forkserver preload of the declared languages (D12) | inferences phase 7.4 → 1.4 s on this tree |
+| DuckDB's client tries `import pandas` for every bound parameter; failed imports are not cached, so each walked `sys.path` | mark genuinely absent optional modules as absent once (`db._mark_missing_optional_modules`) | RQ1 0.17 → 0.02 s warm; every query cheaper |
+| RQ2 resolved the same flagged document set to ordinals once per run, and re-ran the similarity join on every call | `PerDoc.select_ords`, one resolution per distinct set; leak sets memoised per catalog version | RQ2 1.26 → 0.38 s |
+| Gold packs fetched every document's lists into Python and re-serialised them | `COPY … FORMAT JSON` straight from DuckDB | 1.25 → 0.58 s |
+| `kv_set_many` was an `executemany` (1.5 ms a row) | one `unnest` insert | 0.40 → 0.08 s |
+| Document chunks submitted in dataset order, 4 MB minimum | largest first, 1 MB minimum | worker tail removed |
+| `detect_language` counted per token in Python | C-level filter + `Counter` | −40 % per call, identical output |
+| `python - <<EOF` scans crashed every forkserver child (`__file__ == "<stdin>"`) | require a real file | bug fixed |
+| Size-named training splits (`train_large`) counted as evaluation data | one training-split rule in Python and SQL | correctness fix |
+| `tiktoken[llama3]` said "not cached locally" — tiktoken has no such encoding | say so, and what would work | clarity |
+
+Measured on this machine (cold scan, fresh process): the authors' card tree 11.3 s (no-op re-scan 0.14 s), peak 783 MB; workbenches cold (result cache cleared) RQ1 0.27 s · RQ2 0.48 s (its 51 k-pair similarity join included, then memoised) · RQ3 0.14–0.21 s · RQ4 0.12 s · RQ5 0.10 s; warm ≤ 0.19 s. The 296 MB synthetic tree: 24.2 s cold (25.9 s in revision 3), no-op 0.21 s. Derived tables are byte-identical before and after every change in this pass (`fingerprint.py`).
 
 ---
 

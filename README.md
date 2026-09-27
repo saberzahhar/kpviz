@@ -262,6 +262,10 @@ python -m pytest tests                  # contract, parity, statistics vs SciPy,
 python tools/bench/scan_profile.py --data sample_data --state /tmp/st --full
 python tools/bench/probe_ui.py http://127.0.0.1:8050   # against a running app
 python tools/bench/fingerprint.py --state .kpviz   # per-table content hashes
+python tools/bench/profile_scan.py --data TREE --state /tmp/p   # per-function profile, workers included
+
+# your own cards, synthetic documents and runs around them (too-big data stays home)
+python tools/synth_tree.py --cards MY_TREE --out synth_data   # MY_TREE: architectures/ models/ insights/
 ```
 
 The test suite generates its own data tree, checks every SQL score against

@@ -126,8 +126,16 @@ def _iter_lines(path: str, start: int, end: int, bad: list | None = None):
             pos += ln
 
 
+def is_train_split(split: str | None) -> bool:
+    """train, training, and the size-named variants datasets ship
+    (KPBiomed's train_large / train_medium / train_small, train-2020 …)."""
+    s = (split or "").strip().lower()
+    return s in TRAIN_SPLITS or s.startswith(("train_", "train-", "training_",
+                                              "training-"))
+
+
 def is_eval_split(split: str | None) -> bool:
-    return (split or "").lower() not in TRAIN_SPLITS
+    return not is_train_split(split)
 
 
 def _tokenizers(args: dict) -> list:
@@ -143,6 +151,30 @@ def _tokenizers(args: dict) -> list:
 # Documents
 # ---------------------------------------------------------------------------
 
+def _profiled(fn):
+    """KPVIZ_PROFILE_DIR=<dir>: every task writes its cProfile stats there
+    (tools/bench/profile_scan.py merges them). Off by default: one getenv."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(args):
+        where = os.environ.get("KPVIZ_PROFILE_DIR")
+        if not where:
+            return fn(args)
+        import cProfile
+        pr = cProfile.Profile()
+        pr.enable()
+        try:
+            return fn(args)
+        finally:
+            pr.disable()
+            Path(where).mkdir(parents=True, exist_ok=True)
+            pr.dump_stats(str(Path(where) / f"{fn.__name__}-{os.getpid()}-"
+                              f"{time.perf_counter_ns()}.prof"))
+    return run
+
+
+@_profiled
 def derive_doc_chunk(args: dict) -> dict:
     """One byte-range of document.{ds}.jsonl -> spill files."""
     _t0 = time.perf_counter()
@@ -481,6 +513,7 @@ def _match(pstems: list[str], gold_variants: list[list[str]]):
     return pr, gi_hit
 
 
+@_profiled
 def derive_preds_chunk(args: dict) -> dict:
     """Match one or more byte-ranges of batch_XXXXX.jsonl files of one run
     against its dataset's gold pack (loaded once per worker, shared across
@@ -590,6 +623,7 @@ def derive_preds_chunk(args: dict) -> dict:
 # POS phase: unique untagged gold phrases only
 # ---------------------------------------------------------------------------
 
+@_profiled
 def pos_chunk(args: dict) -> dict:
     """args: phrases [[kp, raw], ...], lang, out_dir, tag.
 

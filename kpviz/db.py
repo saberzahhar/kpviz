@@ -30,6 +30,29 @@ import duckdb
 
 from .config import settings
 
+def _mark_missing_optional_modules() -> None:
+    """DuckDB's Python client tries `import pandas` for every bound
+    parameter (2–8 times per query). When pandas is not installed each
+    attempt walks all of sys.path again — failed imports are not cached —
+    which cost 0.21 s of a 0.24 s workbench callback. Recording the
+    module as absent (sys.modules[name] = None, the import system's own
+    "known missing" marker) makes that check free. Only modules that
+    genuinely cannot be found are marked; an installed pandas is untouched."""
+    import importlib.util
+    import sys
+    for name in ("pandas", "polars", "pyarrow"):
+        if name in sys.modules:
+            continue
+        try:
+            missing = importlib.util.find_spec(name) is None
+        except (ImportError, ValueError):
+            missing = True
+        if missing:
+            sys.modules[name] = None
+
+
+_mark_missing_optional_modules()
+
 SCHEMA_VERSION = 5
 
 # Rebuilt on a schema change. `keyphrases` is deliberately absent: its shape
@@ -384,10 +407,12 @@ def kv_set(key: str, value) -> None:
 
 
 def kv_set_many(pairs: dict) -> None:
+    """One statement for any number of keys (executemany paid ~1.5 ms a
+    row: 137 run signatures took 0.2 s)."""
     if not pairs:
         return
-    executemany("INSERT OR REPLACE INTO kv VALUES (?, ?)",
-                [[k, json.dumps(v)] for k, v in pairs.items()])
+    execute("INSERT OR REPLACE INTO kv SELECT unnest(?), unnest(?)",
+            list(pairs), [json.dumps(v) for v in pairs.values()])
 
 
 def kv_get_prefix(prefix: str) -> dict:

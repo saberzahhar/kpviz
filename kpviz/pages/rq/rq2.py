@@ -9,7 +9,8 @@ from __future__ import annotations
 from dash import Input, Output, dcc, html
 
 from ... import db, scanner, ui
-from ...metrics import metric_label, run_scores
+from ...scanner import TRAIN_SPLIT_SQL
+from ...metrics import memo, metric_label, run_scores
 from ...naming import run_labels, run_rows
 from ...stats import fmt_effect, p_str, sig_mark
 from dash import State
@@ -72,6 +73,14 @@ def layout():
 
 def _leak_docs(ds: str, thr: float, label: str | None,
                sup_datasets: set[str] | None) -> set[str]:
+    """Memoised per catalog version (51 k pairs join once per setting)."""
+    key = ("rq2_leak", ds, float(thr), label,
+           None if sup_datasets is None else tuple(sorted(sup_datasets)))
+    return memo(key, lambda: _leak_docs_q(ds, thr, label, sup_datasets))
+
+
+def _leak_docs_q(ds: str, thr: float, label: str | None,
+                 sup_datasets: set[str] | None) -> set[str]:
     """Documents of `ds` flagged through similarity pairs — one query.
 
     sup_datasets: restrict the counterpart side to these datasets' *training*
@@ -93,7 +102,7 @@ def _leak_docs(ds: str, thr: float, label: str | None,
         sql += f"""
         JOIN documents d ON d.dataset = s.other_ds AND d.doc_id = s.other_id
         WHERE s.score >= ? AND s.other_ds IN ({ph})
-          AND lower(coalesce(d.split, '')) IN ('train', 'training')"""
+          AND {TRAIN_SPLIT_SQL.format(col="d.split")}"""
         args += sorted(sup_datasets)
     else:
         sql += " WHERE s.score >= ?"
@@ -171,23 +180,24 @@ def register(app):
         # array arithmetic, so the gold mask is built once instead of 4×N times
         per_all = run_scores(ds, keys, ann, measure, k, prmu=prmu, per_doc=True)
         # the flagged set only varies with the model's supervision datasets
-        sup_cache: dict[frozenset, set[str]] = {}
+        # …and resolved to document ordinals once per distinct set, not per run
+        base_flagged = set(lang_docs) | set(any_leak)
+        flag_ords: dict[frozenset, "object"] = {}
         items = []
         for key in keys:
             model = key[0]
-            flagged = set(lang_docs) | set(any_leak)
-            if "sup_leak" in crit:
-                sup = frozenset(idx.model(model).supervision)
-                if sup:
-                    if sup not in sup_cache:
-                        sup_cache[sup] = _leak_docs(ds, thr or 0.8, label,
-                                                    set(sup))
-                    flagged |= sup_cache[sup]
+            sup = (frozenset(idx.model(model).supervision)
+                   if "sup_leak" in crit else frozenset())
             per = per_all.get(key, {}).get("per_doc")
             if per is None or not len(per):
                 continue
-            items.append((key, per.vals, per.select(flagged, inside=True),
-                          per.select(flagged, inside=False)))
+            if sup not in flag_ords:
+                flagged = base_flagged | (_leak_docs(ds, thr or 0.8, label, set(sup))
+                                          if sup else set())
+                flag_ords[sup] = per.index.ords(flagged)
+            fo = flag_ords[sup]
+            items.append((key, per.vals, per.select_ords(fo, inside=True),
+                          per.select_ords(fo, inside=False)))
 
         # Are flagged documents scored differently from clean ones under this
         # run? Two independent groups; the dagger sits on the (w/o − w/) delta

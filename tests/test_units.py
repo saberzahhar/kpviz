@@ -165,3 +165,20 @@ def test_jsonc():
     from kpviz.util import strip_jsonc
     src = '{"a": "x // not a comment", /* c */ "b": 1 // trailing\n}'
     assert json.loads(strip_jsonc(src)) == {"a": "x // not a comment", "b": 1}
+
+
+def test_training_split_names():
+    """Size-named training splits (KPBiomed's train_large …) are training
+    data in Python and in SQL alike — never evaluated, always leakage
+    counterparts."""
+    import duckdb
+    from kpviz.derive import is_train_split
+    from kpviz.scanner import TRAIN_SPLIT_SQL
+    names = ["train", "Training", "train_large", "train-small", "training_2020",
+             "test", "validation", "dev", "trainee", "", None]
+    want = [True, True, True, True, True, False, False, False, False, False, False]
+    assert [is_train_split(n) for n in names] == want
+    con = duckdb.connect()
+    got = [con.execute(f"SELECT {TRAIN_SPLIT_SQL.format(col='?')}", [n]).fetchone()[0]
+           for n in names]
+    assert got == want
