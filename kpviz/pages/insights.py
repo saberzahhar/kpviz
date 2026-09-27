@@ -4,7 +4,7 @@ from __future__ import annotations
 from dash import ClientsideFunction, Input, Output, dcc, html
 
 from .. import ui
-from ..stats import ALPHAS, ALPHA_DEFAULT, alpha_str
+from ..stats import ADJUST, ALPHAS, ALPHA_DEFAULT, RESAMPLES, alpha_str
 from .rq import rq1, rq2, rq3, rq4, rq5
 
 TABS = [
@@ -27,18 +27,44 @@ def layout():
                               className="rq-tab" + (" active" if key == "rq4" else ""),
                               n_clicks=0)
                   for key, t, _ in TABS], className="rq-tabs"),
-        # one significance level for every workbench: daggers, captions and
-        # exported tables all read this, so a paper cannot mix thresholds
-        ui.filter_row([
-            ui.control("Significance level (daggers)", dcc.Slider(
+        # one inference procedure for every workbench: daggers, intervals,
+        # captions and exported tables all read these, so a paper cannot mix
+        # thresholds, tests or corrections
+        html.Div([
+            html.Div("Statistics", className="stats-bar-title",
+                     title="Applies to every workbench, its captions and its "
+                           "exported tables"),
+            ui.control("Significance level", dcc.Slider(
                 id="ins-alpha", min=0, max=len(ALPHAS) - 1, step=None,
                 marks={i: f"p<{alpha_str(a)}" for i, a in enumerate(ALPHAS)},
                 value=ALPHAS.index(ALPHA_DEFAULT),
-                included=False), 330),
-            html.Div("† marks a two-sided test below this level; every caption "
-                     "states it.", className="muted small",
-                     style={"alignSelf": "flex-end", "paddingBottom": "2px"}),
-        ]),
+                included=False), 300),
+            ui.control("Tests", dcc.Dropdown(
+                id="ins-family", clearable=False, className="dash-dropdown",
+                value="rank", options=[
+                    {"label": "Rank-based — Wilcoxon · Mann–Whitney · Friedman",
+                     "value": "rank"},
+                    {"label": "Mean-based — paired t · Welch t · RM-ANOVA",
+                     "value": "mean"},
+                    {"label": "Resampling — permutation · bootstrap",
+                     "value": "resample"}]), 330),
+            ui.control("Multiple comparisons", dcc.Dropdown(
+                id="ins-adjust", clearable=False, className="dash-dropdown",
+                value="holm",
+                options=[{"label": v, "value": k} for k, v in ADJUST.items()]),
+                220),
+            ui.control("Intervals", dcc.Dropdown(
+                id="ins-ci", clearable=False, className="dash-dropdown",
+                value="t", options=[
+                    {"label": "95 % Student-t", "value": "t"},
+                    {"label": "95 % bootstrap", "value": "bootstrap"},
+                    {"label": "none", "value": "none"}]), 160),
+            ui.control("Resamples", dcc.Dropdown(
+                id="ins-resamples", clearable=False, className="dash-dropdown",
+                value=RESAMPLES, options=[
+                    {"label": f"{n:,}", "value": n}
+                    for n in (1000, 5000, 10000)]), 110),
+        ], className="stats-bar filter-row"),
         *[html.Div(mod.layout(), id=f"panel-{key}",
                    style={"display": "block" if key == "rq4" else "none"})
           for key, _, mod in TABS],

@@ -9,7 +9,8 @@ from .. import db, scanner, ui
 from ..metrics import PRMU, memo, metric_label
 from ..naming import (group_key, natural_key, parse_group_key, run_labels,
                       run_rows)
-from ..stats import ALPHAS, ALPHA_DEFAULT
+from ..stats import (ALPHAS, ALPHA_DEFAULT, RESAMPLES, StatsCfg,
+                     fmt_effect, p_str)
 from ..util import stable_hash
 
 
@@ -42,24 +43,81 @@ def alpha_of(slider_value) -> float:
 
 
 def value_cell(value, n=None, digits: int = 3, signed: bool = False,
-               mark: str = "") -> tuple:
-    """(html cell, plain-text cell) for "0.123 (n=140)" / "+0.045†".
+               mark: str = "", ci: tuple | None = None) -> tuple:
+    """(html cell, LaTeX cell) for "0.123 [0.110, 0.137] (n=140)" / "+0.045†".
 
-    The sample size belongs next to the number it qualifies, not in a column of
-    its own, and a significance mark is a superscript. Returns both renderings
-    so the HTML table and the exported LaTeX row stay in step."""
+    The sample size and the interval belong next to the number they qualify,
+    not in columns of their own, and a significance mark is a superscript.
+    The LaTeX cell is structured ({"v", "lo", "hi", "n", "mark", ...}), so
+    the exported table can choose how much of it to print (export options)
+    while the HTML table and the LaTeX row stay in step."""
     if value is None:
         return html.Span("—", className="muted"), "—"
     num = f"{value:+.{digits}f}" if signed else f"{value:.{digits}f}"
     kids = [num]
-    txt = num
     if mark:
         kids.append(html.Sup(mark))
-        txt += f" {mark}"
+    lo, hi = ci if ci else (None, None)
+    if lo is not None and hi is not None:
+        f = (lambda v: f"{v:+.{digits}f}") if signed else (lambda v: f"{v:.{digits}f}")
+        kids.append(html.Span(f" [{f(lo)}, {f(hi)}]", className="ci"))
     if n is not None:
         kids.append(html.Span(f" (n={n})", className="muted"))
-        txt += f" (n={n})"
-    return html.Span(kids), txt
+    return html.Span(kids), {"v": value, "lo": lo, "hi": hi, "n": n,
+                             "mark": mark, "signed": signed, "digits": digits}
+
+
+# ---- statistics settings (Insights → Statistics) ---------------------------
+
+STATS_IDS = ("ins-alpha", "ins-family", "ins-adjust", "ins-ci", "ins-resamples")
+
+
+def stats_inputs():
+    """Every workbench that tests something listens to all five settings."""
+    from dash import Input
+    return [Input(i, "value") for i in STATS_IDS]
+
+
+def stats_cfg(alpha_ix, family=None, adjust=None, ci=None, resamples=None) -> StatsCfg:
+    return StatsCfg(alpha=alpha_of(alpha_ix), family=family or "rank",
+                    adjust=adjust or "holm", ci=ci or "t",
+                    resamples=resamples or RESAMPLES)
+
+
+_ADJ_SHORT = {"holm": "Holm", "bonferroni": "Bonf.", "bh": "BH"}
+
+
+def p_cells(p, p_adj, cfg: StatsCfg, applicable: bool = True) -> list[tuple]:
+    """[(html, tex)] for the raw p and — when a correction is on — the
+    adjusted p that the dagger actually follows. `applicable=False` (no
+    second condition to compare with) prints a dash, not "n<6"."""
+    def one(v, strong=False):
+        if not applicable:
+            return html.Span("—", className="muted"), "—"
+        txt = p_str(v, "n<6")
+        node = html.B(txt) if (strong and v is not None and v < cfg.alpha) else txt
+        return html.Span(node, className="" if v is not None else "muted"), txt
+    out = [one(p, strong=cfg.adjust == "none")]
+    if cfg.adjust != "none":
+        out.append(one(p_adj, strong=True))
+    return out
+
+
+def p_headers(cfg: StatsCfg) -> list[str]:
+    return ["p"] + ([f"p ({_ADJ_SHORT[cfg.adjust]})"]
+                    if cfg.adjust != "none" else [])
+
+
+def effect_cell(e) -> tuple:
+    txt = fmt_effect(e)
+    return (html.Span(txt, className="muted" if txt == "—" else ""), txt)
+
+
+def stats_note(cfg: StatsCfg, design: str, n_tests: int) -> html.Div:
+    """The methods sentence under a table, as it will read in the caption."""
+    return html.Div(["Statistics: ", cfg.method_text(design, n_tests)
+                     + (f"; {cfg.ci_text()}" if cfg.ci_text() else "") + "."],
+                    className="muted small stats-note")
 
 
 def datasets_with_runs() -> list[str]:

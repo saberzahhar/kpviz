@@ -324,3 +324,26 @@ table.kp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 ::-webkit-scrollbar-thumb { background: var(--baseline); border-radius: 99px;
   border: 2px solid var(--page); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- statistics bar (Insights) ---------- */
+.stats-bar { background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 14px 12px; margin-bottom: 14px; }
+.stats-bar-title { font-size: 11.5px; font-weight: 700; color: var(--accent-ink);
+  text-transform: uppercase; letter-spacing: 0.05em; align-self: center;
+  margin-right: 4px; }
+.stats-note { margin: 8px 0 2px; line-height: 1.45; }
+.kp-table .ci { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+
+/* ---------- export options + preview ---------- */
+.exp-opts { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+  margin: 10px 0 2px; padding-top: 10px; border-top: 1px dashed var(--grid); }
+.exp-opt { display: flex; align-items: center; gap: 6px; }
+.exp-opt-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2);
+  white-space: nowrap; }
+.exp-opt .exp-dd { flex: 1; font-size: 12.5px; }
+.btn.ghost { background: transparent; }
+.exp-preview:empty { display: none; }
+.exp-preview { margin-top: 10px; padding: 14px; background: #fff;
+  border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
+.exp-preview .paper-meta { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+.exp-preview img { display: block; box-shadow: 0 0 0 1px var(--grid); }

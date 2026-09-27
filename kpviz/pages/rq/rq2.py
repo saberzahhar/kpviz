@@ -11,15 +11,18 @@ from dash import Input, Output, dcc, html
 from ... import db, scanner, ui
 from ...metrics import metric_label, run_scores
 from ...naming import run_labels, run_rows
-from ...stats import mann_whitney_u, p_str, sig_caption, sig_mark
+from ...stats import fmt_effect, p_str, sig_mark
 from dash import State
 from dash.exceptions import PreventUpdate
 
-from ..insights_common import (alpha_of, ann_options, datasets_with_runs,
-                               effective_runs, figure_block, gate,
+from ..insights_common import (ann_options, datasets_with_runs,
+                               effective_runs, effect_cell, figure_block, gate,
                                metric_caption, metric_controls, models_control,
-                               prmu_arg, resolve_ann, rq_header, runs_control,
-                               selected_runs, value_cell, vis)
+                               p_cells, p_headers, prmu_arg, resolve_ann,
+                               rq_header, runs_control, selected_runs,
+                               stats_cfg, stats_inputs, stats_note, value_cell,
+                               vis)
+from .rq3 import _ci_hover, _pmap
 
 RQ = "rq2"
 
@@ -131,7 +134,7 @@ def register(app):
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-models", "value"),
         Input(f"{RQ}-runs", "value"),
         Input(f"{RQ}-crit", "value"), Input(f"{RQ}-thr", "value"),
-        Input(f"{RQ}-label", "value"), Input("ins-alpha", "value"),
+        Input(f"{RQ}-label", "value"), *stats_inputs(),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
     def update(visible, *args):
@@ -140,13 +143,13 @@ def register(app):
         return (*_update(*inputs), sig)
 
     def _update(ds, measure, k, prmu_sel, ann_choice, models_sel, runs_sel,
-                crit, thr, label, alpha_ix):
+                crit, thr, label, *stat_vals):
         from ...figures import to_plotly
         if not ds:
             return (to_plotly({"kind": "bar", "series": []}), None, "",
                     html.Div("no dataset", className="muted small"))
         idx = scanner.cards()
-        alpha = alpha_of(alpha_ix)
+        cfg = stats_cfg(*stat_vals)
         chosen = effective_runs([ds], models_sel, runs_sel)
         keys = selected_runs(chosen)
         ann = resolve_ann(ds, ann_choice)
@@ -162,16 +165,16 @@ def register(app):
                     if "any_leak" in crit else set())
 
         labels = run_labels(idx, run_rows([ds]))
-        rows_out, table_rows, tex_rows = [], [], []
 
         # one scoring pass for every run: per-document scores answer all four
         # questions (all / excluding flagged / flagged only / the test) in
-        # Python arithmetic, so the gold mask is built once instead of 4×N times
+        # array arithmetic, so the gold mask is built once instead of 4×N times
         per_all = run_scores(ds, keys, ann, measure, k, prmu=prmu, per_doc=True)
         # the flagged set only varies with the model's supervision datasets
         sup_cache: dict[frozenset, set[str]] = {}
+        items = []
         for key in keys:
-            model, arch, run_id = key
+            model = key[0]
             flagged = set(lang_docs) | set(any_leak)
             if "sup_leak" in crit:
                 sup = frozenset(idx.model(model).supervision)
@@ -183,49 +186,67 @@ def register(app):
             per = per_all.get(key, {}).get("per_doc")
             if per is None or not len(per):
                 continue
-            vals_all = per.values_array().tolist()
-            fl = per.select(flagged, inside=True).tolist()
-            cl = per.select(flagged, inside=False).tolist()
-            base = {"mean": sum(vals_all) / len(vals_all), "n": len(vals_all)}
-            excl = ({"mean": sum(cl) / len(cl), "n": len(cl)} if cl
+            items.append((key, per.vals, per.select(flagged, inside=True),
+                          per.select(flagged, inside=False)))
+
+        # Are flagged documents scored differently from clean ones under this
+        # run? Two independent groups; the dagger sits on the (w/o − w/) delta
+        def _st(item):
+            _key, va, fl, cl = item
+            return {"ci_all": cfg.mean_ci(va),
+                    "ci_cl": cfg.mean_ci(cl) if len(cl) > 1 else (None, None),
+                    "ci_fl": cfg.mean_ci(fl) if len(fl) > 1 else (None, None),
+                    "test": cfg.indep(cl, fl) if len(fl) and len(cl) else None}
+        sts = _pmap(_st, items)
+        p_raw = [((st or {}).get("test") or {}).get("p") for st in sts]
+        p_adj = cfg.adjust_all(p_raw)
+        n_tests = sum(p is not None for p in p_raw)
+
+        rows_out, table_rows, tex_rows = [], [], []
+        for (key, va, fl, cl), st, p, pj in zip(items, sts, p_raw, p_adj):
+            model = key[0]
+            t = st["test"] or {}
+            mark = sig_mark(pj, cfg.alpha)
+            base = {"mean": float(va.mean(dtype=float)), "n": len(va)}
+            excl = ({"mean": float(cl.mean(dtype=float)), "n": len(cl)} if len(cl)
                     else {"mean": None, "n": 0})
-            only = ({"mean": sum(fl) / len(fl), "n": len(fl)} if fl else None)
+            only = ({"mean": float(fl.mean(dtype=float)), "n": len(fl)} if len(fl) else None)
             lab = labels.get("||".join(key), model)
-            # Mann-Whitney U: are flagged documents scored differently from
-            # clean ones under this run? That is exactly the tested difference,
-            # so the dagger sits on the (w/o − w/) delta.
-            p = None
-            if fl and cl:
-                _u, p = mann_whitney_u(fl, cl)
-            mark = sig_mark(p, alpha)
-            delta = ((excl["mean"] - only["mean"])
-                     if (only and excl["mean"] is not None
-                         and only["mean"] is not None) else None)
             shift = ((excl["mean"] - base["mean"])
                      if excl["mean"] is not None else None)
             rows_out.append({
                 "label": lab + (f" {mark}" if mark else ""),
                 "x0": base["mean"], "x1": excl["mean"],
                 "x2": only["mean"] if only else None,
-                "hover": [f"{lab}<br>all documents: {base['mean']:.3f} (n={base['n']})",
+                "err": {"x0": st["ci_all"], "x1": st["ci_cl"], "x2": st["ci_fl"]},
+                "hover": [f"{lab}<br>all documents: {base['mean']:.3f} "
+                          + _ci_hover(st["ci_all"]) + f"(n={base['n']})",
                           f"{lab}<br>without flagged: "
-                          + (f"{excl['mean']:.3f} (n={excl['n']})"
+                          + (f"{excl['mean']:.3f} " + _ci_hover(st["ci_cl"])
+                             + f"(n={excl['n']})"
                              if excl["mean"] is not None else "—")
                           + (f"<br>reported score moves {shift:+.3f}"
                              if shift is not None else "")
-                          + f"<br>with flagged: "
-                          + (f"{only['mean']:.3f} (n={only['n']})"
-                             if only and only["mean"] is not None else "—")
-                          + f"<br>MWU w/o vs w/: p={p_str(p)} {mark}",
+                          + (f"<br>Δ (w/o − w/) = {t['diff']:+.3f} "
+                             + _ci_hover((t.get("lo"), t.get("hi")))
+                             + f"<br>{cfg.test_name('indep')}: p={p_str(p)}"
+                             + (f", adjusted {p_str(pj)}"
+                                if cfg.adjust != "none" else "")
+                             + f" {mark}<br>{cfg.effect_name('indep')} = "
+                             + fmt_effect(t.get("effect"))
+                             if t.get("diff") is not None else ""),
                           f"{lab}<br>flagged documents only: "
-                          + (f"{only['mean']:.3f} (n={only['n']})"
-                             if only and only["mean"] is not None else "—")],
+                          + (f"{only['mean']:.3f} " + _ci_hover(st["ci_fl"])
+                             + f"(n={only['n']})" if only else "—")],
             })
-            cells = [value_cell(base["mean"], base["n"]),
-                     value_cell(excl["mean"], excl["n"] or None),
+            cells = [value_cell(base["mean"], base["n"], ci=st["ci_all"]),
+                     value_cell(excl["mean"], excl["n"] or None, ci=st["ci_cl"]),
                      value_cell(only["mean"] if only else None,
-                                only["n"] if only else None),
-                     value_cell(delta, None, signed=True, mark=mark)]
+                                only["n"] if only else None, ci=st["ci_fl"]),
+                     value_cell(t.get("diff"), None, signed=True, mark=mark,
+                                ci=(t.get("lo"), t.get("hi")))]
+            cells += (p_cells(p, pj, cfg, applicable=bool(t))
+                      + [effect_cell(t.get("effect"))])
             table_rows.append([lab] + [c[0] for c in cells])
             tex_rows.append([lab] + [c[1] for c in cells])
 
@@ -239,6 +260,8 @@ def register(app):
         if "any_leak" in crit:
             crit_txt.append(f"similarity ≥ {thr:.2f} to any document "
                             f"({len(any_leak)} docs)")
+        methods = cfg.method_text("indep", n_tests)
+        ci_txt = cfg.ci_text()
         spec = {
             "kind": "dumbbell", "size": "2col",
             "rows": rows_out,
@@ -254,15 +277,20 @@ def register(app):
             "caption": (f"Impact of data-quality filtering on {mlab} for {ds}: "
                         f"score over all evaluated documents vs. excluding "
                         f"documents flagged by {'; '.join(crit_txt) or 'no criterion'}. "
-                        "The dagger marks a significant difference between the "
-                        "flagged and the clean documents themselves (two-sided "
-                        "Mann–Whitney U on per-document scores; "
-                        + sig_caption(alpha) + "). "
+                        + (f"Whiskers: {ci_txt}. " if ci_txt else "")
+                        + "The dagger marks a significant difference between "
+                        "the clean and the flagged documents themselves "
+                        f"({methods}). "
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          [ds])),
         }
-        headers = ["Run", "All", "w/o flag", "w/ flag", "Δ (w/o − w/)"]
+        headers = (["Run", "All", "w/o flag", "w/ flag", "Δ (w/o − w/)"]
+                   + p_headers(cfg) + [cfg.effect_name("indep")])
         spec["table"] = {"headers": headers, "rows": tex_rows,
-                         "label": f"quality-{ds}"}
-        table = ui.table(headers, table_rows, num_cols={1, 2, 3, 4})
+                         "label": f"quality-{ds}",
+                         "notes": f"Statistics: {methods}"
+                                  + (f"; {ci_txt}" if ci_txt else "") + "."}
+        table = html.Div([ui.table(headers, table_rows,
+                                   num_cols=set(range(1, len(headers)))),
+                          stats_note(cfg, "indep", n_tests)])
         return to_plotly(spec), spec, spec["caption"], table

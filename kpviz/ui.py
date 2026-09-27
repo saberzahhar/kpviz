@@ -143,9 +143,40 @@ def export_bar(rq: str):
         return html.Button(label, id={"type": "exp-btn", "rq": rq, "what": what},
                            className="btn small" + (" primary" if primary else ""),
                            n_clicks=0)
+    def opt(kind, label, options, value, width):
+        # remembered per browser: a paper keeps its venue across sessions
+        return html.Div([
+            html.Span(label, className="exp-opt-label"),
+            dcc.Dropdown(id={"type": f"exp-{kind}", "rq": rq}, options=options,
+                         value=value, clearable=False, searchable=False,
+                         persistence=True, persistence_type="local",
+                         className="dash-dropdown exp-dd")],
+            className="exp-opt", style={"minWidth": f"{width}px"})
+    from .figures import VENUES
     return html.Div([
         dcc.Store(id={"type": "fig-spec", "rq": rq}),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
+        html.Div([
+            opt("venue", "Paper", [{"label": v["label"], "value": k}
+                                   for k, v in VENUES.items()], "generic", 250),
+            opt("span", "Width", [{"label": "as designed", "value": "auto"},
+                                  {"label": "one column", "value": "col"},
+                                  {"label": "full text width", "value": "full"}],
+                "auto", 150),
+            opt("height", "Height", [{"label": "compact", "value": "compact"},
+                                     {"label": "standard", "value": "std"},
+                                     {"label": "tall", "value": "tall"}],
+                "std", 115),
+            opt("legend", "Legend", [{"label": "auto", "value": "auto"},
+                                     {"label": "above", "value": "top"},
+                                     {"label": "right", "value": "right"},
+                                     {"label": "none (in caption)", "value": "none"}],
+                "auto", 150),
+            opt("cells", "Table cells", [
+                {"label": "value", "value": "value"},
+                {"label": "value [CI]", "value": "ci"},
+                {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
+        ], className="exp-opts"),
         html.Div([
             dcc.Clipboard(title="copy LaTeX (figure environment)",
                           id={"type": "exp-clip-fig", "rq": rq},
@@ -161,8 +192,13 @@ def export_bar(rq: str):
                       style={"marginRight": "10px", "marginLeft": "-2px"}),
             b("pdf", "PDF", primary=True), b("png", "PNG"),
             b("pgf", ".pgf"), b("zip", "Bundle"),
+            html.Button("Preview", id={"type": "exp-prev", "rq": rq},
+                        className="btn small ghost", n_clicks=0,
+                        title="Show the exported figure at its printed size"),
             html.Span(id={"type": "exp-hint", "rq": rq}, className="hint"),
         ], className="export-bar"),
+        loading(html.Div(id={"type": "exp-preview", "rq": rq},
+                         className="exp-preview")),
     ])
 
 

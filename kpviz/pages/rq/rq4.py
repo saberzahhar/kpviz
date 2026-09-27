@@ -10,13 +10,15 @@ from dash import Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 
 from ... import scanner, ui
-from ...metrics import metric_label, run_scores
+from ...metrics import metric_label, run_scores_many
 from ...naming import encode_runs, group_key, run_labels, run_rows
 from ..insights_common import (ann_options, datasets_with_runs,
                                effective_runs, figure_block, gate,
                                metric_caption, metric_controls, models_control,
                                prmu_arg, resolve_ann, rq_header,
-                               runs_control, selected_runs, vis)
+                               runs_control, selected_runs, stats_cfg,
+                               stats_inputs, value_cell, vis)
+from .rq3 import _ci_hover
 
 RQ = "rq4"
 
@@ -110,7 +112,7 @@ def register(app):
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-unit", "value"),
         Input(f"{RQ}-norm", "value"), Input(f"{RQ}-xscale", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
-        Input(f"{RQ}-labels", "value"),
+        Input(f"{RQ}-labels", "value"), *stats_inputs(),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
     def update(visible, *args):
@@ -119,7 +121,7 @@ def register(app):
         return (*_update(*inputs), sig)
 
     def _update(ds_sel, measure, k, prmu_sel, ann_choice, unit, norm, xscale,
-                models_sel, runs_sel, labels_on):
+                models_sel, runs_sel, labels_on, *stat_vals):
         from ...figures import to_plotly
         ds_sel = ds_sel or []
         empty = to_plotly({"kind": "scatter", "series": []})
@@ -140,11 +142,15 @@ def register(app):
         enc = encode_runs(idx, shown)
         mlab = metric_label(measure, k, prmu)
 
-        # per-dataset scores
-        per_ds_scores: dict[str, dict] = {}
-        for ds in ds_sel:
-            ann = resolve_ann(ds, ann_choice)
-            per_ds_scores[ds] = run_scores(ds, keys, ann, measure, k, prmu=prmu)
+        cfg = stats_cfg(*stat_vals)
+        want_ci = cfg.ci != "none"
+        # per-dataset scores, concurrently; per-document detail only when an
+        # interval is asked for (the unfiltered means come precomputed)
+        per_ds_scores = run_scores_many({
+            ds: dict(dataset=ds, run_keys=keys,
+                     ann_key=resolve_ann(ds, ann_choice), measure=measure, k=k,
+                     prmu=prmu, per_doc=want_ci)
+            for ds in ds_sel})
 
         # cost + coverage per (run, ds) from the runs table
         run_info: dict[tuple, dict] = {}
@@ -158,7 +164,7 @@ def register(app):
             lab = labels.get(gk, key[0])
             e = enc.get(gk, {})
             perfs, costs_t, docs_t, covs, flags = [], [], [], [], []
-            per_ds_txt = []
+            per_ds_txt, per_doc_arrays = [], []
             ok = True
             for ds in ds_sel:
                 sc = per_ds_scores[ds].get(key)
@@ -167,6 +173,8 @@ def register(app):
                     ok = False
                     break
                 perfs.append(sc["mean"])
+                if sc.get("per_doc") is not None:
+                    per_doc_arrays.append(sc["per_doc"].vals)
                 covs.append(info["coverage"] if info["coverage"] is not None else 1.0)
                 c = (info["costs"] or {}).get(unit)
                 per_ds_txt.append(f"{ds}: {sc['mean']:.3f}"
@@ -181,6 +189,7 @@ def register(app):
             if not ok or not perfs:
                 continue
             perf = sum(perfs) / len(perfs)
+            ci = cfg.macro_ci(per_doc_arrays) if want_ci else (None, None)
             cov = min(covs) if covs else 1.0
             alpha = max(0.15, min(1.0, cov))
             cost_known = all(c is not None for c in costs_t)
@@ -188,7 +197,8 @@ def register(app):
                 total = sum(costs_t)
                 x = (total / max(1, sum(docs_t))) if norm == "per_doc" else total
                 known_pts.append((x, perf))
-                hover = (f"<b>{lab}</b><br>{mlab} = {perf:.3f} (macro over "
+                hover = (f"<b>{lab}</b><br>{mlab} = {perf:.3f} "
+                         + _ci_hover(ci) + "(macro over "
                          f"{len(ds_sel)} datasets)<br>{UNIT_LABEL[unit]} = "
                          f"{x:.3g} ({norm.replace('_', ' ')})<br>"
                          f"coverage = {100 * cov:.0f}%<br>"
@@ -203,15 +213,17 @@ def register(app):
                     "size": e.get("size", 11), "alpha": alpha,
                     "text": [lab], "show_text": bool(labels_on),
                     "hover": [hover], "in_legend": not labels_on,
+                    "err": [ci] if ci[0] is not None else None,
                 })
-                table_rows.append([lab, f"{perf:.3f}", f"{x:.3g}",
-                                   ui.pct(cov, 0),
+                pc = value_cell(perf, None, ci=ci if ci[0] is not None else None)
+                table_rows.append([lab, pc, f"{x:.3g}", ui.pct(cov, 0),
                                    ", ".join(sorted(set(flags))) or "—"])
             else:
                 hlines.append({"y": perf, "label": f"{lab} — no {unit}",
                                "color": e.get("color", "#898781"), "dash": True,
                                "alpha": max(0.35, alpha)})
-                table_rows.append([lab, f"{perf:.3f}", "—", ui.pct(cov, 0),
+                pc = value_cell(perf, None, ci=ci if ci[0] is not None else None)
+                table_rows.append([lab, pc, "—", ui.pct(cov, 0),
                                    f"no {unit} cost resolvable"])
 
         fx, fy = _frontier(known_pts)
@@ -243,17 +255,21 @@ def register(app):
                         "dashed horizontal lines carry runs with no resolvable "
                         "cost; marker transparency encodes document coverage"
                         + (f"; {enc_note}" if enc_note else "") + ". The grey "
-                        "staircase is the Pareto frontier. "
+                        "staircase is the Pareto frontier"
+                        + (f"; vertical whiskers: {cfg.ci_text()} of the "
+                           "macro-average" if want_ci else "") + ". "
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          ds_sel)),
         }
         headers = ["Run", mlab, UNIT_LABEL.get(unit, unit), "Coverage", "Notes"]
         spec["table"] = {"headers": headers,
-                         "rows": [[str(c) for c in r] for r in table_rows],
+                         "rows": [[r[0], r[1][1], *[str(c) for c in r[2:]]]
+                                  for r in table_rows],
                          "label": f"pareto-{unit}"}
         note = html.Div(
             f"{len(eligible)} consistent (model, arch, run) triples across "
             f"{len(ds_sel)} dataset(s); {len(hlines)} without resolvable "
             f"{unit}.", className="muted small", style={"margin": "6px 0"})
-        table = ui.table(headers, table_rows, num_cols={1, 2, 3})
+        table = ui.table(headers, [[r[0], r[1][0], *r[2:]] for r in table_rows],
+                         num_cols={1, 2, 3})
         return to_plotly(spec), spec, spec["caption"], html.Div([note, table])

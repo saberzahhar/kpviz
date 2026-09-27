@@ -47,6 +47,63 @@ PATTERNS = ["", "/", "x", "."]
 _MPL_HATCH = {"": None, "/": "///", "x": "xxx", ".": "..."}
 
 SIZES = {"1col": (3.35, 2.5), "2col": (7.0, 3.1), "slide": (7.5, 4.3)}
+
+# Where the figure goes. Widths are the templates' own \columnwidth and
+# \textwidth (in inches), so the exported figure is drawn at the size it is
+# printed and never rescaled — the labels stay at `font` pt. `preamble` is
+# what the venue typesets text with, used when KPViz compiles the PDF itself
+# (a .pgf always takes the fonts of the document it is \input into).
+VENUES = {
+    "generic": {"label": "Generic (article, two-column)", "col": 3.18,
+                "text": 6.50, "font": 8, "twocol": True,
+                "preamble": []},
+    "acl": {"label": "*ACL (ACL · EMNLP · NAACL)", "col": 3.03, "text": 6.30,
+            "font": 9, "twocol": True,
+            "preamble": [r"\usepackage{times}", r"\usepackage{latexsym}"]},
+    "acm": {"label": "ACM (acmart sigconf)", "col": 3.33, "text": 7.00,
+            "font": 8, "twocol": True,
+            "preamble": [r"\usepackage{libertine}",
+                         r"\usepackage[libertine]{newtxmath}"],
+            "fallback": [r"\usepackage{mathptmx}"]},
+    "ieee": {"label": "IEEE (IEEEtran conference)", "col": 3.49, "text": 7.12,
+             "font": 8, "twocol": True,
+             "preamble": [r"\usepackage{mathptmx}"]},
+    "lncs": {"label": "Springer LNCS (single column)", "col": 4.80,
+             "text": 4.80, "font": 8, "twocol": False, "preamble": []},
+    "neurips": {"label": "NeurIPS · ICLR · ICML (single column)",
+                "col": 5.50, "text": 5.50, "font": 9, "twocol": False,
+                "preamble": [r"\usepackage{times}"]},
+}
+HEIGHTS = {"compact": 0.8, "std": 1.0, "tall": 1.3}
+
+
+def geometry(spec: dict) -> tuple[float, float, float]:
+    """(width in, height in, base font pt) of the exported figure.
+
+    Without export options this is the historical size (1col/2col/slide at
+    8 pt). With them: the venue's column or text width, an aspect that suits
+    the span (column figures are taller relative to their width), and the
+    venue's figure font."""
+    size = spec.get("size", "2col")
+    exp = spec.get("export") or {}
+    if size == "slide" or not exp:
+        w, h = SIZES.get(size, SIZES["2col"])
+        return w, h, 8 if size in ("1col", "2col") else 11
+    v = VENUES.get(exp.get("venue") or "generic", VENUES["generic"])
+    span = exp.get("span") or "auto"
+    if span == "auto":
+        span = "col" if size == "1col" else "full"
+    if not v["twocol"]:
+        span_w = v["text"]
+        aspect = 0.62 if size != "1col" else 0.75
+    elif span == "col":
+        span_w, aspect = v["col"], 0.75
+    else:
+        span_w, aspect = v["text"], 0.44
+    if spec.get("aspect"):
+        aspect = spec["aspect"]
+    aspect *= HEIGHTS.get(exp.get("height") or "std", 1.0)
+    return span_w, round(span_w * aspect, 3), v["font"]
 FONT_STACK = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 
 
@@ -219,6 +276,25 @@ def place_labels(spec: dict, geom: str = "plotly") -> dict:
 # Plotly renderer (interactive layer)
 # ===========================================================================
 
+def _err_arrays(ys, err):
+    """(plus, minus) distances for Plotly error bars from (lo, hi) pairs;
+    None where there is no interval."""
+    plus, minus = [], []
+    for y, e in zip(ys, err or []):
+        lo, hi = (e or (None, None))[:2] if e else (None, None)
+        if y is None or lo is None or hi is None:
+            plus.append(None)
+            minus.append(None)
+        else:
+            plus.append(max(0.0, hi - y))
+            minus.append(max(0.0, y - lo))
+    return plus, minus
+
+
+def _has_err(err) -> bool:
+    return bool(err) and any(e and e[0] is not None for e in err)
+
+
 def _plotly_layout(spec: dict) -> dict:
     n_series = len(spec.get("series", []))
     show_legend = spec.get("show_legend",
@@ -243,6 +319,14 @@ def _plotly_layout(spec: dict) -> dict:
         hoverlabel=dict(bgcolor="#ffffff", bordercolor=GRID,
                         font=dict(family=FONT_STACK, size=12, color=INK)),
     )
+    if spec.get("legend") == "right" and show_legend:
+        # many series: a column beside the plot reads better than a block of
+        # rows above it that eats half the height
+        lay["legend"] = dict(orientation="v", yanchor="top", y=1, x=1.01,
+                             xanchor="left", font=dict(size=11, color=INK2),
+                             title=dict(text=spec.get("legend_title") or ""),
+                             groupclick="toggleitem")
+        lay["margin"]["r"] = 12
     # axis scale only when explicitly requested (never force 'linear' onto
     # categorical axes — string categories would coerce to NaN)
     if spec.get("xtickangle"):
@@ -357,6 +441,7 @@ def to_plotly(spec: dict) -> go.Figure:
             colorscale=colorscale, xgap=2, ygap=2,
             text=text, texttemplate="%{text}" if text else None,
             textfont=dict(size=11, color=INK),
+            customdata=h.get("customdata"),
             hovertemplate=h.get("hover", "%{y} × %{x}: %{z:.3f}<extra></extra>"),
             colorbar=dict(thickness=10, outlinewidth=0,
                           tickfont=dict(size=10, color=MUTED))))
@@ -381,6 +466,15 @@ def to_plotly(spec: dict) -> go.Figure:
                 mode="markers", name=name,
                 marker=dict(size=11, color=color,
                             line=dict(color=SURFACE, width=2)),
+                **({"error_x": dict(
+                    type="data", symmetric=False, visible=True,
+                    array=_err_arrays([r.get(kx) for r in rows],
+                                      [(r.get("err") or {}).get(kx) for r in rows])[0],
+                    arrayminus=_err_arrays([r.get(kx) for r in rows],
+                                           [(r.get("err") or {}).get(kx) for r in rows])[1],
+                    thickness=1.1, width=2, color=color)}
+                   if _has_err([(r.get("err") or {}).get(kx) for r in rows])
+                   else {}),
                 customdata=[(r.get("hover") or [])[j]
                             if isinstance(r.get("hover"), list)
                             and len(r["hover"]) > j else "" for r in rows],
@@ -409,6 +503,12 @@ def to_plotly(spec: dict) -> go.Figure:
                 text=s.get("text"),
                 textposition="outside" if s.get("text") else None,
                 textfont=dict(size=12, color=INK2),
+                **({("error_x" if horiz else "error_y"): dict(
+                    type="data", symmetric=False, visible=True,
+                    array=_err_arrays(s[("x" if horiz else "y")], s["err"])[0],
+                    arrayminus=_err_arrays(s[("x" if horiz else "y")], s["err"])[1],
+                    thickness=1.1, width=2.5, color=INK2)}
+                   if _has_err(s.get("err")) else {}),
                 customdata=hover,
                 hovertemplate=("%{customdata}<extra></extra>" if hover
                                else ("%{y}: %{x:.3f}" if horiz
@@ -429,6 +529,24 @@ def to_plotly(spec: dict) -> go.Figure:
                     dash="dash" if s.get("dash") else "solid")
         pos = [anchors.get((si, pi), "middle right")
                for pi in range(len(s.get("text") or []))] or "middle right"
+        band = s.get("band")
+        if band and _has_err(band):
+            pts = [(x, e) for x, e in zip(s["x"], band) if e and e[0] is not None]
+            if pts:
+                fig.add_trace(go.Scatter(
+                    x=[x for x, _e in pts] + [x for x, _e in reversed(pts)],
+                    y=[e[1] for _x, e in pts] + [e[0] for _x, e in reversed(pts)],
+                    fill="toself", fillcolor=s.get("color", "#2a78d6"),
+                    opacity=0.13, line=dict(width=0), hoverinfo="skip",
+                    showlegend=False, legendgroup=s.get("legendgroup")
+                    or s.get("name")))
+        if _has_err(s.get("err")):
+            plus, minus = _err_arrays(s["y"], s["err"])
+            common["error_y"] = dict(type="data", symmetric=False, array=plus,
+                                     arrayminus=minus, thickness=1.1, width=2.5,
+                                     color=s.get("color", INK2))
+        if s.get("legendgroup"):
+            common["legendgroup"] = s["legendgroup"]
         fig.add_trace(go.Scatter(
             x=s["x"], y=s["y"], mode=mode, marker=marker, line=line,
             text=s.get("text"), textposition=pos,
@@ -495,7 +613,14 @@ _TEX_CHARS = {
     "µ": r"$\mu$", "μ": r"$\mu$", "α": r"$\alpha$", "β": r"$\beta$",
     "Δ": r"$\Delta$", "σ": r"$\sigma$", "ρ": r"$\rho$", "λ": r"$\lambda$",
     "∞": r"$\infty$", "√": r"$\surd$", "⚠": "", "◌": "", "◆": r"$\blacklozenge$",
-    "★": r"$\star$", "•": r"$\bullet$", " ": "~", " ": r"\,",
+    "★": r"$\star$", "•": r"$\bullet$",
+    "τ": r"$\tau$", "η": r"$\eta$", "χ": r"$\chi$", "κ": r"$\kappa$",
+    "δ": r"$\delta$", "ε": r"$\varepsilon$", "θ": r"$\theta$",
+    "π": r"$\pi$", "ν": r"$\nu$", "ω": r"$\omega$", "γ": r"$\gamma$",
+    "²": r"$^{2}$", "³": r"$^{3}$", "¹": r"$^{1}$", "½": r"$\frac{1}{2}$",
+    "∈": r"$\in$", "∑": r"$\sum$", "≪": r"$\ll$", "≫": r"$\gg$",
+    "∼": r"$\sim$", "∝": r"$\propto$", "⇒": r"$\Rightarrow$",
+    "✓": r"$\checkmark$", "✗": r"$\times$", " ": "~", " ": r"\,",
     " ": r"\,",
 }
 _TEX_TABLE = str.maketrans(_TEX_CHARS)
@@ -535,8 +660,12 @@ def tex_sanitize(obj, key: str | None = None):
     return obj
 
 
-def _mpl_rc(size: str, pgf: bool) -> dict:
-    base = 8 if size in ("1col", "2col") else 11
+def _mpl_rc(size, pgf: bool) -> dict:
+    """rc for one export; `size` is a spec (venue-aware) or a size name."""
+    if isinstance(size, dict):
+        base = geometry(size)[2]
+    else:
+        base = 8 if size in ("1col", "2col") else 11
     rc = {
         "figure.facecolor": "white", "axes.facecolor": "white",
         "font.size": base, "axes.titlesize": base + 1,
@@ -628,7 +757,7 @@ def render(spec: dict, pgf: bool, fmt: str, **savefig_kw) -> bytes:
         matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
     buf = io.BytesIO()
-    with plt.rc_context(_mpl_rc(spec.get("size", "2col"), pgf)):
+    with plt.rc_context(_mpl_rc(spec, pgf)):
         fig = to_mpl(spec, pgf=pgf)
         try:
             fig.savefig(buf, format=fmt, **savefig_kw)
@@ -653,13 +782,20 @@ def to_mpl(spec: dict, pgf: bool = False):
     if pgf:
         spec = tex_sanitize(spec)
     size = spec.get("size", "2col")
-    figsize = SIZES.get(size, SIZES["2col"])
+    gw, gh, _font = geometry(spec)
+    figsize = (gw, gh)
+    # the legend option from the export controls ("modulation" of the figure)
+    leg = (spec.get("export") or {}).get("legend")
+    if leg and leg != "auto":
+        spec = dict(spec, legend=leg)
+    if gw < 3.6 and size != "1col":
+        size = "1col"          # a column-wide render uses the compact styling
     kind = spec.get("kind", "scatter")
 
     if kind == "pie_grid":
         return _mpl_pie_grid(spec, plt, size, figsize, pgf)
 
-    with plt.rc_context(_mpl_rc(size, pgf)):
+    with plt.rc_context(_mpl_rc(spec, pgf)):
         fig, ax = plt.subplots(figsize=figsize, layout="constrained")
 
         if kind == "heatmap":
@@ -674,15 +810,25 @@ def to_mpl(spec: dict, pgf: bool = False):
                 mid = h.get("zmid", 0)
                 mid = min(max(mid, vmin + 1e-9), vmax - 1e-9)
                 norm = TwoSlopeNorm(vcenter=mid, vmin=vmin, vmax=vmax)
-                im = ax.imshow(z, cmap=cmap, norm=norm, aspect="auto")
+                mesh_kw = dict(cmap=cmap, norm=norm)
             else:
                 cmap = LinearSegmentedColormap.from_list("kpseq", SEQ_RAMP)
-                im = ax.imshow(z, cmap=cmap, vmin=h.get("zmin"),
-                               vmax=h.get("zmax"), aspect="auto")
+                mesh_kw = dict(cmap=cmap, vmin=h.get("zmin"), vmax=h.get("zmax"))
+            # vector cells (pcolormesh), not an image: the PGF backend cannot
+            # stream raster graphics, and vector cells stay sharp in a PDF
+            ny, nx = z.shape
+            im = ax.pcolormesh(_np.arange(nx + 1) - 0.5, _np.arange(ny + 1) - 0.5,
+                               _np.ma.masked_invalid(z), shading="flat",
+                               edgecolors="white", linewidth=0.8, **mesh_kw)
+            ax.set_xlim(-0.5, nx - 0.5)
+            ax.set_ylim(ny - 0.5, -0.5)
             ax.set_xticks(range(len(h["x"])), h["x"], rotation=30,
                           ha="right", rotation_mode="anchor")
             ax.set_yticks(range(len(h["y"])), h["y"])
             ax.grid(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_visible(False)
+            ax.tick_params(length=0)
             if h.get("text"):
                 for i, row in enumerate(h["text"]):
                     for j, t in enumerate(row):
@@ -694,6 +840,10 @@ def to_mpl(spec: dict, pgf: bool = False):
                                     fontsize=max(5.5, (6 if size == "1col" else 7)),
                                     color="white" if dark else INK)
             cb = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
+            # Matplotlib rasterises a colour bar with ≥ 50 levels; PGF cannot
+            # carry rasters, and a vector gradient costs little here
+            if getattr(cb, "solids", None) is not None:
+                cb.solids.set_rasterized(False)
             cb.outline.set_visible(False)
             cb.ax.tick_params(labelsize=6 if size == "1col" else 7, color=MUTED)
         elif kind == "dumbbell":
@@ -706,14 +856,21 @@ def to_mpl(spec: dict, pgf: bool = False):
                     ax.plot([min(xs), max(xs)], [i, i], color=BASELINE,
                             lw=1.4, zorder=1)
             for j, (kx, name, color) in enumerate(points):
-                ax.scatter([r.get(kx) for r in rows], list(ys), s=42,
+                errs = [(r.get("err") or {}).get(kx) for r in rows]
+                if _has_err(errs):
+                    plus, minus = _err_arrays([r.get(kx) for r in rows], errs)
+                    ax.errorbar([_num(r.get(kx)) for r in rows], list(ys),
+                                xerr=[[_num(m) for m in minus],
+                                      [_num(p) for p in plus]],
+                                fmt="none", ecolor=color, elinewidth=0.7,
+                                capsize=1.4, zorder=1 + j)
+                ax.scatter([_num(r.get(kx)) for r in rows], list(ys), s=42,
                            color=color, zorder=2 + j, label=name,
                            edgecolors="white", linewidths=1.2)
             ax.set_yticks(list(ys), [r["label"] for r in rows])
             ax.invert_yaxis()
             ax.grid(axis="y", visible=False)
-            ax.legend(loc="upper left", bbox_to_anchor=(0, 1.12),
-                      ncols=min(3, len(points)))
+            _legend(ax, spec, len(points), (0, 1.12), min(3, len(points)))
         elif kind == "bar":
             horiz = spec.get("orientation") == "h"
             cat_key, val_key = ("y", "x") if horiz else ("x", "y")
@@ -737,6 +894,12 @@ def to_mpl(spec: dict, pgf: bool = False):
                               label=s.get("name", ""), linewidth=0,
                               hatch=hatch, edgecolor=SURFACE)
                 vals = [_num(v) for v in s[val_key]]
+                if _has_err(s.get("err")) and not stacked:
+                    plus, minus = _err_arrays(s[val_key], s["err"])
+                    ekey = "xerr" if horiz else "yerr"
+                    bar_kw[ekey] = [[_num(m) for m in minus], [_num(p) for p in plus]]
+                    bar_kw["error_kw"] = dict(ecolor=INK2, elinewidth=0.6,
+                                              capsize=1.4, capthick=0.6)
                 if horiz:
                     ax.barh(offs, vals, height=width * 0.92, left=bots,
                             **bar_kw)
@@ -765,14 +928,29 @@ def to_mpl(spec: dict, pgf: bool = False):
                               ha="right" if long_cat else "center")
                 ax.grid(axis="x", visible=False)
             if len(spec.get("series", [])) >= 2:
-                ax.legend(loc="upper left", bbox_to_anchor=(0, 1.16),
-                          ncols=min(4, len(spec["series"])))
+                _legend(ax, spec, len(spec["series"]), (0, 1.16),
+                        min(2 if size == "1col" else 4, len(spec["series"])))
         else:  # scatter / line
             anchors = place_labels(raw_spec,
                                    "mpl1col" if size == "1col" else "mpl")
             for si, s in enumerate(spec.get("series", [])):
                 mode = s.get("mode", "markers")
+                y_raw = s["y"]
                 s = dict(s, y=[_num(v) for v in s["y"]])
+                band = s.get("band")
+                if band and _has_err(band):
+                    bx = [x for x, e in zip(s["x"], band) if e and e[0] is not None]
+                    blo = [e[0] for e in band if e and e[0] is not None]
+                    bhi = [e[1] for e in band if e and e[0] is not None]
+                    ax.fill_between(bx, blo, bhi, color=s.get("color", "#2a78d6"),
+                                    alpha=0.14, lw=0, zorder=1)
+                if _has_err(s.get("err")):
+                    plus, minus = _err_arrays(y_raw, s["err"])
+                    ax.errorbar(s["x"], s["y"],
+                                yerr=[[_num(m) for m in minus], [_num(p) for p in plus]],
+                                fmt="none", ecolor=s.get("color", INK2),
+                                elinewidth=0.6, capsize=1.4, capthick=0.6,
+                                zorder=2)
                 if "lines" in mode:
                     ax.plot(s["x"], s["y"], color=s.get("color", "#2a78d6"),
                             lw=s.get("width", 1.6),
@@ -814,8 +992,8 @@ def to_mpl(spec: dict, pgf: bool = False):
                 ax.set_yscale("log")
             handles, labels_ = ax.get_legend_handles_labels()
             if len(labels_) >= 2:
-                ax.legend(loc="upper left", bbox_to_anchor=(0, 1.22),
-                          ncols=2 if size == "1col" else 3)
+                _legend(ax, spec, len(labels_), (0, 1.22),
+                        2 if size == "1col" else 3)
 
         for hl in spec.get("hlines", []):
             ax.axhline(hl["y"], color=hl.get("color", MUTED),
@@ -854,6 +1032,22 @@ def to_mpl(spec: dict, pgf: bool = False):
         if spec.get("title") and size == "slide":
             ax.set_title(spec["title"], loc="left")
         return fig
+
+
+def _legend(ax, spec: dict, n: int, anchor, ncols: int):
+    """Legend placement: above the axes (default), in a column to the right
+    (many entries), or none (the caption carries it)."""
+    where = spec.get("legend") or "auto"
+    if where == "none":
+        return
+    if where == "right":
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), ncols=1,
+                  fontsize="x-small", handlelength=1.6, borderaxespad=0)
+        return
+    rows = -(-n // max(1, ncols))
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.01), ncols=ncols,
+              borderaxespad=0.2, handlelength=1.6, columnspacing=1.0,
+              fontsize="small" if rows > 2 else None)
 
 
 def _log_fmt():

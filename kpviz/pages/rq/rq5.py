@@ -15,13 +15,17 @@ from dash import Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 
 from ... import db, scanner, ui
-from ...metrics import common_ords, memo, metric_label, run_scores, values_at
+from ...metrics import (common_ords, memo, metric_label, run_scores_many,
+                       values_at)
 from ...naming import (natural_key, param_value_str, slot_color, value_key)
-from ...stats import friedman, p_str, sig_caption, sig_mark, wilcoxon_signed_rank
+from ...stats import sig_mark
 from ...util import fmt_num
-from ..insights_common import (alpha_of, ann_options, figure_block, gate,
-                               metric_caption, metric_controls, prmu_arg,
-                               resolve_ann, rq_header, value_cell, vis)
+from ..insights_common import (ann_options, effect_cell, figure_block, gate,
+                               metric_caption, metric_controls, p_cells,
+                               p_headers, prmu_arg, resolve_ann, rq_header,
+                               stats_cfg, stats_inputs, stats_note, value_cell,
+                               vis)
+from .rq3 import _ci_hover, _pmap
 
 RQ = "rq5"
 
@@ -147,7 +151,7 @@ def register(app):
         Input(f"{RQ}-param", "value"), Input(f"{RQ}-model", "value"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
-        Input(f"{RQ}-ann", "value"), Input("ins-alpha", "value"),
+        Input(f"{RQ}-ann", "value"), *stats_inputs(),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
     def update(visible, *args):
@@ -156,7 +160,7 @@ def register(app):
         return (*_update(*inputs), sig)
 
     def _update(param, models_sel, ds_sel, measure, k, prmu_sel, ann_choice,
-                alpha_ix):
+                *stat_vals):
         from ...figures import to_plotly
         empty = to_plotly({"kind": "bar", "series": []})
         var = _models_with_variation()
@@ -167,7 +171,8 @@ def register(app):
                 "pick a parameter and at least one dataset",
                 className="muted small")
         idx = scanner.cards()
-        alpha = alpha_of(alpha_ix)
+        cfg = stats_cfg(*stat_vals)
+        alpha = cfg.alpha
         prmu = prmu_arg(prmu_sel)
         mlab = metric_label(measure, k, prmu)
         models = [m for m in (models_sel or [])
@@ -178,25 +183,37 @@ def register(app):
         # (dataset, model, value); several runs at the same value keep the best
         cells: dict[tuple[str, str], dict] = {}
         illegal_any = False
+        # every (dataset, model) scored in one concurrent batch: one scoring
+        # statement per dataset (all models' runs together), not one per pair
+        plan: dict[str, tuple] = {}
         for ds in ds_sel:
             ann = resolve_ann(ds, ann_choice)
+            keys, meta = [], {}
             for m in models:
-                rows = [(r[1], r[2], r[3], r[4]) for r in _runs_of(ds)
-                        if r[0] == m]
-                keys, meta = [], {}
-                for arch, rid, resj, vj in rows:
+                for mm, arch, rid, resj, vj in _runs_of(ds):
+                    if mm != m:
+                        continue
                     info = (json.loads(resj or "{}").get(param) or {})
                     if info.get("value") is None:
                         continue
                     keys.append((m, arch, rid))
-                    meta[(arch, rid)] = (
+                    meta[(m, arch, rid)] = (
                         info["value"],
                         any(v.get("param") == param
                             for v in json.loads(vj or "[]")))
+            if keys:
+                plan[ds] = (keys, meta, ann)
+        scored_all = run_scores_many({
+            ds: dict(dataset=ds, run_keys=keys, ann_key=ann, measure=measure,
+                     k=k, prmu=prmu, per_doc=True)
+            for ds, (keys, _meta, ann) in plan.items()})
+        for ds, (all_keys, meta_all, _ann) in plan.items():
+            for m in models:
+                keys = [kk for kk in all_keys if kk[0] == m]
                 if not keys:
                     continue
-                scored = run_scores(ds, keys, ann, measure, k, prmu=prmu,
-                                    per_doc=True)
+                meta = {(kk[1], kk[2]): meta_all[kk] for kk in keys}
+                scored = scored_all[ds]
                 by_value: dict[str, dict] = {}
                 for key in keys:
                     sc = scored.get(key) or {}
@@ -226,28 +243,36 @@ def register(app):
         col_order = sorted(all_vals, key=lambda vj: value_key(all_vals[vj]))
 
         # ---- table: one row per (dataset, model), tested on its own ---------
-        headers = ["Dataset", "Model"] + [param_value_str(all_vals[vj])
-                                          for vj in col_order] + ["p (effect)"]
-        trs, tex, tested = [], [], 0
-        for (ds, m) in sorted(cells, key=lambda t: (natural_key(t[0]),
-                                                    natural_key(idx.model(t[1]).name))):
-            by_value = cells[(ds, m)]
+        headers = (["Dataset", "Model"] + [param_value_str(all_vals[vj])
+                                           for vj in col_order]
+                   + p_headers(cfg) + [cfg.effect_name("multi")])
+        order = sorted(cells, key=lambda t: (natural_key(t[0]),
+                                             natural_key(idx.model(t[1]).name)))
+
+        def _test(pair):
+            by_value = cells[pair]
             present = [vj for vj in col_order if vj in by_value]
             # paired blocks = the documents every value was scored on
             common = common_ords([by_value[vj]["per_doc"] for vj in present])
-            cols = {vj: values_at(by_value[vj]["per_doc"], common).tolist()
-                    for vj in present}
-            p_val, test = None, "—"
-            if len(present) >= 3 and len(common):
-                _chi, p_val = friedman([cols[vj] for vj in present])
-                test = "Friedman"
-            elif len(present) == 2 and len(common):
-                _w, p_val = wilcoxon_signed_rank(cols[present[0]],
-                                                 cols[present[1]])
-                test = "Wilcoxon"
-            if p_val is not None:
-                tested += 1
-            mark = sig_mark(p_val, alpha)
+            res = {"p": None, "effect": None, "common": len(common),
+                   "k": len(present)}
+            if len(present) >= 2 and len(common):
+                res.update(cfg.multi([values_at(by_value[vj]["per_doc"], common)
+                                      for vj in present]))
+            for vj in present:
+                pd_ = by_value[vj]["per_doc"]
+                by_value[vj]["ci"] = cfg.mean_ci(pd_.vals) if pd_ is not None \
+                    else (None, None)
+            return res
+        tests = _pmap(_test, order)
+        p_raw = [t["p"] for t in tests]
+        p_adj = cfg.adjust_all(p_raw)
+        tested = sum(p is not None for p in p_raw)
+        trs, tex = [], []
+        for (ds, m), t, p_val, pj in zip(order, tests, p_raw, p_adj):
+            by_value = cells[(ds, m)]
+            present = [vj for vj in col_order if vj in by_value]
+            mark = sig_mark(pj, alpha)
             best_vj = max(present, key=lambda vj: by_value[vj]["mean"]) \
                 if present else None
             row_h, row_t = [ds, idx.model(m).name], [ds, idx.model(m).name]
@@ -257,18 +282,24 @@ def register(app):
                     row_h.append(html.Span("—", className="muted"))
                     row_t.append("—")
                     continue
-                cell = value_cell(info["mean"], info["n"])
+                cell = value_cell(info["mean"], info["n"], ci=info.get("ci"),
+                                  mark=mark if vj == best_vj else "")
                 node = (html.B(cell[0]) if vj == best_vj else cell[0])
                 if info["illegal"]:
                     node = html.Span([node, html.Span(" ⚠", title="value "
                                                       "violates the model card")])
                 row_h.append(node)
-                row_t.append(cell[1] + (" (best)" if vj == best_vj else ""))
-            p_cell = f"{p_str(p_val)}" if p_val is not None else \
-                ("n<6" if len(common) else "—")
-            row_h.append(html.Span([p_cell, html.Sup(mark)] if mark else p_cell,
-                                   title=f"{test} over {len(common)} common documents"))
-            row_t.append(f"{p_cell} {mark}".strip())
+                row_t.append(dict(cell[1], bold=vj == best_vj))
+            test = (cfg.test_name("multi") if t["k"] >= 3
+                    else cfg.test_name("paired"))
+            pc = p_cells(p_val, pj, cfg)
+            for c in pc:
+                row_h.append(html.Span(c[0], title=f"{test} over {t['common']} "
+                                                   "common documents"))
+                row_t.append(c[1])
+            ec = effect_cell(t["effect"])
+            row_h.append(ec[0])
+            row_t.append(ec[1])
             trs.append(row_h)
             tex.append(row_t)
 
@@ -278,24 +309,28 @@ def register(app):
         # position in this chart
         mslot = db.color_seq("model", sorted(models))
         for i, m in enumerate(sorted(models, key=lambda m: natural_key(idx.model(m).name))):
-            xs, ys, hv = [], [], []
+            xs, ys, hv, err = [], [], [], []
             for vj in col_order:
                 per_ds = [(ds, cells[(ds, mm)][vj]) for (ds, mm) in cells
                           if mm == m and vj in cells[(ds, mm)]]
                 if not per_ds:
                     continue
                 mean = sum(c["mean"] for _d, c in per_ds) / len(per_ds)
+                ci = cfg.macro_ci([c["per_doc"].vals for _d, c in per_ds
+                                   if c.get("per_doc") is not None])
                 xs.append(param_value_str(all_vals[vj]))
-                ys.append(round(mean, 3))
+                ys.append(round(mean, 4))
+                err.append(ci)
                 hv.append(f"{idx.model(m).name}<br>{param} = "
                           f"{param_value_str(all_vals[vj])}<br>{mlab} = "
-                          f"{mean:.3f} (macro over {len(per_ds)} dataset"
+                          f"{mean:.3f} " + _ci_hover(ci)
+                          + f"(macro over {len(per_ds)} dataset"
                           f"{'s' if len(per_ds) > 1 else ''})<br>"
                           + "<br>".join(f"{d}: {c['mean']:.3f} (n={c['n']})"
                                         for d, c in per_ds))
             if xs:
                 series.append({"name": idx.model(m).name, "x": xs, "y": ys,
-                               "hover": hv,
+                               "hover": hv, "err": err,
                                "color": slot_color(mslot.get(m, i) % 8)})
 
         spec_p = None
@@ -319,18 +354,26 @@ def register(app):
                         "runs vary it. Values are resolved against each model "
                         "card (missing parameters take the declared default"
                         + ("; ⚠ marks values outside the card's legal range"
-                           if illegal_any else "") + "). The table tests each "
-                        "(dataset, model) separately over the documents its "
-                        "runs share — Friedman for three or more values, "
-                        "Wilcoxon for two; " + sig_caption(alpha) + ". "
+                           if illegal_any else "") + "). "
+                        + (f"Error bars: {cfg.ci_text()}"
+                           + (" of the macro-average" if len(ds_sel) > 1 else "")
+                           + ". " if cfg.ci_text() else "")
+                        + "The table tests each (dataset, model) separately "
+                        "over the documents its runs share ("
+                        + cfg.method_text("multi", tested) + "). "
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          sorted(ds_sel))),
         }
-        spec["table"] = {"headers": headers, "rows": tex, "label": f"hp-{param}"}
+        spec["table"] = {"headers": headers, "rows": tex, "label": f"hp-{param}",
+                         "notes": "Bold: best value in the row. Statistics: "
+                                  + cfg.method_text("multi", tested)
+                                  + (f"; {cfg.ci_text()}" if cfg.ci_text() else "")
+                                  + "."}
         note = html.Div(
             f"{tested} of {len(trs)} (dataset, model) pairs had enough paired "
             f"documents to test; bold marks the best value in the row.",
             className="muted small", style={"marginBottom": "6px"})
         return (to_plotly(spec), spec, spec["caption"],
                 html.Div([note, ui.table(headers, trs,
-                                         num_cols=set(range(2, len(headers))))]))
+                                         num_cols=set(range(2, len(headers)))),
+                          stats_note(cfg, "multi", tested)]))

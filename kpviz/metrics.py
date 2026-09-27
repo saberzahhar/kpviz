@@ -522,6 +522,9 @@ def cache_stats() -> dict:
     return _CACHE.stats()
 
 
-def memo(key, fn, size: int = 4096):
-    """Cache any small derived value for the current catalog (UI helpers)."""
+def memo(key, fn, size: int = 4096, sized: bool = False):
+    """Cache a derived value for the current catalog (UI helpers). With
+    sized=True, fn returns (value, nbytes) and the cache charges that."""
+    if sized:
+        return _CACHE.get_or_compute((key, db.scan_version()), fn)
     return _CACHE.get_or_compute((key, db.scan_version()), lambda: (fn(), size))

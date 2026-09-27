@@ -26,8 +26,11 @@ from dash import (ALL, MATCH, ClientsideFunction, Input, Output, State, ctx,
 
 from . import __version__, db, scanner
 from .config import settings
-from .export import (export_bundle, fig_pdf, fig_pgf, fig_png, latex_figure,
-                     latex_table, slugify, start_tex_probe, tex_status)
+from .figures import geometry
+from .export import (export_bundle, fig_pdf, fig_pgf, fig_png, figure_env,
+                     latex_figure,
+                     latex_table, slugify, start_tex_probe, table_caption,
+                     tex_status)
 
 # Identifies this server process. A browser tab holds the callback signatures
 # of the build that rendered it, so a tab left open across an upgrade posts a
@@ -249,39 +252,65 @@ def _install_timing(app):
 # Export callbacks (shared by every insight workbench)
 # ---------------------------------------------------------------------------
 
+_EXP_OPTS = ("venue", "span", "height", "legend", "cells")
+
+
+def _with_opts(spec: dict, *vals) -> dict:
+    """The figure spec plus the export options chosen under it."""
+    opts = {k: v for k, v in zip(_EXP_OPTS, vals) if v}
+    out = dict(spec)
+    if opts:
+        out["export"] = opts
+    return out
+
+
 def _register_exports(app):
+    opt_in = [Input({"type": f"exp-{k}", "rq": MATCH}, "value") for k in _EXP_OPTS]
+    opt_st = [State({"type": f"exp-{k}", "rq": MATCH}, "value") for k in _EXP_OPTS]
+
     @app.callback(
         Output({"type": "exp-clip-fig", "rq": MATCH}, "content"),
         Output({"type": "exp-clip-tab", "rq": MATCH}, "content"),
         Output({"type": "exp-hint", "rq": MATCH}, "children"),
         Input({"type": "fig-spec", "rq": MATCH}, "data"),
         Input({"type": "caption", "rq": MATCH}, "n_blur"),
+        *opt_in,
         State({"type": "caption", "rq": MATCH}, "value"),
         prevent_initial_call=True)
-    def clipboards(spec, _blur, caption):
-        """The two LaTeX snippets. Runs when the figure changes or the
-        caption editor loses focus — never per keystroke, never waiting on
-        TeX (the probe result is read, not computed, here)."""
+    def clipboards(spec, _blur, *rest):
+        """The two LaTeX snippets. Runs when the figure, the caption (on
+        blur) or an export option changes — never per keystroke, never
+        waiting on TeX (the probe result is read, not computed, here)."""
+        *opts, caption = rest
         if not spec:
             return "", "", ""
+        spec = _with_opts(spec, *opts)
         caption = caption or spec.get("caption", "")
         slug = slugify(spec.get("name", "figure"))
         status, eng = tex_status()
         use_pgf = status == "ready" and bool(eng)
         fig_tex = latex_figure(f"figures/{slug}" + (".pgf" if use_pgf else ".pdf"),
                                caption, slug, pgf=use_pgf,
-                               size=spec.get("size", "2col"))
+                               size=spec.get("size", "2col"),
+                               env=figure_env(spec), dims=geometry(spec))
         tab = spec.get("table")
         tab_tex = ""
         if tab:
-            tab_tex = latex_table(tab["headers"], tab["rows"], caption,
-                                  tab.get("label", slug))
+            tab_tex = latex_table(tab["headers"], tab["rows"],
+                                  table_caption(spec, caption),
+                                  tab.get("label", slug),
+                                  cells=spec.get("export", {}).get("cells", "ci"),
+                                  notes=tab.get("notes"),
+                                  venue=spec.get("export", {}).get("venue"))
+        w, h, pt = geometry(spec)
+        size_txt = f"{w:.2f}×{h:.2f} in, {pt:g} pt"
         if status == "probing":
-            hint = "checking TeX… (PDF/PNG are ready now)"
+            hint = f"{size_txt} · checking TeX… (PDF/PNG are ready now)"
         elif use_pgf:
-            hint = f"PGF typeset with {eng}"
+            hint = f"{size_txt} · PGF typeset with {eng}"
         else:
-            hint = "no working TeX — PDF exports use Matplotlib's vector backend"
+            hint = (f"{size_txt} · no working TeX — PDF exports use "
+                    "Matplotlib's vector backend")
         return fig_tex, tab_tex, hint
 
     @app.callback(
@@ -290,15 +319,19 @@ def _register_exports(app):
         Input({"type": "exp-btn", "rq": MATCH, "what": ALL}, "n_clicks"),
         State({"type": "fig-spec", "rq": MATCH}, "data"),
         State({"type": "caption", "rq": MATCH}, "value"),
+        *opt_st,
         prevent_initial_call=True)
-    def download(clicks, spec, caption):
+    def download(clicks, spec, caption, *opts):
         if not spec or not ctx.triggered_id or not any(c for c in clicks if c):
             return no_update, no_update
         what = ctx.triggered_id.get("what")
-        spec = dict(spec)
+        spec = _with_opts(spec, *opts)
         if caption:
             spec["caption"] = caption
         slug = slugify(spec.get("name", "figure"))
+        venue = (spec.get("export") or {}).get("venue")
+        if venue and venue != "generic":
+            slug = f"{slug}-{venue}"
         try:
             if what == "png":
                 return dcc.send_bytes(fig_png(spec), f"{slug}.png"), no_update
@@ -317,3 +350,37 @@ def _register_exports(app):
         except Exception as e:           # say what failed, never a dead button
             return no_update, f"{what} export failed: {type(e).__name__}: {e}"[:200]
         return no_update, no_update
+
+    @app.callback(
+        Output({"type": "exp-preview", "rq": MATCH}, "children"),
+        Output({"type": "exp-prev", "rq": MATCH}, "children"),
+        Input({"type": "exp-prev", "rq": MATCH}, "n_clicks"),
+        Input({"type": "fig-spec", "rq": MATCH}, "data"),
+        *opt_in,
+        prevent_initial_call=True)
+    def preview(n, spec, *opts):
+        """The exported figure as it will print: rendered by the export
+        engine at the venue's width, shown at 96 px per inch (1:1 on a
+        standard screen). Toggled by the button; while open it follows the
+        figure and the options."""
+        if not n or n % 2 == 0 or not spec:
+            return None, "Preview"
+        import base64
+        spec = _with_opts(spec, *opts)
+        w, h, pt = geometry(spec)
+        try:
+            png = fig_png(spec, dpi=192)
+        except Exception as e:
+            return (html.Div(f"preview failed: {type(e).__name__}: {e}",
+                             className="muted small"), "Hide preview")
+        from .figures import VENUES
+        v = VENUES.get((spec.get("export") or {}).get("venue") or "generic",
+                       VENUES["generic"])
+        env = figure_env(spec)
+        return html.Div([
+            html.Div(f"{v['label']} · {env} · {w:.2f} × {h:.2f} in · "
+                     f"{pt:g} pt labels · shown at print size",
+                     className="paper-meta"),
+            html.Img(src="data:image/png;base64," + base64.b64encode(png).decode(),
+                     style={"width": f"{w * 96:.0f}px", "maxWidth": "none"}),
+        ]), "Hide preview"

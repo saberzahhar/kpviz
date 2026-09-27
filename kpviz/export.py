@@ -15,7 +15,7 @@ import subprocess
 import threading
 from collections import OrderedDict
 
-from .figures import _TEX_TABLE, render
+from .figures import _TEX_TABLE, VENUES, geometry, render
 from .util import fmt_num, stable_hash
 
 # Matplotlib's pyplot figure manager and rcParams are process-global, and the
@@ -194,10 +194,50 @@ def tex_engine(wait: float = 120.0) -> str | None:
     return tex_status()[1]
 
 
-def _configure_pgf(eng: str):
+_KPSE: dict[str, bool] = {}
+
+
+def _have_sty(name: str) -> bool:
+    """Is `name`.sty installed? (kpsewhich, cached)."""
+    if name not in _KPSE:
+        path = shutil.which("kpsewhich")
+        ok = False
+        if path:
+            try:
+                ok = bool(subprocess.run([path, f"{name}.sty"], capture_output=True,
+                                         text=True, timeout=10).stdout.strip())
+            except Exception:
+                ok = False
+        _KPSE[name] = ok
+    return _KPSE[name]
+
+
+def venue_preamble(spec: dict) -> tuple[str, str]:
+    """(preamble, note) that typesets a KPViz-compiled PDF in the venue's
+    fonts, falling back to the closest installed packages."""
+    exp = spec.get("export") or {}
+    v = VENUES.get(exp.get("venue") or "generic")
+    if not v:
+        return "", ""
+
+    def usable(lines):
+        pk = [re.search(r"\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}", ln) for ln in lines]
+        return all(m and _have_sty(m.group(1)) for m in pk)
+    if usable(v["preamble"]):
+        return "\n".join(v["preamble"]), ""
+    fb = v.get("fallback") or []
+    if fb and usable(fb):
+        return "\n".join(fb), (f"{v['label']} fonts are not installed here; the "
+                               "PDF is set in Times (the .pgf takes your "
+                               "document's fonts)")
+    return "", (f"{v['label']} fonts are not installed here; the PDF uses "
+                "Computer Modern (the .pgf takes your document's fonts)")
+
+
+def _configure_pgf(eng: str, preamble: str = ""):
     import matplotlib
     matplotlib.rcParams["pgf.texsystem"] = eng
-    matplotlib.rcParams["pgf.preamble"] = ""
+    matplotlib.rcParams["pgf.preamble"] = preamble
 
 
 def _first_tex_error(exc: Exception) -> str:
@@ -226,14 +266,15 @@ def fig_png(spec: dict, dpi: int = 300) -> bytes:
 def fig_pdf(spec: dict) -> tuple[bytes, str, str]:
     """(pdf bytes, method, note): 'pgf' (TeX-typeset) or 'matplotlib'
     (vector fallback with embedded TrueType fonts, no TeX required)."""
-    note = [""]
+    pre, pre_note = venue_preamble(spec)
+    note = [pre_note]
 
     def build():
         eng = tex_engine()
         with _render_lock:
             if eng:
                 try:
-                    _configure_pgf(eng)
+                    _configure_pgf(eng, pre)
                     return b"pgf:" + render(spec, True, "pdf", backend="pgf",
                                             bbox_inches="tight", pad_inches=0.02)
                 except Exception as e:
@@ -257,10 +298,12 @@ def fig_pgf(spec: dict) -> tuple[str | None, str]:
     if key in _FAILED:
         return None, _FAILED[key]
 
+    pre, _note = venue_preamble(spec)
+
     def build():
         with _render_lock:
             try:
-                _configure_pgf(eng)
+                _configure_pgf(eng, pre)
                 return render(spec, True, "pgf", backend="pgf").decode("utf-8")
             except Exception as e:
                 _FAILED[key] = f"{eng}: {_first_tex_error(e)}"
@@ -320,9 +363,24 @@ PGF_PREAMBLE_NOTE = ("% requires \\usepackage{pgf} in your preamble\n"
                      "\\providecommand{\\mathdefault}[1]{#1}")
 
 
+def figure_env(spec: dict) -> str:
+    """`figure*` when the figure spans both columns of a two-column venue,
+    `figure` otherwise (single-column venues, column-wide figures)."""
+    exp = spec.get("export") or {}
+    size = spec.get("size", "2col")
+    if not exp:
+        return "figure*" if size in ("2col", "slide") else "figure"
+    v = VENUES.get(exp.get("venue") or "generic", VENUES["generic"])
+    span = exp.get("span") or "auto"
+    if span == "auto":
+        span = "col" if size == "1col" else "full"
+    return "figure*" if (v["twocol"] and span == "full") else "figure"
+
+
 def latex_figure(filename: str, caption: str, label: str,
                  width: str | None = None, pgf: bool = True,
-                 size: str = "2col") -> str:
+                 size: str = "2col", env: str | None = None,
+                 dims: tuple | None = None) -> str:
     """A figure environment for the exported file.
 
     The PGF is \\input at its natural size — never \\resizebox-ed, which
@@ -331,12 +389,14 @@ def latex_figure(filename: str, caption: str, label: str,
     into `figure*`, spanning \\textwidth; a one-column figure (3.35 in) into
     `figure`. The PDF fallback is scaled to the same width, which is harmless
     for an image."""
-    env = "figure*" if size in ("2col", "slide") else "figure"
+    env = env or ("figure*" if size in ("2col", "slide") else "figure")
     width = width or ("\\textwidth" if env == "figure*" else "\\columnwidth")
     body = (f"    \\input{{{filename}}}" if pgf
             else f"    \\includegraphics[width={width}]{{{filename}}}")
     lines = [
-        PGF_PREAMBLE_NOTE if pgf else None,
+        PGF_PREAMBLE_NOTE if pgf else "% requires \\usepackage{graphicx} in your preamble",
+        (f"% drawn at {dims[0]:.2f} x {dims[1]:.2f} in with {dims[2]:g} pt "
+         "labels: \\input as is, never rescale" if dims and pgf else None),
         f"\\begin{{{env}}}[t]",
         "    \\centering",
         body,
@@ -347,52 +407,133 @@ def latex_figure(filename: str, caption: str, label: str,
     return "\n".join(l for l in lines if l is not None)
 
 
-# A column header like "document truncated to model's context window" makes a
-# five-column tabular wider than \textwidth: LaTeX then runs it off the page
-# with only an Overfull \hbox warning. Past this printable width the tabular is
-# wrapped in \resizebox, which is what a human would do by hand.
-_TABLE_FIT_CHARS = 78
+TABLE_CELLS = ("value", "ci", "ci_n")      # how much of a stat cell to print
+
+
+def _num_tex(v: float, digits: int, signed: bool) -> str:
+    """A number for text mode: a real minus sign, never a hyphen."""
+    txt = f"{v:+.{digits}f}" if signed else f"{v:.{digits}f}"
+    return txt.replace("-", "$-$", 1) if txt.startswith("-") else txt
+
+
+def cell_text(cell, style: str = "ci") -> str:
+    """Plain-text rendering of a table cell (structured or not) — what the
+    width estimate and non-LaTeX consumers see."""
+    if not isinstance(cell, dict):
+        return str(cell)
+    d, sg = cell.get("digits", 3), cell.get("signed", False)
+    f = (lambda v: f"{v:+.{d}f}") if sg else (lambda v: f"{v:.{d}f}")
+    out = f(cell["v"]) + (f" {cell['mark']}" if cell.get("mark") else "")
+    if style in ("ci", "ci_n") and cell.get("lo") is not None:
+        out += f" [{f(cell['lo'])}, {f(cell['hi'])}]"
+    if style == "ci_n" and cell.get("n") is not None:
+        out += f" (n={cell['n']})"
+    return out
+
+
+_SCI = re.compile(r"^(-?\d+(?:\.\d+)?)e([+-]?)0*(\d+)$")
+
+
+def _cell_tex(cell, style: str) -> str:
+    if not isinstance(cell, dict):
+        txt = cell if isinstance(cell, str) else fmt_num(cell)
+        m = _SCI.match(str(txt).strip())
+        if m:                       # 9.13e-06 -> $9.13\times10^{-6}$
+            exp = ("-" if m.group(2) == "-" else "") + m.group(3)
+            return f"${m.group(1)}\\times10^{{{exp}}}$"
+        return _tex_escape(txt)
+    d, sg = cell.get("digits", 3), cell.get("signed", False)
+    out = _num_tex(cell["v"], d, sg)
+    if cell.get("mark"):
+        out += "$^{" + "".join({"†": r"\dagger", "‡": r"\ddagger"}.get(ch, "")
+                               for ch in cell["mark"]) + "}$"
+    if style in ("ci", "ci_n") and cell.get("lo") is not None:
+        out += (" {\\scriptsize[" + _num_tex(cell["lo"], d, sg) + ", "
+                + _num_tex(cell["hi"], d, sg) + "]}")
+    if style == "ci_n" and cell.get("n") is not None:
+        out += f" {{\\scriptsize(n={cell['n']})}}"
+    if cell.get("bold"):
+        out = "\\textbf{" + out + "}"
+    return out
+
+
+def table_caption(spec: dict, caption: str | None = None) -> str:
+    """A table's own caption: what the table lists, in one sentence, and a
+    pointer to its figure — not the figure's whole caption again (in IEEE
+    small caps that was six lines above every table). The statistical
+    procedure goes in the table notes."""
+    tab = spec.get("table") or {}
+    if tab.get("caption"):
+        return tab["caption"]
+    cap = (caption or spec.get("caption") or "").strip()
+    # first sentence: up to the first ". " that is not inside parentheses
+    depth, cut = 0, len(cap)
+    for i, ch in enumerate(cap):
+        depth += (ch == "(") - (ch == ")")
+        if ch == "." and depth == 0 and (i + 1 == len(cap) or cap[i + 1] == " "):
+            cut = i + 1
+            break
+    first = cap[:cut].rstrip(".")
+    slug = slugify(spec.get("name", "figure"))
+    return (first + f". Values behind Figure~\\ref{{fig:{slug}}}"
+            if first else f"Values behind Figure~\\ref{{fig:{slug}}}")
 
 
 def latex_table(headers: list[str], rows: list[list], caption: str,
                 label: str, align: str | None = None,
-                best_mask: list[list[bool]] | None = None) -> str:
-    """A booktabs table. best_mask marks cells to \\textbf{} (e.g. column
-    maxima)."""
+                best_mask: list[list[bool]] | None = None,
+                cells: str = "ci", notes: str | None = None,
+                venue: str | None = None) -> str:
+    """A booktabs table, set in \\small.
+
+    `cells` chooses how much of a statistic to print — the value (with its
+    significance mark), + its interval, + its sample size; `notes` is a line
+    under the rule (the statistical procedure, typically); best_mask marks
+    cells to \\textbf{}.
+
+    Width: a table wider than a column of a two-column venue goes into
+    `table*` (it spans the page, as a human would place it); whatever the
+    environment, adjustbox's `max width=\\linewidth` shrinks it only if it
+    still does not fit — never a silent run into the margin, never a blow-up
+    of a narrow table."""
+    from .figures import VENUES
     ncol = len(headers)
     align = align or ("l" + "r" * (ncol - 1))
     widths = [len(str(h)) for h in headers]
     for row in rows:
         for j, cell in enumerate(row[:ncol]):
-            widths[j] = max(widths[j], len(str(cell)))
-    wide = sum(widths) + 2 * ncol > _TABLE_FIT_CHARS
+            widths[j] = max(widths[j], len(cell_text(cell, cells)))
+    v = VENUES.get(venue or "generic", VENUES["generic"])
+    # \small digits are ~4.6 pt wide; 8 pt of padding per column
+    need_in = (sum(widths) * 4.6 + ncol * 8) / 72
+    env = "table*" if (v["twocol"] and need_in > v["col"]) else "table"
     out = [
-        "\\begin{table}[t]",
+        "% requires \\usepackage{booktabs} and \\usepackage{adjustbox}",
+        f"\\begin{{{env}}}[t]",
         "    \\centering",
+        "    \\small",
         f"    \\caption{{{caption_escape(caption)}}}",
         f"    \\label{{tab:{label}}}",
         "    \\setlength{\\tabcolsep}{4pt}",
-    ]
-    if wide:
-        out.append("    \\resizebox{\\linewidth}{!}{%")
-    out += [
+        "    \\begin{adjustbox}{max width=\\linewidth}",
         f"    \\begin{{tabular}}{{{align}}}",
         "        \\toprule",
         "        " + " & ".join(_tex_escape(h) for h in headers) + " \\\\",
         "        \\midrule",
     ]
     for i, row in enumerate(rows):
-        cells = []
+        cells_tex = []
         for j, cell in enumerate(row):
-            txt = _tex_escape(cell if isinstance(cell, str) else fmt_num(cell))
+            txt = _cell_tex(cell, cells)
             if best_mask and best_mask[i][j]:
                 txt = "\\textbf{" + txt + "}"
-            cells.append(txt)
-        out.append("        " + " & ".join(cells) + " \\\\")
-    out += ["        \\bottomrule", "    \\end{tabular}"]
-    if wide:
-        out.append("    }")
-    out.append("\\end{table}")
+            cells_tex.append(txt)
+        out.append("        " + " & ".join(cells_tex) + " \\\\")
+    out += ["        \\bottomrule", "    \\end{tabular}", "    \\end{adjustbox}"]
+    if notes:
+        out += ["    \\par\\smallskip",
+                "    {\\footnotesize " + caption_escape(notes) + "\\par}"]
+    out.append(f"\\end{{{env}}}")
     return "\n".join(out)
 
 
@@ -406,10 +547,16 @@ def export_bundle(spec: dict, name: str) -> bytes:
     caption = spec.get("caption", "")
     tex = latex_figure(f"{slug}.pgf" if pgf else f"{slug}.pdf",
                        caption, slug, pgf=bool(pgf),
-                       size=spec.get("size", "2col"))
+                       size=spec.get("size", "2col"), env=figure_env(spec),
+                       dims=geometry(spec))
     tab = spec.get("table")
-    table_tex = (latex_table(tab["headers"], tab["rows"], caption,
-                             tab.get("label", slug)) if tab else None)
+    cells = (spec.get("export") or {}).get("cells") or "ci"
+    table_tex = (latex_table(tab["headers"], tab["rows"],
+                             table_caption(spec, caption),
+                             tab.get("label", slug), cells=cells,
+                             notes=tab.get("notes"),
+                             venue=(spec.get("export") or {}).get("venue"))
+                 if tab else None)
     buf = io.BytesIO()
     # PDF/PNG are already compressed; level 1 keeps the text members small
     # without spending CPU re-compressing binary ones
