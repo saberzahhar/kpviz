@@ -33,7 +33,20 @@
   if (document.readyState !== "loading") { fitAll(); } else {
     document.addEventListener("DOMContentLoaded", fitAll);
   }
-  new MutationObserver(schedule).observe(document.documentElement,
-    { childList: true, subtree: true });
+  // Observe only what can hold a caption box. Watching the whole document
+  // made every DOM change (each progress tick, each figure) force a layout
+  // read. The caption boxes live inside the workbench panels; attach once
+  // they exist, and re-fit when their subtree changes.
+  var observer = new MutationObserver(schedule);
+  function attach() {
+    var roots = document.querySelectorAll(".caption-box");
+    if (!roots.length) { setTimeout(attach, 500); return; }
+    roots.forEach(function (r) {
+      observer.observe(r, { childList: true, subtree: true,
+                            characterData: true, attributes: true });
+    });
+    fitAll();
+  }
+  attach();
   window.addEventListener("resize", schedule);
 })();

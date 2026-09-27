@@ -41,10 +41,10 @@ spec = {
 print("tex engine:", tex_engine())
 png = fig_png(spec)
 print("png bytes:", len(png), png[:4] == b"\x89PNG")
-pdf, method = fig_pdf(spec)
-print("pdf bytes:", len(pdf), "method:", method, pdf[:5] == b"%PDF-")
-pgf = fig_pgf(spec)
-print("pgf chars:", len(pgf) if pgf else None,
+pdf, method, note = fig_pdf(spec)
+print("pdf bytes:", len(pdf), "method:", method, pdf[:5] == b"%PDF-", note or "")
+pgf, pgf_err = fig_pgf(spec)
+print("pgf chars:", len(pgf) if pgf else pgf_err,
       (pgf or "")[:40].replace("\n", " "))
 z = export_bundle(spec, "pareto test")
 print("zip bytes:", len(z), z[:2] == b"PK")

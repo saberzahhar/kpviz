@@ -11,11 +11,34 @@ from __future__ import annotations
 
 import math
 
+try:
+    import numpy as _np
+except Exception:  # pragma: no cover - numpy ships with the stack
+    _np = None
+
 MIN_N = 6
 
 
-def _rankdata(values: list[float]) -> tuple[list[float], float]:
-    """Average ranks + tie-correction term Σ(t³−t)."""
+def _rankdata(values) -> tuple[list[float], float]:
+    """Average ranks + tie-correction term Σ(t³−t).
+
+    Vectorised for large samples (20 k paired documents × 22 runs is the
+    common case): the same average ranks — exact halves, so identical — as
+    the pure-Python loop kept below for small inputs."""
+    n = len(values)
+    if _np is not None and n > 256:
+        a = _np.asarray(values, dtype=float)
+        sorter = _np.argsort(a, kind="mergesort")
+        inv = _np.empty(n, dtype=_np.intp)
+        inv[sorter] = _np.arange(n)
+        sa = a[sorter]
+        obs = _np.r_[True, sa[1:] != sa[:-1]]
+        dense = obs.cumsum()[inv]
+        count = _np.r_[_np.nonzero(obs)[0], n]
+        ranks = 0.5 * (count[dense] + count[dense - 1] + 1)
+        t = _np.diff(count).astype(float)
+        return ranks, float(((t ** 3) - t).sum())
+    values = list(values)
     order = sorted(range(len(values)), key=lambda i: values[i])
     ranks = [0.0] * len(values)
     tie_term = 0.0
@@ -44,8 +67,13 @@ def mann_whitney_u(x: list[float], y: list[float]) -> tuple[float | None, float 
     n1, n2 = len(x), len(y)
     if n1 < MIN_N or n2 < MIN_N:
         return None, None
-    ranks, tie_term = _rankdata(list(x) + list(y))
-    r1 = sum(ranks[:n1])
+    if _np is not None:
+        both = _np.concatenate((_np.asarray(x, dtype=float),
+                                _np.asarray(y, dtype=float)))
+    else:
+        both = list(x) + list(y)
+    ranks, tie_term = _rankdata(both)
+    r1 = float(sum(ranks[:n1]))
     u1 = r1 - n1 * (n1 + 1) / 2
     u = min(u1, n1 * n2 - u1)
     mu = n1 * n2 / 2
@@ -60,13 +88,24 @@ def mann_whitney_u(x: list[float], y: list[float]) -> tuple[float | None, float 
 
 def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float | None, float | None]:
     """Two-sided paired Wilcoxon signed-rank on aligned samples. (W, p)."""
-    diffs = [a - b for a, b in zip(x, y) if a != b]
-    n = len(diffs)
-    if n < MIN_N:
-        return None, None
-    ranks, tie_term = _rankdata([abs(d) for d in diffs])
-    w_pos = sum(r for r, d in zip(ranks, diffs) if d > 0)
-    w_neg = sum(r for r, d in zip(ranks, diffs) if d < 0)
+    if _np is not None and len(x) > 256:
+        d = _np.asarray(x, dtype=float)[:len(y)] - _np.asarray(y, dtype=float)[:len(x)]
+        d = d[d != 0]
+        n = len(d)
+        if n < MIN_N:
+            return None, None
+        ranks, tie_term = _rankdata(_np.abs(d))
+        ranks = _np.asarray(ranks, dtype=float)
+        w_pos = float(ranks[d > 0].sum())
+        w_neg = float(ranks[d < 0].sum())
+    else:
+        diffs = [a - b for a, b in zip(x, y) if a != b]
+        n = len(diffs)
+        if n < MIN_N:
+            return None, None
+        ranks, tie_term = _rankdata([abs(d) for d in diffs])
+        w_pos = sum(r for r, d in zip(ranks, diffs) if d > 0)
+        w_neg = sum(r for r, d in zip(ranks, diffs) if d < 0)
     w = min(w_pos, w_neg)
     mu = n * (n + 1) / 4
     sigma2 = n * (n + 1) * (2 * n + 1) / 24 - tie_term / 48

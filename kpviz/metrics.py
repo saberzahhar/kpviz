@@ -16,27 +16,43 @@ Conventions (documented in every export caption):
   * documents with zero gold after filtering are excluded (n reported);
   * scores are macro-averaged over documents.
 
-`rebuild_run_metrics` precomputes the *unfiltered* case in one SQL statement
-at the end of a scan. `run_scores` uses it whenever no gold-side filter is
-active, which is the common first view — the arithmetic is the same, so the
-numbers are identical (tools/test_metric_parity.py asserts it).
+Execution. Every score — filtered or not, aggregate or per document — is one
+DuckDB statement over `matches`, vectorised, parallel and outside the GIL;
+results come back as NumPy columns. (The previous path fetched every match
+row into Python lists and looped: 2.7–3.2 s per call at 22 runs × 20 k
+documents, of which 1.9 s was building the Python rows; one statement takes
+~0.13 s.) `rebuild_run_metrics` still precomputes the unfiltered aggregate
+table at the end of a scan, the common first view.
+
+Memory. Per-document results are `PerDoc` objects: a sorted int32 array of
+document ordinals into a per-dataset index shared by every result, plus a
+float64 score array — about 12 bytes per document instead of ~100 for a
+dict entry, and without a private copy of every id string. They sit in a
+cache bounded by *bytes* (not entries), with single-flight: concurrent
+callbacks asking for the same scores wait for one computation.
 """
 from __future__ import annotations
 
-import json
-from collections import defaultdict
+import threading
+from collections import OrderedDict
+from collections.abc import Mapping
+
+import numpy as np
 
 from . import db
 
 KS = ["5", "10", "O", "M"]
 MEASURES = ["f1", "p", "r"]
 PRMU = ["P", "R", "M", "U"]
-_MEMO_MAX = 4096
-
-# _doc_scores returns (precision, recall, f1) in that order. Selecting by
-# MEASURES.index() silently returned precision for "f1" — the SQL parity test
-# (tools/test_metric_parity.py) is what surfaced it. Never index by position.
-_MEASURE_SLOT = {"p": 0, "r": 1, "f1": 2}
+CACHE_BYTES = 256 * 2**20       # overridable via set_cache_budget()
+def _max_concurrent() -> int:
+    """Scoring statements allowed at once: DuckDB runs them outside the GIL,
+    so up to one per core overlaps well; beyond that they only queue."""
+    try:
+        from .hostinfo import usable_cpus
+        return max(2, usable_cpus())
+    except Exception:
+        return 2
 
 
 def metric_label(measure: str, k: str, prmu: list[str] | None = None) -> str:
@@ -89,7 +105,7 @@ def rebuild_run_metrics(con) -> int:
 
 
 def _from_run_metrics(dataset: str, run_keys: list[tuple], ann_key: str,
-                      measure: str, k: str) -> dict | None:
+                      measure: str, k: str) -> dict:
     if not run_keys:
         return {}
     col = {"f1": "f1_mean", "p": "p_mean", "r": "r_mean"}[measure]
@@ -107,65 +123,245 @@ def _from_run_metrics(dataset: str, run_keys: list[tuple], ann_key: str,
 
 
 # ---------------------------------------------------------------------------
-# Gold-side filter masks
+# Per-dataset document index and compact per-document results
+# ---------------------------------------------------------------------------
+class DocIndex:
+    """Sorted document ids of one dataset; position = ordinal."""
+
+    __slots__ = ("ids", "pos")
+
+    def __init__(self, ids: list[str]):
+        self.ids = ids
+        self.pos = {d: i for i, d in enumerate(ids)}
+
+    def ords(self, doc_ids) -> np.ndarray:
+        pos = self.pos
+        return np.fromiter(sorted({pos[d] for d in doc_ids if d in pos}),
+                           dtype=np.int32)
+
+
+class PerDoc(Mapping):
+    """Per-document scores of one run: a read-only {doc_id: score} mapping
+    backed by two arrays (sorted ordinals, scores) over a shared DocIndex."""
+
+    __slots__ = ("ords", "vals", "index")
+
+    def __init__(self, ords: np.ndarray, vals: np.ndarray, index: DocIndex):
+        self.ords, self.vals, self.index = ords, vals, index
+
+    # Mapping protocol (keeps every caller that used a dict working)
+    def __len__(self):
+        return len(self.ords)
+
+    def __iter__(self):
+        ids = self.index.ids
+        return (ids[o] for o in self.ords.tolist())
+
+    def __getitem__(self, doc_id):
+        o = self.index.pos.get(doc_id)
+        if o is not None:
+            i = int(np.searchsorted(self.ords, o))
+            if i < len(self.ords) and self.ords[i] == o:
+                return float(self.vals[i])
+        raise KeyError(doc_id)
+
+    def __contains__(self, doc_id):
+        try:
+            self[doc_id]
+            return True
+        except KeyError:
+            return False
+
+    # vectorised helpers
+    def values_array(self) -> np.ndarray:
+        return self.vals
+
+    def as_dict(self) -> dict:
+        ids = self.index.ids
+        return {ids[o]: float(v) for o, v in zip(self.ords.tolist(),
+                                                  self.vals.tolist())}
+
+    def select(self, doc_ids, inside: bool = True) -> np.ndarray:
+        """Scores of the documents in (or not in) `doc_ids`."""
+        mask = np.isin(self.ords, self.index.ords(doc_ids))
+        return self.vals[mask if inside else ~mask]
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.ords.nbytes + self.vals.nbytes)
+
+
+def paired(a: PerDoc, b: PerDoc) -> tuple[np.ndarray, np.ndarray]:
+    """Scores of the documents both results share, aligned (sorted by id)."""
+    common, ia, ib = np.intersect1d(a.ords, b.ords, assume_unique=True,
+                                    return_indices=True)
+    return a.vals[ia], b.vals[ib]
+
+
+def common_ords(results: list[PerDoc]) -> np.ndarray:
+    out = None
+    for r in results:
+        out = r.ords if out is None else np.intersect1d(out, r.ords,
+                                                        assume_unique=True)
+    return out if out is not None else np.zeros(0, dtype=np.int32)
+
+
+def values_at(r: PerDoc, ords: np.ndarray) -> np.ndarray:
+    idx = np.searchsorted(r.ords, ords)
+    return r.vals[idx]
+
+
+def doc_index(dataset: str) -> DocIndex:
+    """The dataset's document index for the current catalog (cached)."""
+    key = ("docindex", dataset, db.scan_version())
+
+    def build():
+        ids = [r[0] for r in db.q("""SELECT DISTINCT doc_id FROM documents
+                                     WHERE dataset=? ORDER BY doc_id""", dataset)]
+        idx = DocIndex(ids)
+        return idx, sum(len(d) + 120 for d in ids)   # ~ bytes of str + dict slot
+    return _CACHE.get_or_compute(key, build)
+
+
+# ---------------------------------------------------------------------------
+# The scoring statement
 # ---------------------------------------------------------------------------
 
-def gold_masks(dataset: str, ann_key: str,
-               prmu: list[str] | None = None,
-               tok_limit: tuple[str, int] | None = None,
-               require_position: bool = False) -> dict[str, set[int]]:
-    """{doc_id: set(kp_idx allowed)} under the given filters.
+def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
+                doc_filter: str | None) -> str:
+    """One statement: per-document P, R, F1 for every selected run.
 
-    tok_limit=(tokenizer, L): keep gold whose first occurrence ends within
-    the first L tokens (i.e. survives input truncation at L).
-    require_position: drop gold with no in-text occurrence."""
-    if tok_limit:
-        sql = """SELECT g.doc_id, g.kp_idx, g.prmu, g.first_char, t.tok_end
-                 FROM gold g LEFT JOIN gold_tokpos t
-                   ON t.dataset=g.dataset AND t.doc_id=g.doc_id
-                  AND t.ann_key=g.ann_key AND t.kp_idx=g.kp_idx
-                  AND t.tokenizer=?
-                 WHERE g.dataset=? AND g.ann_key=?"""
-        params = [tok_limit[0], dataset, ann_key]
+    Parameters are named: $ds, $ann, $k, $r{i}_{0..2} (run keys) and, when
+    the corresponding filter is on, $prmu, $tok, $tok_limit. Filters that are
+    off are left out of the SQL text entirely."""
+    runs = ",".join(f"($r{i}_0, $r{i}_1, $r{i}_2)" for i in range(n_runs))
+    filtered = prmu or need_pos or tok
+    if filtered:
+        conds = ["g.dataset = $ds", "g.ann_key = $ann"]
+        if prmu:
+            conds.append("list_contains($prmu, coalesce(g.prmu, 'U'))")
+        if need_pos:
+            conds.append("coalesce(g.end_char, -1) >= 0")
+        tok_join = ""
+        if tok:
+            tok_join = ("LEFT JOIN gold_tokpos t ON t.dataset = g.dataset "
+                        "AND t.doc_id = g.doc_id AND t.ann_key = g.ann_key "
+                        "AND t.kp_idx = g.kp_idx AND t.tokenizer = $tok")
+            conds.append("t.tok_end IS NOT NULL AND t.tok_end <= $tok_limit")
+        gold_cte = f"""
+    ok AS (
+      SELECT g.doc_id, list(g.kp_idx) AS allowed, count(*)::INTEGER AS n_ok
+      FROM gold g {tok_join}
+      WHERE {" AND ".join(conds)}
+      GROUP BY 1),"""
+        join = "LEFT JOIN ok ON ok.doc_id = m.doc_id"
+        n_allowed = "coalesce(ok.n_ok, 0)"
+        allowed = ", ok.allowed"
+        # pairs (rank, gold index) with rank inside the cutoff and the gold
+        # keyphrase allowed by the filter
+        tp = ("len(list_filter(range(len(c.pred_ranks)), i -> c.pred_ranks[i + 1] < c.cut "
+              "AND list_contains(c.allowed, c.gold_idxs[i + 1])))")
     else:
-        sql = """SELECT g.doc_id, g.kp_idx, g.prmu, g.first_char
-                 FROM gold g WHERE g.dataset=? AND g.ann_key=?"""
-        params = [dataset, ann_key]
+        gold_cte, join, n_allowed, allowed = "", "", "m.n_gold", ""
+        tp = "len(list_filter(c.pred_ranks, x -> x < c.cut))"
+    dfilter = ""
+    if doc_filter == "include":
+        dfilter = "AND m.doc_id IN (SELECT doc_id FROM kp_docfilter)"
+    elif doc_filter == "exclude":
+        dfilter = "AND m.doc_id NOT IN (SELECT doc_id FROM kp_docfilter)"
+    return f"""
+    WITH sel(model, arch, run_id) AS (VALUES {runs}),
+    di AS (SELECT doc_id, (row_number() OVER (ORDER BY doc_id) - 1)::INTEGER AS ord
+           FROM (SELECT DISTINCT doc_id FROM documents WHERE dataset = $ds)),{gold_cte}
+    base AS (
+      SELECT m.model, m.arch, m.run_id, m.doc_id, m.n_uniq,
+             {n_allowed} AS n_al, m.pred_ranks, m.gold_idxs{allowed}
+      FROM matches m {join}
+      JOIN sel ON sel.model = m.model AND sel.arch = m.arch AND sel.run_id = m.run_id
+      WHERE m.dataset = $ds AND m.ann_key = $ann {dfilter}),
+    c AS (
+      SELECT *, CASE $k WHEN 'O' THEN n_al WHEN 'M' THEN greatest(n_uniq, 1)
+                        ELSE TRY_CAST($k AS INTEGER) END AS cut
+      FROM base WHERE n_al > 0),
+    t AS (
+      SELECT c.model, c.arch, c.run_id, c.doc_id, c.n_al,
+             {tp}::DOUBLE AS tp,
+             CASE WHEN c.n_uniq > 0 THEN least(c.cut, c.n_uniq) ELSE 0 END AS dp
+      FROM c),
+    s AS (
+      SELECT model, arch, run_id, doc_id,
+             CASE WHEN dp > 0 THEN tp / dp ELSE 0.0 END AS p,
+             tp / n_al AS r
+      FROM t),
+    skipped AS (
+      SELECT model || '||' || arch || '||' || run_id AS run, count(*) AS n
+      FROM base WHERE n_al <= 0 GROUP BY 1)
+    SELECT s.model || '||' || s.arch || '||' || s.run_id AS run, di.ord,
+           s.p, s.r,
+           CASE WHEN s.p + s.r > 0 THEN 2 * s.p * s.r / (s.p + s.r) ELSE 0.0 END AS f1,
+           -1::BIGINT AS n_skipped
+    FROM s JOIN di ON di.doc_id = s.doc_id
+    UNION ALL      -- one row per run with its count of gold-less documents
+    SELECT run, -1, 0.0, 0.0, 0.0, n FROM skipped
+    ORDER BY run, ord
+    """
 
-    allowed: dict[str, set[int]] = defaultdict(set)
-    prmu_set = set(prmu) if prmu else None
-    for row in db.q(sql, *params):
-        doc_id, kp_idx, cat, first_char = row[0], row[1], row[2], row[3]
-        if prmu_set is not None and (cat or "U") not in prmu_set:
-            continue
-        if require_position and (first_char is None or first_char < 0):
-            continue
-        if tok_limit:
-            tok_end = row[4]
-            if tok_end is None or tok_end > tok_limit[1]:
-                continue
-        allowed[doc_id].add(kp_idx)
-    return allowed
 
+def _compute(dataset: str, run_keys: list[tuple], ann_key: str, k: str,
+             prmu, tok_limit, require_position, doc_ids, exclude_doc_ids):
+    """{run_key: {"p","r","f1": PerDoc, "n_skipped"}} — one statement."""
+    doc_filter = ("include" if doc_ids is not None
+                  else "exclude" if exclude_doc_ids is not None else None)
+    sql = _scores_sql(len(run_keys), prmu is not None, bool(require_position),
+                      tok_limit is not None, doc_filter)
+    params = {"ds": dataset, "ann": ann_key, "k": str(k)}
+    if prmu is not None:
+        params["prmu"] = sorted(prmu)
+    if tok_limit is not None:
+        params.update(tok=tok_limit[0], tok_limit=int(tok_limit[1]))
+    for i, key in enumerate(run_keys):
+        for j, part in enumerate(key):
+            params[f"r{i}_{j}"] = part
 
-# ---------------------------------------------------------------------------
-# Score computation
-# ---------------------------------------------------------------------------
+    index = doc_index(dataset)
+    with _SEM:
+        cur = db.connect().cursor()
+        try:
+            if doc_filter:
+                ids = doc_ids if doc_filter == "include" else exclude_doc_ids
+                cur.execute("CREATE OR REPLACE TEMP TABLE kp_docfilter(doc_id VARCHAR)")
+                if ids:
+                    cur.execute("INSERT INTO kp_docfilter SELECT unnest(?)",
+                                [sorted(str(d) for d in ids)])
+            cols = cur.execute(sql, params).fetchnumpy()
+        finally:
+            cur.close()
 
-def _doc_scores(n_uniq: int, n_gold_allowed: int, tp_ranks: list[int],
-                k: str) -> tuple[float, float, float]:
-    """(precision, recall, f1) for one document — index via _MEASURE_SLOT."""
-    if n_gold_allowed <= 0:
-        return (float("nan"),) * 3
-    cut = {"O": n_gold_allowed, "M": max(n_uniq, 1)}.get(k)
-    if cut is None:
-        cut = int(k)
-    tp = sum(1 for r in tp_ranks if r < cut)
-    denom_p = min(cut, n_uniq) if n_uniq else 0
-    p = tp / denom_p if denom_p else 0.0
-    r = tp / n_gold_allowed
-    f = (2 * p * r / (p + r)) if (p + r) else 0.0
-    return p, r, f
+    runs = np.asarray(cols["run"], dtype=object)
+    n_sk = np.asarray(cols["n_skipped"], dtype=np.int64)
+    skip_rows = n_sk >= 0
+    skipped = {runs[i]: int(n_sk[i]) for i in np.flatnonzero(skip_rows)}
+    keep = ~skip_rows
+    runs = runs[keep]
+    ords = np.asarray(cols["ord"], dtype=np.int32)[keep]
+    vals = {m: np.asarray(cols[m], dtype=np.float64)[keep]
+            for m in ("p", "r", "f1")}
+    bounds = {}
+    if len(runs):
+        change = np.flatnonzero(runs[1:] != runs[:-1]) + 1
+        starts = np.concatenate(([0], change))
+        ends = np.concatenate((change, [len(runs)]))
+        for a, b in zip(starts.tolist(), ends.tolist()):
+            bounds[runs[a]] = (a, b)
+    out = {}
+    for key in run_keys:
+        name = "||".join(key)
+        a, b = bounds.get(name, (0, 0))
+        o = ords[a:b].copy()
+        out[tuple(key)] = {m: PerDoc(o, vals[m][a:b].copy(), index)
+                           for m in ("p", "r", "f1")}
+        out[tuple(key)]["n_skipped"] = skipped.get(name, 0)
+    return out
 
 
 def run_scores(dataset: str, run_keys: list[tuple[str, str, str]],
@@ -179,121 +375,153 @@ def run_scores(dataset: str, run_keys: list[tuple[str, str, str]],
                use_cache: bool = True) -> dict:
     """Macro-averaged scores for runs of one dataset.
 
-    run_keys: [(model, arch, run_id), ...] — pass them all at once; the
-    dataset-wide gold mask is then built once for the whole list.
+    run_keys: [(model, arch, run_id), ...] — pass them all at once: one
+    statement scores every run. `doc_ids=None` means no document filter;
+    an empty set means "no documents" (it is never confused with None).
+    Returns {run_key: {"mean", "n", "n_skipped"[, "per_doc": PerDoc]}}.
     """
     run_keys = [tuple(x) for x in run_keys]
     filtered = (prmu is not None or tok_limit is not None or require_position
                 or doc_ids is not None or exclude_doc_ids is not None)
+    if not run_keys:
+        return {}
+    if not filtered and not per_doc:
+        return _from_run_metrics(dataset, run_keys, ann_key, measure, k)
 
-    cache_key = memo_key = None
+    def compute():
+        res = _compute(dataset, sorted(run_keys), ann_key, k, prmu, tok_limit,
+                       require_position, doc_ids, exclude_doc_ids)
+        size = sum(pd.nbytes for r in res.values()
+                   for m, pd in r.items() if m != "n_skipped")
+        return res, size
+
     if use_cache:
-        cache_key = {"fn": "run_scores", "dataset": dataset,
-                     "runs": sorted(run_keys), "ann": ann_key, "m": measure,
-                     "k": k, "prmu": sorted(prmu) if prmu else None,
-                     "tok": tok_limit, "pos": require_position, "pd": per_doc,
-                     "docs": sorted(doc_ids) if doc_ids else None,
-                     "xdocs": sorted(exclude_doc_ids) if exclude_doc_ids else None}
-        memo_key = _memo_key(cache_key)
-        hit = _MEMO.get(memo_key)
-        if hit is not None:
-            return hit
-        if not per_doc:
-            payload = db.cache_get(cache_key)
-            if payload is not None:
-                out = {tuple(json.loads(kk)): vv for kk, vv in payload.items()}
-                _memo_put(memo_key, out)
-                return out
-        # exact precomputed table for the unfiltered case
-        if not filtered and not per_doc:
-            fast = _from_run_metrics(dataset, run_keys, ann_key, measure, k)
-            if fast is not None:
-                _memo_put(memo_key, fast)
-                return fast
-
-    masks = gold_masks(dataset, ann_key, prmu, tok_limit,
-                       require_position) if (prmu is not None
-                                             or tok_limit is not None
-                                             or require_position) else None
+        key = ("scores", dataset, tuple(sorted(run_keys)), ann_key, str(k),
+               tuple(sorted(prmu)) if prmu is not None else None,
+               tuple(tok_limit) if tok_limit is not None else None,
+               bool(require_position),
+               None if doc_ids is None else frozenset(doc_ids),
+               None if exclude_doc_ids is None else frozenset(exclude_doc_ids),
+               db.scan_version())
+        res = _CACHE.get_or_compute(key, compute)
+    else:
+        res = compute()[0]
 
     out: dict[tuple, dict] = {}
-    mi = _MEASURE_SLOT[measure]
-    if run_keys:
-        vals = ",".join("(?,?,?)" for _ in run_keys)
-        args = [dataset, ann_key] + [x for key in run_keys for x in key]
-        rows = db.q(f"""SELECT model, arch, run_id, doc_id, n_uniq, n_gold,
-                               pred_ranks, gold_idxs
-                        FROM matches
-                        WHERE dataset=? AND ann_key=?
-                          AND (model, arch, run_id) IN (VALUES {vals})""", *args)
-    else:
-        rows = []
-
-    acc: dict[tuple, list] = {key: [0.0, 0, 0, {}] for key in run_keys}
-    for model, arch, run_id, doc_id, n_uniq, n_gold, ranks, idxs in rows:
-        key = (model, arch, run_id)
-        slot = acc.get(key)
-        if slot is None:
-            continue
-        if doc_ids is not None and doc_id not in doc_ids:
-            continue
-        if exclude_doc_ids is not None and doc_id in exclude_doc_ids:
-            continue
-        ranks = ranks or []
-        if masks is not None:
-            allowed = masks.get(doc_id, set())
-            tp_ranks = [r for r, gi in zip(ranks, idxs or []) if gi in allowed]
-            n_allowed = len(allowed)
-        else:
-            tp_ranks = list(ranks)
-            n_allowed = n_gold
-        s = _doc_scores(n_uniq or 0, n_allowed, tp_ranks, k)[mi]
-        if s != s:                     # NaN -> no gold after filtering
-            slot[2] += 1
-            continue
-        slot[0] += s
-        slot[1] += 1
-        if per_doc:
-            slot[3][doc_id] = s
-
     for key in run_keys:
-        total, n, n_skipped, per_map = acc[key]
-        res = {"mean": (total / n) if n else None, "n": n,
-               "n_skipped": n_skipped}
+        r = res[tuple(key)]
+        pd = r[measure]
+        n = len(pd)
+        item = {"mean": float(pd.vals.mean()) if n else None, "n": n,
+                "n_skipped": r["n_skipped"]}
         if per_doc:
-            res["per_doc"] = per_map
-        out[key] = res
-
-    if cache_key is not None:
-        if not per_doc:
-            db.cache_put(cache_key, {json.dumps(list(kk)): vv
-                                     for kk, vv in out.items()})
-        _memo_put(memo_key, out)
+            item["per_doc"] = pd
+        out[key] = item
     return out
 
 
 # ---------------------------------------------------------------------------
-# in-process memo on top of the DuckDB cache (invalidated by scan version)
+# Result cache: bounded in bytes, single-flight
 # ---------------------------------------------------------------------------
-_MEMO: dict = {}
-_MEMO_ORDER: list = []
-_MEMO_VERSION: int | None = None
+_SEM = threading.BoundedSemaphore(_max_concurrent())
+_POOL = None
 
 
-def _memo_key(cache_key: dict):
-    global _MEMO_VERSION, _MEMO, _MEMO_ORDER
-    from .util import stable_hash
-    v = db.scan_version()
-    if v != _MEMO_VERSION:
-        _MEMO, _MEMO_ORDER, _MEMO_VERSION = {}, [], v
-    return stable_hash(cache_key)
+def run_scores_many(calls: dict) -> dict:
+    """Several `run_scores` calls at once: {name: kwargs} -> {name: result}.
+
+    A workbench that needs a few independent scorings (RQ3: present gold,
+    every distinct context window, all gold) runs them concurrently — each
+    is one DuckDB statement executed outside the GIL."""
+    global _POOL
+    if len(calls) <= 1:
+        return {k: run_scores(**kw) for k, kw in calls.items()}
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(max_workers=_max_concurrent(),
+                                   thread_name_prefix="kpviz-score")
+    futs = {k: _POOL.submit(run_scores, **kw) for k, kw in calls.items()}
+    return {k: f.result() for k, f in futs.items()}
 
 
-def _memo_put(key, value) -> None:
-    if key is None:
-        return
-    if key not in _MEMO:
-        _MEMO_ORDER.append(key)
-        while len(_MEMO_ORDER) > _MEMO_MAX:      # bounded: a long-lived server
-            _MEMO.pop(_MEMO_ORDER.pop(0), None)  # must not grow without limit
-    _MEMO[key] = value
+class ByteLRU:
+    """LRU cache bounded by the summed size of its values.
+
+    `get_or_compute(key, fn)`: fn() -> (value, nbytes). Concurrent callers of
+    the same missing key wait for the first one's computation instead of
+    repeating it — a page load fires several callbacks that need the same
+    per-document scores."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._d: OrderedDict = OrderedDict()
+        self._sizes: dict = {}
+        self._bytes = 0
+        self._lock = threading.Lock()
+        self._inflight: dict = {}
+        self.hits = self.misses = 0
+
+    def get_or_compute(self, key, fn):
+        with self._lock:
+            if key in self._d:
+                self._d.move_to_end(key)
+                self.hits += 1
+                return self._d[key]
+            ev = self._inflight.get(key)
+            owner = ev is None
+            if owner:
+                ev = self._inflight[key] = [threading.Event(), None, None]
+                self.misses += 1
+        if not owner:
+            ev[0].wait()
+            if ev[2] is not None:
+                raise ev[2]
+            return ev[1]
+        try:
+            value, size = fn()
+        except BaseException as e:
+            ev[2] = e
+            with self._lock:
+                self._inflight.pop(key, None)
+            ev[0].set()
+            raise
+        with self._lock:
+            ev[1] = value
+            self._inflight.pop(key, None)
+            if size <= self.max_bytes:
+                self._d[key] = value
+                self._sizes[key] = size
+                self._bytes += size
+                while self._bytes > self.max_bytes and self._d:
+                    old, _v = self._d.popitem(last=False)
+                    self._bytes -= self._sizes.pop(old, 0)
+        ev[0].set()
+        return value
+
+    def clear(self):
+        with self._lock:
+            self._d.clear()
+            self._sizes.clear()
+            self._bytes = 0
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._d), "mb": round(self._bytes / 2**20, 1),
+                    "budget_mb": round(self.max_bytes / 2**20),
+                    "hits": self.hits, "misses": self.misses}
+
+
+_CACHE = ByteLRU(CACHE_BYTES)
+
+
+def set_cache_budget(nbytes: int) -> None:
+    _CACHE.max_bytes = int(nbytes)
+
+
+def cache_stats() -> dict:
+    return _CACHE.stats()
+
+
+def memo(key, fn, size: int = 4096):
+    """Cache any small derived value for the current catalog (UI helpers)."""
+    return _CACHE.get_or_compute((key, db.scan_version()), lambda: (fn(), size))

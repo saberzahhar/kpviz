@@ -8,13 +8,14 @@ Matplotlib's own vector backend and the LaTeX snippet switches to
 from __future__ import annotations
 
 import io
+import json
 import re
 import shutil
+import subprocess
 import threading
 from collections import OrderedDict
-from functools import lru_cache
 
-from .figures import _TEX_TABLE, to_mpl
+from .figures import _TEX_TABLE, render
 from .util import fmt_num, stable_hash
 
 # Matplotlib's pyplot figure manager and rcParams are process-global, and the
@@ -23,11 +24,21 @@ from .util import fmt_num, stable_hash
 # downloads of the same figure are free.
 _render_lock = threading.RLock()
 _CACHE: "OrderedDict[str, bytes | str]" = OrderedDict()
-_CACHE_MAX = 64
+_CACHE_BYTES = 64 * 2**20
+_cache_size = [0]
+_FAILED: dict[str, str] = {}          # render key -> error (never retried)
+
+
+def _render_key(kind: str, spec: dict) -> str:
+    """What the rendered bytes depend on. The caption and the LaTeX table
+    are not drawn in the figure: editing a caption must not re-render (or
+    evict) the figure."""
+    drawn = {k: v for k, v in spec.items() if k not in ("caption", "table")}
+    return kind + ":" + stable_hash(drawn)
 
 
 def _cached(kind: str, spec: dict, build):
-    key = kind + ":" + stable_hash(spec)
+    key = _render_key(kind, spec)
     with _render_lock:
         hit = _CACHE.get(key)
         if hit is not None:
@@ -36,8 +47,10 @@ def _cached(kind: str, spec: dict, build):
         val = build()
         if val is not None:
             _CACHE[key] = val
-            while len(_CACHE) > _CACHE_MAX:
-                _CACHE.popitem(last=False)
+            _cache_size[0] += len(val)
+            while _cache_size[0] > _CACHE_BYTES and len(_CACHE) > 1:
+                _k, old = _CACHE.popitem(last=False)
+                _cache_size[0] -= len(old)
         return val
 
 
@@ -61,134 +74,199 @@ _PROBE_SPEC = {
     "hlines": [{"y": 0.5, "label": "no usd — 100 %", "dash": True}],
     "frontier": {"x": [1e-6, 1e-3], "y": [0.0, 1.0]},
 }
-
+# pdflatex first: it is the fastest engine and the one most papers use;
+# lualatex (slowest, and the one most often missing fonts) last
+_ENGINES = ("pdflatex", "xelatex", "lualatex")
 
 _PROBE_NOTES: list[str] = []
+_probe = {"status": "idle", "engine": None}    # idle | probing | ready
+_probe_lock = threading.Lock()
+_demoted: set[str] = set()
 
 
-@lru_cache(maxsize=1)
-def tex_engine() -> str | None:
-    """First TeX engine that actually compiles a *representative* PGF figure.
-
-    `which` alone is not enough — a minimal or broken TeX install can have the
-    binary but miss font metrics or a Lua module. Probing once (cached) keeps
-    exports honest."""
-    import io
-
+def _probe_key() -> dict:
     import matplotlib
-    for eng in ("lualatex", "xelatex", "pdflatex"):
-        if not shutil.which(eng):
+    key = {"mpl": matplotlib.__version__, "engines": {}}
+    for eng in _ENGINES:
+        path = shutil.which(eng)
+        if not path:
             continue
         try:
-            matplotlib.rcParams["pgf.texsystem"] = eng
-            matplotlib.rcParams["pgf.preamble"] = ""
-            from .figures import to_mpl
-            fig = to_mpl(_PROBE_SPEC, pgf=True)
-            buf = io.BytesIO()
-            # exercise the exact export path (tight bbox measures text via TeX)
-            fig.savefig(buf, format="pdf", backend="pgf", bbox_inches="tight")
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-            if buf.getvalue()[:5] == b"%PDF-":
-                return eng
-            _PROBE_NOTES.append(f"{eng}: produced no PDF")
+            ver = subprocess.run([path, "--version"], capture_output=True,
+                                 text=True, timeout=10).stdout.splitlines()[:1]
+        except Exception:
+            ver = []
+        key["engines"][eng] = [path, ver[0] if ver else ""]
+    return key
+
+
+def _probe_file():
+    try:
+        from .config import settings
+        return settings().state_dir / "tex_probe.json"
+    except Exception:
+        return None
+
+
+def _run_probe() -> str | None:
+    """First engine that compiles a *representative* PGF figure. The result
+    is persisted per (engine binaries, versions, Matplotlib), so a restart
+    does not pay for TeX again."""
+    import matplotlib
+    key = _probe_key()
+    pf = _probe_file()
+    if pf and pf.exists():
+        try:
+            saved = json.loads(pf.read_text())
+            if saved.get("key") == key:
+                _PROBE_NOTES[:] = saved.get("notes", [])
+                return saved.get("engine")
+        except Exception:
+            pass
+    engine = None
+    notes: list[str] = []
+    for eng in _ENGINES:
+        if eng not in key["engines"]:
+            continue
+        try:
+            with _render_lock:
+                matplotlib.rcParams["pgf.texsystem"] = eng
+                matplotlib.rcParams["pgf.preamble"] = ""
+                # the exact export path (tight bbox measures text via TeX)
+                pdf = render(_PROBE_SPEC, True, "pdf", backend="pgf",
+                             bbox_inches="tight")
+            if pdf[:5] == b"%PDF-":
+                engine = eng
+                break
+            notes.append(f"{eng}: produced no PDF")
         except Exception as e:
             first = next((ln for ln in str(e).splitlines()
                           if ln.strip().startswith("!")), "").strip()
-            _PROBE_NOTES.append(f"{eng}: {first or type(e).__name__}")
-            continue
-    # every installed engine failed the probe: say which and why, once. The
-    # alternative is a silent downgrade of every export in the session.
-    if _PROBE_NOTES:
+            notes.append(f"{eng}: {first or type(e).__name__}")
+    _PROBE_NOTES[:] = notes
+    if engine is None and notes:
         print("· no usable TeX engine — exports use Matplotlib's vector "
-              "backend.\n  " + "\n  ".join(_PROBE_NOTES))
-    return None
+              "backend.\n  " + "\n  ".join(notes))
+    if pf:
+        try:
+            pf.write_text(json.dumps({"key": key, "engine": engine,
+                                      "notes": notes}))
+        except OSError:
+            pass
+    return engine
 
 
-def _configure_pgf():
+def start_tex_probe() -> None:
+    """Probe TeX once, in the background, at start-up — never inside a
+    callback (six clipboard callbacks used to each run it at first load)."""
+    with _probe_lock:
+        if _probe["status"] != "idle":
+            return
+        _probe["status"] = "probing"
+
+    def run():
+        eng = None
+        try:
+            eng = _run_probe()
+        finally:
+            with _probe_lock:
+                _probe.update(status="ready", engine=eng)
+    threading.Thread(target=run, daemon=True, name="kpviz-tex-probe").start()
+
+
+def tex_status() -> tuple[str, str | None]:
+    """('probing' | 'ready', engine or None) — never blocks."""
+    with _probe_lock:
+        eng = _probe["engine"]
+        if eng in _demoted:
+            eng = None
+        return _probe["status"], eng
+
+
+def tex_engine(wait: float = 120.0) -> str | None:
+    """The usable engine, waiting for a running probe (exports only)."""
+    import time
+    if _probe["status"] == "idle":
+        start_tex_probe()
+    t0 = time.time()
+    while tex_status()[0] == "probing" and time.time() - t0 < wait:
+        time.sleep(0.05)
+    return tex_status()[1]
+
+
+def _configure_pgf(eng: str):
     import matplotlib
-    matplotlib.rcParams["pgf.texsystem"] = tex_engine() or "pdflatex"
+    matplotlib.rcParams["pgf.texsystem"] = eng
     matplotlib.rcParams["pgf.preamble"] = ""
 
 
-_PGF_WARNED: set[str] = set()
-LAST_PGF_ERROR: str | None = None
-
-
-def _warn_pgf_fallback(exc: Exception) -> None:
-    """Report a PGF render that fell back, once per distinct cause."""
-    global LAST_PGF_ERROR
+def _first_tex_error(exc: Exception) -> str:
     first = next((ln for ln in str(exc).splitlines()
                   if ln.strip().startswith("!")), "").strip()
-    LAST_PGF_ERROR = first or f"{type(exc).__name__}: {str(exc)[:160]}"
-    if LAST_PGF_ERROR not in _PGF_WARNED:
-        _PGF_WARNED.add(LAST_PGF_ERROR)
-        print(f"· PGF export fell back to Matplotlib's vector backend "
-              f"({tex_engine()}): {LAST_PGF_ERROR}")
+    return first or f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
+def _demote(eng: str, err: str) -> None:
+    """A real render failed although the probe passed: stop offering this
+    engine for PGF (reported once)."""
+    if eng not in _demoted:
+        _demoted.add(eng)
+        print(f"· {eng} failed a real PGF render ({err}); PGF disabled for "
+              f"this session, PDF falls back to Matplotlib")
 
 
 def fig_png(spec: dict, dpi: int = 300) -> bytes:
     def build():
         with _render_lock:
-            fig = to_mpl(spec, pgf=False)
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=dpi, facecolor="white",
-                        bbox_inches="tight", pad_inches=0.02)
-            _close(fig)
-            return buf.getvalue()
+            return render(spec, False, "png", dpi=dpi, facecolor="white",
+                          bbox_inches="tight", pad_inches=0.02)
     return _cached(f"png{dpi}", spec, build)
 
 
-def fig_pdf(spec: dict) -> tuple[bytes, str]:
-    """Returns (pdf bytes, method) — 'pgf' (TeX-typeset) or 'matplotlib'
-    (vector fallback, no TeX required)."""
+def fig_pdf(spec: dict) -> tuple[bytes, str, str]:
+    """(pdf bytes, method, note): 'pgf' (TeX-typeset) or 'matplotlib'
+    (vector fallback with embedded TrueType fonts, no TeX required)."""
+    note = [""]
+
     def build():
+        eng = tex_engine()
         with _render_lock:
-            if tex_engine():
+            if eng:
                 try:
-                    _configure_pgf()
-                    fig = to_mpl(spec, pgf=True)
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format="pdf", backend="pgf",
-                                bbox_inches="tight", pad_inches=0.02)
-                    _close(fig)
-                    return b"pgf:" + buf.getvalue()
+                    _configure_pgf(eng)
+                    return b"pgf:" + render(spec, True, "pdf", backend="pgf",
+                                            bbox_inches="tight", pad_inches=0.02)
                 except Exception as e:
-                    # never silent: a PDF that quietly stopped being
-                    # TeX-typeset is a paper with two different font stacks
-                    _warn_pgf_fallback(e)
-            fig = to_mpl(spec, pgf=False)
-            buf = io.BytesIO()
-            fig.savefig(buf, format="pdf", bbox_inches="tight", pad_inches=0.02)
-            _close(fig)
-            return b"mpl:" + buf.getvalue()
+                    err = _first_tex_error(e)
+                    _demote(eng, err)
+                    note[0] = f"{eng} failed ({err})"
+            return b"mpl:" + render(spec, False, "pdf", bbox_inches="tight",
+                                    pad_inches=0.02)
     blob = _cached("pdf", spec, build)
     tag, _, payload = blob.partition(b":")
-    return payload, ("pgf" if tag == b"pgf" else "matplotlib")
+    return payload, ("TeX (PGF)" if tag == b"pgf" else "Matplotlib"), note[0]
 
 
-def fig_pgf(spec: dict) -> str | None:
-    """The .pgf source itself (None when no TeX is available)."""
-    if not tex_engine():
-        return None
+def fig_pgf(spec: dict) -> tuple[str | None, str]:
+    """(.pgf source, "") or (None, reason). Failures are remembered, so a
+    broken figure does not re-run TeX on every click."""
+    eng = tex_engine()
+    if not eng:
+        return None, "no working TeX engine on this machine"
+    key = _render_key(f"pgf-{eng}", spec)
+    if key in _FAILED:
+        return None, _FAILED[key]
 
     def build():
         with _render_lock:
             try:
-                _configure_pgf()
-                fig = to_mpl(spec, pgf=True)
-                buf = io.BytesIO()
-                fig.savefig(buf, format="pgf", backend="pgf")
-                _close(fig)
-                return buf.getvalue().decode("utf-8")
-            except Exception:
+                _configure_pgf(eng)
+                return render(spec, True, "pgf", backend="pgf").decode("utf-8")
+            except Exception as e:
+                _FAILED[key] = f"{eng}: {_first_tex_error(e)}"
                 return None
-    return _cached("pgf", spec, build)
-
-
-def _close(fig):
-    import matplotlib.pyplot as plt
-    plt.close(fig)
+    out = _cached(f"pgf-{eng}", spec, build)
+    return (out, "") if out is not None else (None, _FAILED.get(key, "failed"))
 
 
 # ---------------------------------------------------------------------------
@@ -243,19 +321,28 @@ PGF_PREAMBLE_NOTE = ("% requires \\usepackage{pgf} in your preamble\n"
 
 
 def latex_figure(filename: str, caption: str, label: str,
-                 width: str = "\\linewidth", pgf: bool = True) -> str:
+                 width: str | None = None, pgf: bool = True,
+                 size: str = "2col") -> str:
+    """A figure environment for the exported file.
+
+    The PGF is \\input at its natural size — never \\resizebox-ed, which
+    scaled the typeset labels with it (a 7 in figure squeezed into a 3.3 in
+    column set 7 pt text at ~3 pt). A two-column figure ("2col", 7 in) goes
+    into `figure*`, spanning \\textwidth; a one-column figure (3.35 in) into
+    `figure`. The PDF fallback is scaled to the same width, which is harmless
+    for an image."""
+    env = "figure*" if size in ("2col", "slide") else "figure"
+    width = width or ("\\textwidth" if env == "figure*" else "\\columnwidth")
     body = (f"    \\input{{{filename}}}" if pgf
             else f"    \\includegraphics[width={width}]{{{filename}}}")
     lines = [
         PGF_PREAMBLE_NOTE if pgf else None,
-        "\\begin{figure}[t]",
+        f"\\begin{{{env}}}[t]",
         "    \\centering",
-        ("    \\resizebox{" + width + "}{!}{%") if pgf else None,
         body,
-        "    }" if pgf else None,
         f"    \\caption{{{caption_escape(caption)}}}",
         f"    \\label{{fig:{label}}}",
-        "\\end{figure}",
+        f"\\end{{{env}}}",
     ]
     return "\n".join(l for l in lines if l is not None)
 
@@ -313,12 +400,16 @@ def export_bundle(spec: dict, name: str) -> bytes:
     """Zip with fig.pdf (+ fig.pgf when TeX available) + fig.png + fig.tex."""
     import zipfile
     slug = slugify(name)
-    pdf, method = fig_pdf(spec)
-    pgf = fig_pgf(spec)
+    pdf, method, _note = fig_pdf(spec)
+    pgf, _err = fig_pgf(spec)
     png = fig_png(spec)
     caption = spec.get("caption", "")
     tex = latex_figure(f"{slug}.pgf" if pgf else f"{slug}.pdf",
-                       caption, slug, pgf=bool(pgf))
+                       caption, slug, pgf=bool(pgf),
+                       size=spec.get("size", "2col"))
+    tab = spec.get("table")
+    table_tex = (latex_table(tab["headers"], tab["rows"], caption,
+                             tab.get("label", slug)) if tab else None)
     buf = io.BytesIO()
     # PDF/PNG are already compressed; level 1 keeps the text members small
     # without spending CPU re-compressing binary ones
@@ -328,6 +419,10 @@ def export_bundle(spec: dict, name: str) -> bytes:
             z.writestr(f"{slug}.pgf", pgf)
         z.writestr(f"{slug}.png", png)
         z.writestr(f"{slug}.tex", tex)
+        if table_tex:
+            z.writestr(f"{slug}-table.tex", table_tex)
+        z.writestr("figure.json", json.dumps(spec, ensure_ascii=False, indent=1,
+                                             default=str))
         z.writestr("README.txt",
                    f"KPViz export — {name}\n"
                    f"PDF rendered via: {method}\n"

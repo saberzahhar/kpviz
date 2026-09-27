@@ -70,9 +70,9 @@ TABLE = (["Run", "Context window", "full-document (n=29)",
 
 def main() -> int:
     print("tex engine reported by KPViz:", tex_engine())
-    pgf = fig_pgf(HOSTILE)
+    pgf, err = fig_pgf(HOSTILE)
     if not pgf:
-        print("no TeX distribution — nothing to compile")
+        print("no PGF export —", err or "no TeX distribution", "— nothing to compile")
         return 0
     d = Path(tempfile.mkdtemp(prefix="kpviz-tex-"))
     (d / "hostile.pgf").write_text(pgf)

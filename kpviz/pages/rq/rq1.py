@@ -9,14 +9,16 @@ import math
 
 from dash import Input, Output, State, dcc, html
 
-from ... import db, scanner, ui
+from ... import scanner, ui
 from ...metrics import metric_label, run_scores
 from ...naming import run_labels, run_rows
+from dash.exceptions import PreventUpdate
+
 from ..insights_common import (ann_options, datasets_with_runs,
-                               effective_runs, figure_block, metric_caption,
-                               metric_controls, models_control, prmu_arg,
-                               resolve_ann, rq_header, runs_control,
-                               selected_runs)
+                               effective_runs, figure_block, gate,
+                               metric_caption, metric_controls, models_control,
+                               prmu_arg, resolve_ann, rq_header, runs_control,
+                               selected_runs, vis)
 
 RQ = "rq1"
 
@@ -81,8 +83,11 @@ def register(app):
     register_dataset_refresh(app, f"{RQ}-ds", multi=True)
     register_model_run_chain(app, RQ, multi_ds=True, require_all=True)
 
-    @app.callback(Output(f"{RQ}-ann", "options"), Input(f"{RQ}-ds", "value"))
-    def opts(ds_sel):
+    @app.callback(Output(f"{RQ}-ann", "options"), Input(vis(RQ), "data"),
+                  Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
+    def opts(visible, ds_sel):
+        if not visible:
+            raise PreventUpdate
         return ann_options(ds_sel or [])
 
     @app.callback(
@@ -90,12 +95,23 @@ def register(app):
         Output({"type": "fig-spec", "rq": RQ}, "data"),
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
+        Output({"type": "fig-sig", "rq": RQ}, "data"),
+        Input(vis(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-method", "value"),
-        Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"))
-    def update(ds_sel, measure, k, prmu_sel, ann_choice, method, models_sel,
-               runs_sel):
+        Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
+        State({"type": "fig-sig", "rq": RQ}, "data"),
+        prevent_initial_call=True)
+    def update(visible, ds_sel, measure, k, prmu_sel, ann_choice, method,
+               models_sel, runs_sel, last_sig):
+        sig = gate(visible, [ds_sel, measure, k, prmu_sel, ann_choice, method,
+                             models_sel, runs_sel], last_sig)
+        return (*_update(ds_sel, measure, k, prmu_sel, ann_choice, method,
+                         models_sel, runs_sel), sig)
+
+    def _update(ds_sel, measure, k, prmu_sel, ann_choice, method, models_sel,
+                runs_sel):
         from ...figures import to_plotly
         ds_sel = [d for d in (ds_sel or [])]
         if len(ds_sel) < 2:
@@ -140,7 +156,8 @@ def register(app):
                         f"{metric_label(measure, k, prmu)} scores, over the "
                         f"n={n} (model, run) pairs evaluated on all "
                         f"{len(ds_sel)} datasets. "
-                        + metric_caption(measure, k, prmu_sel, ann_choice)),
+                        + metric_caption(measure, k, prmu_sel, ann_choice,
+                                         ds_sel)),
         }
         # table for the LaTeX export
         headers = [""] + ds_sel

@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import MUTED, PALETTE, PATTERNS, to_plotly
-from ..naming import (natural_key, order_splits, slot_color, split_color,
+from ..figures import MUTED, PATTERNS, to_plotly
+from ..metrics import memo
+from ..naming import (natural_key, order_splits, split_color,
                       split_rank, tokenizer_label)
-from ..util import fmt_num, human_count, mean_sd
+from ..util import declared_langs, human_count, mean_sd
 
 # P green · R yellow · M orange · U red
 PRMU_COLORS = {"P": "#008300", "R": "#eda100", "M": "#eb6834", "U": "#e34948"}
@@ -30,20 +32,21 @@ PANEL_H = 330          # every distribution panel gets the same box
 
 
 def _datasets():
-    return [r[0] for r in db.q("SELECT DISTINCT dataset FROM documents ORDER BY 1")]
+    return memo("ds_datasets", lambda: [r[0] for r in db.q(
+        "SELECT DISTINCT dataset FROM documents ORDER BY 1")])
 
 
 def _annotators(ds: str) -> list[str]:
     """Real annotation sets, never the synthetic union."""
-    return [r[0] for r in db.q(
+    return memo(("ds_annotators", ds), lambda: [r[0] for r in db.q(
         "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? AND ann_key<>? "
-        "ORDER BY 1", ds, COMBINED)]
+        "ORDER BY 1", ds, COMBINED)])
 
 
 def _splits(ds: str) -> list[str]:
-    return [r[0] for r in db.q(
+    return memo(("ds_splits", ds), lambda: [r[0] for r in db.q(
         "SELECT DISTINCT coalesce(split,'?') FROM documents WHERE dataset=? "
-        "ORDER BY 1", ds)]
+        "ORDER BY 1", ds)])
 
 
 def _group_series(data: dict[tuple[str, str], dict], cats: list,
@@ -102,7 +105,23 @@ def layout():
             ui.control("Tokenizer", dcc.Dropdown(
                 id="ds-tok", clearable=False, className="dash-dropdown"), 260),
         ]),
-        html.Div(id="ds-body"),
+        ui.loading(html.Div(id="ds-body")),
+        # the browser lives outside ds-body: changing the split, annotation or
+        # tokenizer re-renders the statistics, not the search you typed
+        ui.card([
+            html.Div([
+                dcc.Input(id="ds-search", type="text", debounce=True,
+                          placeholder="search document ids…",
+                          style={"border": "1px solid var(--border)",
+                                 "borderRadius": "8px", "padding": "7px 11px",
+                                 "fontSize": "13px", "width": "260px"}),
+                dcc.Dropdown(id="ds-flagged", multi=True, options=[],
+                             placeholder="data quality flags (all documents)",
+                             className="dash-dropdown",
+                             style={"minWidth": "420px", "flex": "1"}),
+            ], className="flex", style={"marginBottom": "8px"}),
+            html.Div(id="ds-doc-list"),
+        ], title="Document browser"),
         html.Div(id="ds-doc-view"),
     ], className="page")
 
@@ -152,9 +171,6 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         f"""SELECT ann_key, sum(n), sum(words_sum),
                    sum(CASE WHEN prmu='P' THEN n ELSE 0 END)
             FROM gold_agg WHERE {agg_where} GROUP BY 1""", *agg_args)}
-    n_gold = sum(v[0] or 0 for v in per_ann.values())
-    words_sum = sum(v[1] or 0 for v in per_ann.values())
-    n_present = sum(v[2] or 0 for v in per_ann.values())
 
     def _by_ann(fmt):
         return " · ".join(f"{a} {fmt(per_ann[a])}" for a in anns if a in per_ann)
@@ -203,8 +219,8 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                                 sorted(((r[0], r[1]) for r in split_rows),
                                        key=lambda t: split_rank(t[0])))),
         ui.stat_tile("Unique keyphrases", human_count(n_unique),
-                     ("union of " + ", ".join(anns)) if len(anns) > 1
-                     else "distinct surface forms"),
+                     ("distinct stemmed forms, union of " + ", ".join(anns))
+                     if len(anns) > 1 else "distinct stemmed forms"),
         ui.stat_tile("Keyphrases per document", mean_sd(n_kp_doc, 1), basis),
         ui.stat_tile("Present (P) per document",
                      mean_sd(p_share, 1, pct=True),
@@ -323,7 +339,7 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                     JOIN keyphrases k ON k.kp = g.display
                     WHERE g.dataset=? AND g.ann_key IN ({ann_sql})
                       {'AND d.split=?' if use_split else ''}
-                      AND k.pos IS NOT NULL
+                      AND k.pos IS NOT NULL AND k.pos <> ''
                     GROUP BY 1,2,3""", *agg_args)
     if rows:
         data = {}
@@ -355,39 +371,32 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                               "widen --gold-scope.", className="muted small"),
                      title="Keyphrase POS tags", style={"minWidth": 0})
     grid1 = html.Div([c for c in (c1, c2) if c], className="grid-2")
-
-    browser = ui.card([
-        html.Div([
-            dcc.Input(id="ds-search", type="text", debounce=True,
-                      placeholder="search document ids…",
-                      style={"border": "1px solid var(--border)",
-                             "borderRadius": "8px", "padding": "7px 11px",
-                             "fontSize": "13px", "width": "260px"}),
-            dcc.Dropdown(id="ds-flagged", multi=True, options=[],
-                         placeholder="data quality flags (all documents)",
-                         className="dash-dropdown",
-                         style={"minWidth": "420px", "flex": "1"}),
-        ], className="flex", style={"marginBottom": "8px"}),
-        html.Div(id="ds-doc-list"),
-    ], title="Document browser")
-
-    return html.Div([header, kpis, *charts, grid1, browser])
+    return html.Div([header, kpis, *charts, grid1])
 
 
 # ---------------------------------------------------------------------------
 
 def register(app):
     @app.callback(Output("ds-pick", "options"), Output("ds-pick", "value"),
-                  Input("catalog-version", "data"), State("ds-pick", "value"))
-    def refresh_datasets(_v, current):
+                  Input("vis-datasets", "data"),
+                  Input("catalog-version", "data"),
+                  State("ds-pick", "options"), State("ds-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_datasets(visible, _v, cur_opts, current):
+        """Only while the page is on screen; a hidden page catches up when
+        shown (the catalog version is an input)."""
+        if not visible:
+            raise PreventUpdate
         ds = _datasets()
+        if cur_opts == ds and current in ds:
+            raise PreventUpdate
         value = current if current in ds else (ds[0] if ds else None)
         return ds, value
 
     @app.callback(Output("ds-ann", "options"), Output("ds-ann", "value"),
                   Output("ds-split", "options"), Output("ds-split", "value"),
                   Output("ds-tok", "options"), Output("ds-tok", "value"),
-                  Input("ds-pick", "value"))
+                  Input("ds-pick", "value"), prevent_initial_call=True)
     def set_options(ds):
         if not ds:
             return [], None, [], None, [], None
@@ -401,7 +410,8 @@ def register(app):
 
     @app.callback(Output("ds-body", "children"),
                   Input("ds-pick", "value"), Input("ds-ann", "value"),
-                  Input("ds-split", "value"), Input("ds-tok", "value"))
+                  Input("ds-split", "value"), Input("ds-tok", "value"),
+                  prevent_initial_call=True)
     def body(ds, ann, split, tok):
         if not ds:
             return ui.empty_state("No datasets in the catalog — run a scan on "
@@ -410,7 +420,8 @@ def register(app):
             return ui.empty_state("No annotations derived for this dataset yet.")
         return _body(ds, ann, split, tok)
 
-    @app.callback(Output("ds-flagged", "options"), Input("ds-pick", "value"))
+    @app.callback(Output("ds-flagged", "options"), Input("ds-pick", "value"),
+                  prevent_initial_call=True)
     def flag_options(ds):
         if not ds:
             return []
@@ -420,7 +431,8 @@ def register(app):
 
     @app.callback(Output("ds-doc-list", "children"),
                   Input("ds-pick", "value"), Input("ds-search", "value"),
-                  Input("ds-flagged", "value"), Input("ds-split", "value"))
+                  Input("ds-flagged", "value"), Input("ds-split", "value"),
+                  prevent_initial_call=True)
     def doc_list(ds, q, flagged, split):
         if not ds:
             return None
@@ -436,11 +448,20 @@ def register(app):
         if split and split != "(all)":
             where += " AND coalesce(split,'?')=?"
             args.append(split)
-        rows = db.q(f"""SELECT doc_id, coalesce(split,'?'), n_words, flags
-                        FROM documents WHERE {where} ORDER BY doc_id LIMIT 15""",
-                    *args)
-        if not rows:
+        # natural order (kp20k_testing_2 before _10), a count, the first 25:
+        # sort ids only, then fetch the 25 rows shown
+        ids_all = [r[0] for r in db.q(
+            f"SELECT doc_id FROM documents WHERE {where} LIMIT 50000", *args)]
+        if not ids_all:
             return html.Div("no matching documents", className="muted small")
+        total = (len(ids_all) if len(ids_all) < 50000 else
+                 db.q1(f"SELECT count(*) FROM documents WHERE {where}", *args)[0])
+        top = sorted(ids_all, key=natural_key)[:25]
+        got = {r[0]: r for r in db.q(
+            f"""SELECT doc_id, coalesce(split,'?'), n_words, flags FROM documents
+                WHERE dataset=? AND doc_id IN ({','.join('?' * len(top))})""",
+            ds, *top)}
+        rows = [got[d] for d in top if d in got]
         table_rows, ids = [], []
         for doc_id, sp, nw, flags in rows:
             ids.append(doc_id)
@@ -448,8 +469,12 @@ def register(app):
                 html.Code(doc_id), sp, human_count(nw),
                 html.Span([ui.tag_chip(f) for f in (flags or [])[:3]])
                 if flags else html.Span("—", className="muted")])
-        return ui.table(["Document", "Split", "Words", "Flags"], table_rows,
-                        num_cols={2}, row_ids=ids, table_id="ds-doc")
+        return html.Div([
+            html.Div(f"{len(rows)} of {total:,} matching documents — refine the "
+                     "search or flags to find others; click a row to open it",
+                     className="muted small", style={"marginBottom": "4px"}),
+            ui.table(["Document", "Split", "Words", "Flags"], table_rows,
+                     num_cols={2}, row_ids=ids, table_id="ds-doc")])
 
     @app.callback(Output("ds-doc-view", "children"),
                   Input({"type": "ds-doc-row", "key": ALL}, "n_clicks"),
@@ -467,7 +492,8 @@ def register(app):
         secs = []
         for s in obj.get("sections", []):
             secs.append(html.Div([
-                html.Div(f"{s.get('field')} · {','.join(s.get('language') or [])}",
+                html.Div(f"{s.get('field')} · "
+                         f"{','.join(declared_langs(s)) or 'language from the card'}",
                          className="doc-field"),
                 html.Div(s.get("content", ""), className="doc-text"),
             ], className="doc-section"))

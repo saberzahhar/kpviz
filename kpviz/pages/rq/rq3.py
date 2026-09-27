@@ -11,19 +11,20 @@ from __future__ import annotations
 
 import json
 
-from dash import Input, Output, dcc, html
+import numpy as np
+from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from ... import db, scanner, ui
-from ...metrics import metric_label, run_scores
+from ...metrics import memo, metric_label, paired, run_scores_many
 from ...naming import run_labels, run_rows, window_str
 from ...stats import (mann_whitney_u, p_str, sig_caption, sig_mark,
                       wilcoxon_signed_rank)
-from ...util import fmt_num
 from ..insights_common import (alpha_of, ann_options, datasets_with_runs,
-                               effective_runs, figure_block, metric_caption,
-                               metric_controls, models_control, resolve_ann,
-                               rq_header, runs_control, selected_runs,
-                               value_cell)
+                               effective_runs, figure_block, gate,
+                               metric_caption, metric_controls, models_control,
+                               resolve_ann, rq_header, runs_control,
+                               selected_runs, value_cell, vis)
 
 RQ = "rq3"     # panel (a): truncation conditions
 RQB = "rq3b"   # panel (b): length bins
@@ -60,26 +61,43 @@ def layout():
     ])
 
 
-def _run_limit(idx, model, arch, run_id) -> tuple[str, int, bool] | None:
-    """(tokenizer, effective input limit, came_from_default) for a run.
+def _run_limits(ds: str) -> dict[tuple, tuple | None]:
+    """{(model, arch, run_id): (tokenizer, input limit, from_default) | None}
+    for every run *of this dataset* — one query per catalog version.
 
-    A run that never declares its window still *has* one — the card's default —
-    and the table says so rather than showing a blank."""
-    mcard = idx.model(model)
-    row = db.q1("""SELECT resolved FROM runs
-                   WHERE model=? AND arch=? AND run_id=? LIMIT 1""",
-                model, arch, run_id)
-    resolved = json.loads(row[0] or "{}") if row else {}
-    for ps in mcard.context_params():
-        if "input" not in ps.name:
-            continue
-        info = resolved.get(ps.name) or {}
-        given = info.get("value")
-        v = given if given is not None else ps.default
-        if v and ps.tokenizer:
-            return (ps.tokenizer, int(v),
-                    given is None or info.get("source") == "default")
-    return None
+    Run ids are reused across datasets, so the window must come from this
+    dataset's run (the old per-run lookup had no dataset filter and could
+    apply another dataset's window). A run that never declares its window
+    still *has* one — the card's default — and the table says so. A value
+    that is not a positive integer yields no window instead of a crash."""
+    def build():
+        idx = scanner.cards()
+        out = {}
+        for model, arch, run_id, resj in db.q(
+                "SELECT model, arch, run_id, resolved FROM runs WHERE dataset=?", ds):
+            resolved = json.loads(resj or "{}")
+            lim = None
+            for ps in idx.model(model).context_params():
+                if "input" not in ps.name:
+                    continue
+                info = resolved.get(ps.name) or {}
+                given = info.get("value")
+                v = given if given is not None else ps.default
+                try:
+                    v = int(v) if v is not None else None
+                except (TypeError, ValueError):
+                    v = None
+                if v and v > 0 and ps.tokenizer:
+                    lim = (ps.tokenizer, v,
+                           given is None or info.get("source") == "default")
+                    break
+            out[(model, arch, run_id)] = lim
+        return out
+    return memo(("rq3_limits", ds), build)
+
+
+def _run_limit(ds, model, arch, run_id):
+    return _run_limits(ds).get((model, arch, run_id))
 
 
 def register(app):
@@ -89,8 +107,11 @@ def register(app):
                              prefer=["semeval2010"])
     register_model_run_chain(app, RQ, multi_ds=False)
 
-    @app.callback(Output(f"{RQ}-ann", "options"), Input(f"{RQ}-ds", "value"))
-    def opts(ds):
+    @app.callback(Output(f"{RQ}-ann", "options"), Input(vis(RQ), "data"),
+                  Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
+    def opts(visible, ds):
+        if not visible:
+            raise PreventUpdate
         return ann_options([ds] if ds else [])
 
     @app.callback(
@@ -102,11 +123,20 @@ def register(app):
         Output({"type": "fig-spec", "rq": RQB}, "data"),
         Output({"type": "caption", "rq": RQB}, "value"),
         Output({"type": "rq-table", "rq": RQB}, "children"),
+        Output({"type": "fig-sig", "rq": RQ}, "data"),
+        Input(vis(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-ann", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
-        Input("ins-alpha", "value"))
-    def update(ds, measure, k, ann_choice, models_sel, runs_sel, alpha_ix):
+        Input("ins-alpha", "value"),
+        State({"type": "fig-sig", "rq": RQ}, "data"),
+        prevent_initial_call=True)
+    def update(visible, *args):
+        *inputs, last_sig = args
+        sig = gate(visible, inputs, last_sig)
+        return (*_update(*inputs), sig)
+
+    def _update(ds, measure, k, ann_choice, models_sel, runs_sel, alpha_ix):
         from ...figures import MUTED, to_plotly
         from ...naming import encode_runs, group_key
         empty = to_plotly({"kind": "bar", "series": []})
@@ -132,24 +162,35 @@ def register(app):
         # one call for the "present" condition across every run, and one per
         # distinct (tokenizer, limit) — the dataset-wide gold mask is the
         # expensive part and must not be rebuilt per run
-        present_all = run_scores(ds, keys, ann, measure, k,
-                                 require_position=True, per_doc=True)
         limits: dict[tuple, list] = {}
         for key in keys:
-            lim = _run_limit(idx, *key)
+            lim = _run_limit(ds, *key)
             if lim:
                 limits.setdefault(lim, []).append(key)
-        trunc_all: dict[tuple, dict] = {}
         tok_ok: dict[tuple, tuple] = {}
-        for lim, lim_keys in limits.items():
+        calls = {
+            "present": dict(dataset=ds, run_keys=keys, ann_key=ann,
+                            measure=measure, k=k, require_position=True,
+                            per_doc=True),
+            # panel (b), all gold: scored in the same concurrent batch
+            "plain": dict(dataset=ds, run_keys=keys, ann_key=ann,
+                          measure=measure, k=k, per_doc=True),
+        }
+        for li, (lim, lim_keys) in enumerate(limits.items()):
             tokz, L, _dflt = lim
             have = db.q1("""SELECT count(*), bool_or(approx) FROM gold_tokpos
                             WHERE dataset=? AND tokenizer=?""", ds, tokz)
             tok_ok[lim] = have or (0, False)
             if have and have[0]:
-                trunc_all.update(run_scores(ds, lim_keys, ann, measure, k,
-                                            require_position=True,
-                                            tok_limit=(tokz, L), per_doc=True))
+                calls[f"trunc{li}"] = dict(
+                    dataset=ds, run_keys=lim_keys, ann_key=ann, measure=measure,
+                    k=k, require_position=True, tok_limit=(tokz, L),
+                    per_doc=True)
+        got = run_scores_many(calls)
+        present_all, plain_all = got.pop("present"), got.pop("plain")
+        trunc_all: dict[tuple, dict] = {}
+        for res in got.values():
+            trunc_all.update(res)
 
         for key in keys:
             model, arch, run_id = key
@@ -158,7 +199,7 @@ def register(app):
             present = present_all.get(key) or {"mean": None, "n": 0}
             if present["mean"] is None:
                 continue
-            lim = _run_limit(idx, model, arch, run_id)
+            lim = _run_limit(ds, model, arch, run_id)
             trunc, p_val = None, None
             win_txt = window_str(*lim) if lim else "—"
             if lim:
@@ -166,11 +207,12 @@ def register(app):
                 if have[0]:
                     trunc = trunc_all.get(key)
                     approx_any = approx_any or bool(have[1])
-                    pa = present.get("per_doc", {})
-                    pb = (trunc or {}).get("per_doc", {})
-                    common = sorted(set(pa) & set(pb))
-                    _w, p_val = wilcoxon_signed_rank(
-                        [pb[d] for d in common], [pa[d] for d in common])
+                    pa = present.get("per_doc")
+                    pb = (trunc or {}).get("per_doc")
+                    if pa is not None and pb is not None:
+                        vb, va = paired(pb, pa)
+                        _w, p_val = wilcoxon_signed_rank(vb.tolist(),
+                                                         va.tolist())
             mark = sig_mark(p_val, alpha)
             xs_all.append(lab)
             ys_all.append(round(present["mean"], 3))
@@ -225,7 +267,7 @@ def register(app):
                         + "). Daggers mark a significant paired difference "
                         "(two-sided Wilcoxon signed-rank on per-document "
                         f"scores; {sig_caption(alpha)}). "
-                        + metric_caption(measure, k, None, ann_choice)),
+                        + metric_caption(measure, k, None, ann_choice, [ds])),
         }
         headers = ["Run", "Context window", name_all, name_win, "Δ"]
         specA["table"] = {"headers": headers, "rows": tex_rows,
@@ -237,26 +279,42 @@ def register(app):
         # with length, not how much present gold survives truncation
         seriesB, vlines = [], []
         used_tok: dict[int, int] = {}
-        plain_all = run_scores(ds, keys, ann, measure, k, per_doc=True)
-        lens_cache: dict[str, dict] = {}
+        lens_cache: dict[str, "np.ndarray"] = {}
         splitB_rows, splitB_tex = [], []
         default_tok = [r[0] for r in db.q(
             "SELECT DISTINCT tokenizer FROM doc_tokens WHERE dataset=? LIMIT 1", ds)]
         for key in keys:
             model, arch, run_id = key
             gk = group_key(*key)
-            lim = _run_limit(idx, model, arch, run_id)
+            lim = _run_limit(ds, model, arch, run_id)
             tokz = lim[0] if lim else (default_tok[0] if default_tok else None)
             if tokz is None:
                 continue
+            per_doc = (plain_all.get(key) or {}).get("per_doc")
             if tokz not in lens_cache:
-                lens_cache[tokz] = dict(db.q(
-                    """SELECT doc_id, n_tokens FROM doc_tokens
-                       WHERE dataset=? AND tokenizer=?""", ds, tokz))
+                # document lengths aligned on the shared document index
+                idx_ = per_doc.index if per_doc is not None else None
+                arr = np.full(len(idx_.ids) if idx_ else 0, -1, dtype=np.int64)
+                if idx_ is not None:
+                    got = db.qnp("""SELECT doc_id, n_tokens FROM doc_tokens
+                                    WHERE dataset=? AND tokenizer=?""", ds, tokz)
+                    pos = idx_.pos
+                    for d, n in zip(got["doc_id"].tolist(),
+                                    got["n_tokens"].tolist()):
+                        o = pos.get(d)
+                        if o is not None and n is not None:
+                            arr[o] = n
+                lens_cache[tokz] = arr
             lens = lens_cache[tokz]
-            per = plain_all.get(key) or {}
-            pairs = sorted((lens.get(d), s) for d, s in per.get("per_doc", {}).items()
-                           if lens.get(d) is not None)
+            # (length, score) per document, sorted by length then score
+            PL = np.zeros(0, dtype=np.int64)
+            PS = np.zeros(0, dtype=np.float64)
+            if per_doc is not None and len(per_doc):
+                L = lens[per_doc.ords]
+                ok = L >= 0
+                PL, PS = L[ok], per_doc.vals[ok]
+                order = np.lexsort((PS, PL))
+                PL, PS = PL[order], PS[order]
             # documents that fit the window vs documents the model could not
             # have read in full: two independent groups, so Mann–Whitney U.
             # A run without a declared window still gets a row — it is stated,
@@ -268,37 +326,36 @@ def register(app):
                 splitB_tex.append([labels.get(gk, model), "no window",
                                    "—", "—", "—"])
             if lim:
-                within = [s for L, s in pairs if L <= lim[1]]
-                over = [s for L, s in pairs if L > lim[1]]
+                within, over = PS[PL <= lim[1]], PS[PL > lim[1]]
                 p_split = None
-                if within and over:
+                if len(within) and len(over):
                     _u, p_split = mann_whitney_u(within, over)
                 m_split = sig_mark(p_split, alpha)
-                d_split = ((sum(within) / len(within) - sum(over) / len(over))
-                           if within and over else None)
+                mw = float(within.mean()) if len(within) else None
+                mo = float(over.mean()) if len(over) else None
+                d_split = (mw - mo) if (mw is not None and mo is not None) else None
                 cells = [
-                    value_cell(sum(within) / len(within) if within else None,
-                               len(within) or None),
-                    value_cell(sum(over) / len(over) if over else None,
-                               len(over) or None),
+                    value_cell(mw, len(within) or None),
+                    value_cell(mo, len(over) or None),
                     value_cell(d_split, None, signed=True, mark=m_split)]
                 splitB_rows.append([labels.get(gk, model), window_str(*lim)]
                                    + [c[0] for c in cells])
                 splitB_tex.append([labels.get(gk, model), window_str(*lim)]
                                   + [c[1] for c in cells])
-            if len(pairs) < 4:
+            n_pairs = len(PL)
+            if n_pairs < 4:
                 continue
-            nb = min(8, max(3, len(pairs) // 12))
-            per_bin = max(1, len(pairs) // nb)
+            nb = min(8, max(3, n_pairs // 12))
+            per_bin = max(1, n_pairs // nb)
             xs, ys, hv = [], [], []
-            for i in range(0, len(pairs), per_bin):
-                chunk = pairs[i:i + per_bin]
-                if len(chunk) < max(2, per_bin // 2) and xs:
+            for i in range(0, n_pairs, per_bin):
+                cl, cs = PL[i:i + per_bin], PS[i:i + per_bin]
+                if len(cl) < max(2, per_bin // 2) and xs:
                     break
-                xs.append(sum(p[0] for p in chunk) / len(chunk))
-                ys.append(round(sum(p[1] for p in chunk) / len(chunk), 3))
+                xs.append(float(cl.mean()))
+                ys.append(round(float(cs.mean()), 3))
                 hv.append(f"{labels.get(gk, model)}<br>"
-                          f"~{xs[-1]:.0f} tokens · n={len(chunk)}<br>"
+                          f"~{xs[-1]:.0f} tokens · n={len(cl)}<br>"
                           f"{mlab} = {ys[-1]:.3f}")
             e = enc.get(gk, {})
             seriesB.append({"name": labels.get(gk, model), "x": xs, "y": ys,
@@ -318,7 +375,12 @@ def register(app):
         specB = {
             "kind": "line", "size": "2col", "xlabel": "document length "
             "(model tokens, equal-count bins)"
-            + ("  ·  beyond axis: " + "; ".join(v["label"] for v in beyond)
+            # the axis label only names the window sizes; which run has which
+            # window is spelled out in the caption (a list of run labels
+            # overflowed the figure width)
+            + ("  ·  windows beyond axis: " + ", ".join(
+                (f"{x / 1000:.0f}k" if x >= 1000 else f"{x:g}")
+                for x in sorted({v["x"] for v in beyond}))
                if beyond else ""), "ylabel": mlab,
             "series": seriesB, "vlines": inside,
             "name": f"length-curve-{ds}",
@@ -327,7 +389,10 @@ def register(app):
                         "counts), against all gold keyphrases. Dashed "
                         "verticals mark each run's input window; the drop past "
                         "the line is the truncation penalty. "
-                        + metric_caption(measure, k, None, ann_choice)),
+                        + ("Windows beyond the plotted lengths: "
+                           + "; ".join(v["label"] for v in beyond) + ". "
+                           if beyond else "")
+                        + metric_caption(measure, k, None, ann_choice, [ds])),
         }
         headersB = ["Run", "Context window",
                     "documents within model's context window",

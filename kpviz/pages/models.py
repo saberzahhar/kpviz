@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 
 from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import to_plotly, PALETTE
+from ..figures import to_plotly
 from ..metrics import run_scores
 from ..naming import natural_key, slot_color, window_str
 from ..util import fmt_num, human_cost, human_count
@@ -30,7 +31,7 @@ def layout():
                 id="md-pick", options=[], clearable=False,
                 placeholder="scan first…", className="dash-dropdown"), 280),
         ]),
-        html.Div(id="md-body"),
+        ui.loading(html.Div(id="md-body")),
     ], className="page")
 
 
@@ -135,12 +136,15 @@ def _quality_glance(model):
     if not series_by_run:
         return None
     series = []
+    # colour follows the run (a stable slot), never its rank in this chart
+    slots = db.color_seq("run", sorted(series_by_run))
     for i, (lab, per_ds) in enumerate(
             sorted(series_by_run.items(), key=lambda kv: natural_key(kv[0]))):
         series.append({"name": lab, "x": datasets,
                        "y": [per_ds.get(d) for d in datasets],
-                       "color": slot_color(i)})
-    spec = {"kind": "bar", "xlabel": "dataset", "ylabel": "F1@O (combined gold)",
+                       "color": slot_color(slots.get(lab, i) % 8)})
+    spec = {"kind": "bar", "xlabel": "dataset",
+            "ylabel": "F1@O (all annotation sets, or the only one)",
             "series": series}
     return ui.card([ui.graph("md-quality", to_plotly(spec), 300)],
                    title="Quality glance — F1@O per dataset and run")
@@ -207,14 +211,22 @@ def _body(model):
 
 def register(app):
     @app.callback(Output("md-pick", "options"), Output("md-pick", "value"),
-                  Input("catalog-version", "data"), State("md-pick", "value"))
-    def refresh_models(_v, current):
+                  Input("vis-models", "data"),
+                  Input("catalog-version", "data"),
+                  State("md-pick", "options"), State("md-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_models(visible, _v, cur_opts, current):
+        if not visible:
+            raise PreventUpdate
         opts = _model_options()
+        if cur_opts == opts and current:
+            raise PreventUpdate
         vals = {o["value"] for o in opts}
         value = current if current in vals else (opts[0]["value"] if opts else None)
         return opts, value
 
-    @app.callback(Output("md-body", "children"), Input("md-pick", "value"))
+    @app.callback(Output("md-body", "children"), Input("md-pick", "value"),
+                  prevent_initial_call=True)
     def body(model):
         if not model:
             return ui.empty_state("No models found — add model cards and scan.")

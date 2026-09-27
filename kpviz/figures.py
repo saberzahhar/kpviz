@@ -252,6 +252,12 @@ def _plotly_layout(spec: dict) -> dict:
         lay["xaxis"]["type"] = spec["xscale"]
     if spec.get("yscale"):
         lay["yaxis"]["type"] = spec["yscale"]
+    # log axes read 10^-6, not "1µ" dollars — and match the Matplotlib export
+    for ax in ("xaxis", "yaxis"):
+        if lay[ax].get("type") == "log":
+            lay[ax].update(exponentformat="power", showexponent="all")
+    # keep the user's zoom and legend toggles across updates of the same view
+    lay["uirevision"] = spec.get("name") or spec.get("kind")
     if len(spec.get("series", [])) >= 2 and spec.get("barmode") == "stack":
         lay["legend"]["traceorder"] = "normal"
     if spec.get("title"):
@@ -597,6 +603,40 @@ def _mpl_pie_grid(spec: dict, plt, size: str, figsize, pgf: bool):
     return fig
 
 
+def _num(v):
+    """None/NaN-safe number for Matplotlib: missing is NaN (drawn as a gap),
+    never zero. Plotly tolerates None; Matplotlib raised TypeError on it, so
+    any figure with a missing value (an RQ3 run without a window, an
+    undefined correlation) failed to export."""
+    if v is None:
+        return float("nan")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def render(spec: dict, pgf: bool, fmt: str, **savefig_kw) -> bytes:
+    """Build *and save* a figure inside the same rc context.
+
+    Saving after `to_mpl`'s context had exited dropped `pdf.fonttype: 42`
+    (and `pgf.rcfonts`), so Matplotlib PDFs embedded Type 3 fonts — the
+    classic camera-ready rejection. Every export path goes through here."""
+    import matplotlib
+    if matplotlib.get_backend().lower() not in (
+            "agg", "pdf", "ps", "svg", "cairo", "pgf", "template"):
+        matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    buf = io.BytesIO()
+    with plt.rc_context(_mpl_rc(spec.get("size", "2col"), pgf)):
+        fig = to_mpl(spec, pgf=pgf)
+        try:
+            fig.savefig(buf, format=fmt, **savefig_kw)
+        finally:
+            plt.close(fig)
+    return buf.getvalue()
+
+
 def to_mpl(spec: dict, pgf: bool = False):
     import matplotlib
     # every render here goes to an in-memory buffer, so a non-file backend
@@ -624,7 +664,8 @@ def to_mpl(spec: dict, pgf: bool = False):
 
         if kind == "heatmap":
             h = spec["heat"]
-            z = h["z"]
+            import numpy as _np
+            z = _np.array([[_num(v) for v in row] for row in h["z"]], dtype=float)
             if h.get("diverging"):
                 cmap = LinearSegmentedColormap.from_list(
                     "kpdiv", [DIV_LOW, DIV_MID, DIV_HIGH])
@@ -645,7 +686,7 @@ def to_mpl(spec: dict, pgf: bool = False):
             if h.get("text"):
                 for i, row in enumerate(h["text"]):
                     for j, t in enumerate(row):
-                        if t not in (None, ""):
+                        if t not in (None, "") and z[i][j] == z[i][j]:
                             val = z[i][j]
                             dark = _is_dark(cmap, norm(val) if h.get("diverging")
                                             else _seq_t(val, h))
@@ -695,15 +736,16 @@ def to_mpl(spec: dict, pgf: bool = False):
                               alpha=s.get("alpha", 1.0),
                               label=s.get("name", ""), linewidth=0,
                               hatch=hatch, edgecolor=SURFACE)
+                vals = [_num(v) for v in s[val_key]]
                 if horiz:
-                    ax.barh(offs, s[val_key], height=width * 0.92, left=bots,
+                    ax.barh(offs, vals, height=width * 0.92, left=bots,
                             **bar_kw)
                 else:
-                    ax.bar(offs, s[val_key], width=width * 0.92, bottom=bots,
+                    ax.bar(offs, vals, width=width * 0.92, bottom=bots,
                            **bar_kw)
                 if s.get("text") and not stacked:
-                    for xv, yv, t in zip(offs, s[val_key], s["text"]):
-                        if t and yv is not None:
+                    for xv, yv, t in zip(offs, vals, s["text"]):
+                        if t and yv == yv:
                             ax.annotate(str(t), (yv, xv) if horiz else (xv, yv),
                                         xytext=(3, 0) if horiz else (0, 2),
                                         textcoords="offset points",
@@ -730,6 +772,7 @@ def to_mpl(spec: dict, pgf: bool = False):
                                    "mpl1col" if size == "1col" else "mpl")
             for si, s in enumerate(spec.get("series", [])):
                 mode = s.get("mode", "markers")
+                s = dict(s, y=[_num(v) for v in s["y"]])
                 if "lines" in mode:
                     ax.plot(s["x"], s["y"], color=s.get("color", "#2a78d6"),
                             lw=s.get("width", 1.6),
@@ -766,6 +809,7 @@ def to_mpl(spec: dict, pgf: bool = False):
                         lw=1.0, alpha=0.9, label="Pareto frontier", zorder=2)
             if spec.get("xscale") == "log":
                 ax.set_xscale("log")
+                ax.xaxis.set_major_formatter(_log_fmt())
             if spec.get("yscale") == "log":
                 ax.set_yscale("log")
             handles, labels_ = ax.get_legend_handles_labels()
@@ -791,9 +835,6 @@ def to_mpl(spec: dict, pgf: bool = False):
                             xycoords=("data", "axes fraction"),
                             xytext=(3, -8), textcoords="offset points",
                             fontsize=max(5.5, 6.5), color=INK2)
-            if vl.get("shade_beyond"):
-                ax.axvspan(vl["x"], ax.get_xlim()[1], color=MUTED, alpha=0.06,
-                           lw=0)
 
         if spec.get("xlabel"):
             ax.set_xlabel(spec["xlabel"])
@@ -803,9 +844,23 @@ def to_mpl(spec: dict, pgf: bool = False):
             ax.set_xlim(spec["xrange"])
         if spec.get("yrange"):
             ax.set_ylim(spec["yrange"])
+        # shade after the limits are final, or the band stops short of the
+        # axis edge whenever xrange changes them
+        for vl in spec.get("vlines", []):
+            if vl.get("shade_beyond"):
+                lo, hi = ax.get_xlim()
+                ax.axvspan(vl["x"], hi, color=MUTED, alpha=0.06, lw=0)
+                ax.set_xlim(lo, hi)
         if spec.get("title") and size == "slide":
             ax.set_title(spec["title"], loc="left")
         return fig
+
+
+def _log_fmt():
+    """10^n tick labels on log axes, as Plotly shows them (exponentformat
+    'power'), instead of SI prefixes in one renderer and powers in the other."""
+    from matplotlib.ticker import LogFormatterMathtext
+    return LogFormatterMathtext()
 
 
 def _seq_t(val, h):

@@ -12,15 +12,16 @@ from __future__ import annotations
 import json
 
 from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from ... import db, scanner, ui
-from ...metrics import metric_label, run_scores
+from ...metrics import common_ords, memo, metric_label, run_scores, values_at
 from ...naming import (natural_key, param_value_str, slot_color, value_key)
 from ...stats import friedman, p_str, sig_caption, sig_mark, wilcoxon_signed_rank
 from ...util import fmt_num
-from ..insights_common import (alpha_of, ann_options, figure_block,
+from ..insights_common import (alpha_of, ann_options, figure_block, gate,
                                metric_caption, metric_controls, prmu_arg,
-                               resolve_ann, rq_header, value_cell)
+                               resolve_ann, rq_header, value_cell, vis)
 
 RQ = "rq5"
 
@@ -37,13 +38,28 @@ def _varying(model: str) -> dict[str, set]:
 
 def _models_with_variation() -> dict[str, dict[str, set]]:
     """Only models whose runs actually differ somewhere — a model run once, or
-    run many times with identical settings, has no needle to move."""
-    out = {}
-    for (m,) in db.q("SELECT DISTINCT model FROM runs ORDER BY 1"):
-        var = _varying(m)
-        if var:
-            out[m] = var
-    return out
+    run many times with identical settings, has no needle to move.
+    (One pass over `runs` per catalog version, shared by all callbacks.)"""
+    def build():
+        seen: dict[str, dict[str, set]] = {}
+        for m, resj in db.q("SELECT model, resolved FROM runs ORDER BY 1"):
+            d = seen.setdefault(m, {})
+            for p, info in (json.loads(resj or "{}")).items():
+                d.setdefault(p, set()).add(
+                    json.dumps((info or {}).get("value"), default=str))
+        out = {}
+        for m, params in seen.items():
+            var = {p: vs for p, vs in params.items() if len(vs) > 1}
+            if var:
+                out[m] = var
+        return out
+    return memo("rq5_variation", build)
+
+
+def _runs_of(ds: str):
+    return memo(("rq5_runs", ds), lambda: [tuple(r) for r in db.q(
+        """SELECT model, arch, run_id, resolved, violations FROM runs
+           WHERE dataset=?""", ds)])
 
 
 def layout():
@@ -74,9 +90,13 @@ def layout():
 def register(app):
     @app.callback(Output(f"{RQ}-param", "options"),
                   Output(f"{RQ}-param", "value"),
+                  Input(vis(RQ), "data"),
                   Input("catalog-version", "data"),
-                  State(f"{RQ}-param", "value"))
-    def refresh_params(_v, current):
+                  State(f"{RQ}-param", "value"),
+                  prevent_initial_call=True)
+    def refresh_params(visible, _v, current):
+        if not visible:
+            raise PreventUpdate
         var = _models_with_variation()
         counts: dict[str, int] = {}
         spread: dict[str, int] = {}
@@ -98,7 +118,8 @@ def register(app):
                   Output(f"{RQ}-ds", "options"), Output(f"{RQ}-ds", "value"),
                   Output(f"{RQ}-ann", "options"),
                   Input(f"{RQ}-param", "value"),
-                  State(f"{RQ}-model", "value"))
+                  State(f"{RQ}-model", "value"),
+                  prevent_initial_call=True)
     def opts(param, current):
         if not param:
             return [], [], [], [], ["auto"]
@@ -121,12 +142,21 @@ def register(app):
         Output({"type": "fig-spec", "rq": RQ}, "data"),
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
+        Output({"type": "fig-sig", "rq": RQ}, "data"),
+        Input(vis(RQ), "data"),
         Input(f"{RQ}-param", "value"), Input(f"{RQ}-model", "value"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
-        Input(f"{RQ}-ann", "value"), Input("ins-alpha", "value"))
-    def update(param, models_sel, ds_sel, measure, k, prmu_sel, ann_choice,
-               alpha_ix):
+        Input(f"{RQ}-ann", "value"), Input("ins-alpha", "value"),
+        State({"type": "fig-sig", "rq": RQ}, "data"),
+        prevent_initial_call=True)
+    def update(visible, *args):
+        *inputs, last_sig = args
+        sig = gate(visible, inputs, last_sig)
+        return (*_update(*inputs), sig)
+
+    def _update(param, models_sel, ds_sel, measure, k, prmu_sel, ann_choice,
+                alpha_ix):
         from ...figures import to_plotly
         empty = to_plotly({"kind": "bar", "series": []})
         var = _models_with_variation()
@@ -151,8 +181,8 @@ def register(app):
         for ds in ds_sel:
             ann = resolve_ann(ds, ann_choice)
             for m in models:
-                rows = db.q("""SELECT arch, run_id, resolved, violations
-                               FROM runs WHERE model=? AND dataset=?""", m, ds)
+                rows = [(r[1], r[2], r[3], r[4]) for r in _runs_of(ds)
+                        if r[0] == m]
                 keys, meta = [], {}
                 for arch, rid, resj, vj in rows:
                     info = (json.loads(resj or "{}").get(param) or {})
@@ -179,7 +209,7 @@ def register(app):
                     if best is None or sc["mean"] > best["mean"]:
                         by_value[vj] = {"value": val, "mean": sc["mean"],
                                         "n": sc["n"], "illegal": illegal,
-                                        "per_doc": sc.get("per_doc", {}),
+                                        "per_doc": sc.get("per_doc"),
                                         "run": key[2]}
                 if by_value:
                     cells[(ds, m)] = by_value
@@ -204,20 +234,16 @@ def register(app):
             by_value = cells[(ds, m)]
             present = [vj for vj in col_order if vj in by_value]
             # paired blocks = the documents every value was scored on
-            common = None
-            for vj in present:
-                docs = set(by_value[vj]["per_doc"])
-                common = docs if common is None else (common & docs)
-            common = sorted(common or [])
+            common = common_ords([by_value[vj]["per_doc"] for vj in present])
+            cols = {vj: values_at(by_value[vj]["per_doc"], common).tolist()
+                    for vj in present}
             p_val, test = None, "—"
-            if len(present) >= 3 and common:
-                _chi, p_val = friedman([[by_value[vj]["per_doc"][d]
-                                         for d in common] for vj in present])
+            if len(present) >= 3 and len(common):
+                _chi, p_val = friedman([cols[vj] for vj in present])
                 test = "Friedman"
-            elif len(present) == 2 and common:
-                _w, p_val = wilcoxon_signed_rank(
-                    [by_value[present[0]]["per_doc"][d] for d in common],
-                    [by_value[present[1]]["per_doc"][d] for d in common])
+            elif len(present) == 2 and len(common):
+                _w, p_val = wilcoxon_signed_rank(cols[present[0]],
+                                                 cols[present[1]])
                 test = "Wilcoxon"
             if p_val is not None:
                 tested += 1
@@ -239,7 +265,7 @@ def register(app):
                 row_h.append(node)
                 row_t.append(cell[1] + (" (best)" if vj == best_vj else ""))
             p_cell = f"{p_str(p_val)}" if p_val is not None else \
-                ("n<6" if common else "—")
+                ("n<6" if len(common) else "—")
             row_h.append(html.Span([p_cell, html.Sup(mark)] if mark else p_cell,
                                    title=f"{test} over {len(common)} common documents"))
             row_t.append(f"{p_cell} {mark}".strip())
@@ -248,6 +274,9 @@ def register(app):
 
         # ---- figure: the headline, one series per model ---------------------
         series = []
+        # colour follows the model (the same slot on every page), not its
+        # position in this chart
+        mslot = db.color_seq("model", sorted(models))
         for i, m in enumerate(sorted(models, key=lambda m: natural_key(idx.model(m).name))):
             xs, ys, hv = [], [], []
             for vj in col_order:
@@ -266,7 +295,8 @@ def register(app):
                                         for d, c in per_ds))
             if xs:
                 series.append({"name": idx.model(m).name, "x": xs, "y": ys,
-                               "hover": hv, "color": slot_color(i)})
+                               "hover": hv,
+                               "color": slot_color(mslot.get(m, i) % 8)})
 
         spec_p = None
         for m in models:
@@ -293,7 +323,8 @@ def register(app):
                         "(dataset, model) separately over the documents its "
                         "runs share — Friedman for three or more values, "
                         "Wilcoxon for two; " + sig_caption(alpha) + ". "
-                        + metric_caption(measure, k, prmu_sel, ann_choice)),
+                        + metric_caption(measure, k, prmu_sel, ann_choice,
+                                         sorted(ds_sel))),
         }
         spec["table"] = {"headers": headers, "rows": tex, "label": f"hp-{param}"}
         note = html.Div(

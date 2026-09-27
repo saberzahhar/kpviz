@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import json
-import time
 
-from dash import Input, Output, State, dcc, html, no_update
+from dash import Input, Output, State, ctx, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
 from ..config import settings
-from ..util import human_bytes, human_count, human_duration
+from ..util import human_bytes, human_count, human_duration, stable_hash
 
 
 def layout():
@@ -18,19 +18,27 @@ def layout():
         html.P(["Data root ", html.Code(str(st.data_root)),
                 " — scans detect new, modified and deleted components by "
                 "size/mtime + BLAKE2 content hash, then re-derive only what "
-                "changed, in parallel across all CPU threads. Exact per-step "
-                "timings of every scan are archived in .kpviz/scan_stats/."],
+                "changed, in parallel across the CPU cores. Exact per-step "
+                "timings and memory of every scan are archived in "
+                ".kpviz/scan_stats/."],
                className="page-desc"),
         html.Div([
             html.Button("Scan for changes", id="btn-scan",
                         className="btn primary", n_clicks=0),
-            html.Button("Full re-scan (re-hash everything)", id="btn-rescan",
-                        className="btn", n_clicks=0),
+            html.Button("Full re-scan (re-derive everything)", id="btn-rescan",
+                        className="btn", n_clicks=0,
+                        title="Re-hash every file and re-derive every "
+                              "collection and run"),
+            html.Button("Retry tokenizer downloads", id="btn-retry-tok",
+                        className="btn small", n_clicks=0,
+                        title="Forget which tokenizer assets were unavailable "
+                              "and try again on the next scan"),
             html.Button("Cancel", id="btn-cancel", className="btn small",
                         n_clicks=0, style={"display": "none"}),
             html.Span(id="scan-headline", className="muted small"),
         ], className="flex", style={"marginBottom": "14px"}),
-        html.Div(id="scan-progress"),
+        html.Div(id="scan-progress", children=_progress_panel(
+            scanner.STATE.snapshot())),
         html.Div(id="home-inventory"),
         html.Div(id="home-backends"),
         html.Div([
@@ -45,7 +53,7 @@ def layout():
             ]),
             html.Div(id="home-issues"),
         ]),
-        dcc.Interval(id="home-poll", interval=1000, n_intervals=0),
+        dcc.Store(id="scan-panel-sig"),
     ], className="page")
 
 
@@ -78,6 +86,12 @@ def _progress_panel(snap: dict):
     if running and running[0]["total"]:
         frac_run = min(1.0, running[0]["done"] / running[0]["total"])
     frac = (n_done + frac_run) / n_steps if n_steps else 0
+    if snap.get("skipped") and not snap["running"]:
+        return ui.card(html.Div([
+            ui.badge("up to date", "ok"),
+            html.Span(" nothing changed since the last scan — the catalog was "
+                      "left as it was (no re-derivation, no cache invalidation)",
+                      className="muted small")]), title="Scan")
     if snap["running"]:
         status_line = [
             html.B(f"{100 * frac:.0f}% "),
@@ -87,6 +101,10 @@ def _progress_panel(snap: dict):
     elif snap.get("error"):
         status_line = [ui.badge("scan failed", "bad"),
                        html.Span(" see log below", className="muted small")]
+    elif snap.get("cancelled"):
+        status_line = [ui.badge("scan cancelled", "warn"),
+                       html.Span(" the next scan redoes the unfinished work",
+                                 className="muted small")]
     else:
         dur = (snap.get("finished_at") or 0) - (snap.get("started_at") or 0)
         status_line = [ui.badge("scan complete", "ok"),
@@ -118,7 +136,7 @@ def _inventory():
         "SELECT kind, count(*) FROM files GROUP BY kind")}
     n_docs = db.q1("SELECT count(*), sum(n_words) FROM documents")
     n_gold = db.q1("SELECT sum(n) FROM gold_agg WHERE ann_key <> '@combined'")
-    n_kp = db.q1("SELECT count(*), count(pos) FROM keyphrases")
+    n_kp = db.q1("SELECT count(*), count(nullif(pos, '')) FROM keyphrases")
     n_runs = db.q1("SELECT count(*) FROM runs")
     n_preds = db.q1("SELECT count(*), sum(n_preds) FROM preds")
     n_ds = db.q1("SELECT count(DISTINCT dataset) FROM documents")
@@ -129,7 +147,8 @@ def _inventory():
         ui.stat_tile("Documents", human_count(n_docs[0] if n_docs else 0),
                      f"{human_count(n_docs[1] or 0)} words" if n_docs else ""),
         ui.stat_tile("Gold keyphrases", human_count(n_gold[0] if n_gold else 0),
-                     f"{human_count(n_kp[0])} unique · {human_count(n_kp[1])} POS-tagged"
+                     f"{human_count(n_kp[0])} distinct phrases · "
+                     f"{human_count(n_kp[1])} POS-tagged"
                      if n_kp else ""),
         ui.stat_tile("Models", counts.get("model_card", 0),
                      f"{counts.get('arch_card', 0)} architectures"),
@@ -186,6 +205,20 @@ def _issues(groupby: str):
             html.Span(" every run is complete, valid and fully linked",
                       className="muted small")]), title="Run issues"))
 
+    card_errors = db.kv_get("card_errors", []) or []
+    if card_errors:
+        blocks.append(ui.card(ui.table(
+            ["Card", "Problem"],
+            [[html.Code(e["file"]), e["error"]] for e in card_errors]),
+            title="Unreadable cards — treated as absent until fixed"))
+    coll = db.kv_get("collection_issues", {}) or {}
+    coll_rows = [[ds, ui.tag_chip(f"{k}:{v}")] for ds, d in sorted(coll.items())
+                 for k, v in d.items() if k != "first_malformed_byte"]
+    if coll_rows:
+        blocks.append(ui.card(ui.table(["Dataset", "Collection integrity"],
+                                       coll_rows),
+                              title="Collection integrity"))
+
     # share of the dataset's own documents, in the same cell as the count —
     # "157" means nothing until you know whether the collection has 200 or 20k
     fl = db.q("""SELECT d.dataset, f.fl, count(*),
@@ -215,6 +248,8 @@ def _backends_panel():
     b = backends()
     rows = []
     for name, info in b.items():
+        if name == "TeX":        # the probed engine is listed below instead
+            continue
         kind = {"ok": "ok", "warn": "warn", "info": "gray"}[info["level"]]
         rows.append([name, ui.badge(info["value"], kind),
                      info["note"] or ""])
@@ -230,7 +265,24 @@ def _backends_panel():
                      f"gold {d['gold_scope']} · tokens {d['token_scope']}",
                      "distribution charts always cover every split"),
     ]
-    warn = [n for n, i in b.items() if i["level"] == "warn"]
+    # tokenizer *assets*, not just packages: an approximate token count is
+    # exactly the silent degradation this panel exists to expose
+    toks = db.kv_get("tokenizers", {}) or {}
+    for spec, info in sorted(toks.items()):
+        exact = info.get("status") == "exact"
+        rows.append([html.Code(spec),
+                     ui.badge("exact" if exact else "approximate",
+                              "ok" if exact else "warn"),
+                     "" if exact else (info.get("why") or "asset unavailable")
+                     + " — token counts and window positions are estimated"])
+    from ..export import tex_status
+    tstat, teng = tex_status()
+    rows.append(["TeX (probed)", ui.badge(teng or ("checking…" if tstat == "probing"
+                                                     else "none"),
+                                          "ok" if teng else "gray"),
+                 "PGF typesetting" if teng else "PDF/PNG via Matplotlib"])
+    warn = [n for n, i in b.items() if i["level"] == "warn" and n != "TeX"] + [
+        s_ for s_, i in toks.items() if i.get("status") != "exact"]
     return html.Div([
         html.H3("Engine", className="section-title"),
         html.Div("Fast paths in use on this machine"
@@ -242,26 +294,39 @@ def _backends_panel():
     ])
 
 
+def _panel_sig(snap: dict) -> str:
+    """What the progress panel shows, minus the clock (elapsed/ETA change on
+    every tick): an unchanged panel is not re-sent."""
+    s = {k: v for k, v in snap.items() if k not in ("elapsed_s", "eta_s")}
+    s["eta_bucket"] = round((snap.get("eta_s") or 0) / 5)
+    s["elapsed_bucket"] = int(snap.get("elapsed_s") or 0)
+    return stable_hash(s)
+
+
 def register(app):
+    from ..appfactory import _sidebar_status
+
     @app.callback(
         Output("scan-progress", "children"),
-        Output("home-inventory", "children"),
-        Output("home-backends", "children"),
-        Output("home-issues", "children"),
         Output("btn-scan", "disabled"),
         Output("btn-rescan", "disabled"),
         Output("btn-cancel", "style"),
         Output("scan-headline", "children"),
         Output("catalog-version", "data"),
-        Input("home-poll", "n_intervals"),
+        Output("scan-poll", "disabled"),
+        Output("sidebar-scan", "children"),
+        Output("scan-panel-sig", "data"),
+        Input("scan-poll", "n_intervals"),
         Input("btn-scan", "n_clicks"),
         Input("btn-rescan", "n_clicks"),
         Input("btn-cancel", "n_clicks"),
-        Input("issues-groupby", "value"),
+        Input("btn-retry-tok", "n_clicks"),
         State("catalog-version", "data"),
-    )
-    def poll(_n, s_clicks, r_clicks, c_clicks, groupby, known_version):
-        from dash import ctx
+        State("scan-panel-sig", "data"),
+        prevent_initial_call=True)
+    def poll(_n, s_clicks, r_clicks, c_clicks, t_clicks, known_version, last_sig):
+        """The only periodic callback. It runs while a scan runs (the
+        interval is disabled otherwise) and returns only what changed."""
         trig = ctx.triggered_id
         if trig == "btn-scan":
             scanner.start_scan(False)
@@ -269,19 +334,35 @@ def register(app):
             scanner.start_scan(True)
         elif trig == "btn-cancel":
             scanner.request_cancel()
+        elif trig == "btn-retry-tok":
+            from ..textproc import forget_tokenizers
+            forget_tokenizers(settings().tokenizer_cache)
         snap = scanner.STATE.snapshot()
         running = snap["running"]
         v = db.scan_version()
-        version_out = v if v != known_version else no_update
-        # inventory/issues only when idle (and when stale or explicitly asked)
-        refresh_static = (not running) and (
-            v != known_version or trig in ("btn-scan", "btn-rescan",
-                                           "issues-groupby", None))
-        inv = _inventory() if refresh_static else no_update
-        iss = _issues(groupby or "dataset") if refresh_static else no_update
-        eng = _backends_panel() if refresh_static else no_update
-        headline = f"catalog version {v}" if (v and not running) else ""
-        return (_progress_panel(snap), inv, eng, iss,
-                running, running,
+        sig = _panel_sig(snap)
+        panel = _progress_panel(snap) if sig != last_sig else no_update
+        headline = (f"catalog version {v}" if (v and not running) else "")
+        if trig == "btn-retry-tok":
+            headline = "tokenizer downloads will be retried on the next scan"
+        return (panel, running, running,
                 {"display": "inline-flex"} if running else {"display": "none"},
-                headline, version_out)
+                headline, v if v != known_version else no_update,
+                not running, _sidebar_status(),
+                sig if sig != last_sig else no_update)
+
+    @app.callback(
+        Output("home-inventory", "children"),
+        Output("home-backends", "children"),
+        Output("home-issues", "children"),
+        Input("vis-home", "data"),
+        Input("catalog-version", "data"),
+        Input("issues-groupby", "value"),
+        prevent_initial_call=True)
+    def static(visible, _v, groupby):
+        """Catalog, engine and issues: on show, after a scan publishes, or
+        when the grouping changes — never on a timer."""
+        if not visible:
+            raise PreventUpdate
+        return (_inventory(), _backends_panel(),
+                _issues(groupby or "dataset"))

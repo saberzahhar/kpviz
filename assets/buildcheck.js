@@ -25,6 +25,12 @@
       .catch(function () { /* server down / restarting: try again later */ });
   }
 
+  // a restart matters when the user comes back to the tab, not every 4 s:
+  // check on load, on focus / becoming visible, and once a minute
   check();
-  setInterval(check, 4000);
+  setInterval(check, 60000);
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") check();
+  });
 })();

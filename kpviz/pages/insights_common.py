@@ -1,15 +1,36 @@
 """Shared machinery for the five research-question workbenches."""
 from __future__ import annotations
 
-import json
 
 from dash import dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..metrics import PRMU, metric_label
+from ..metrics import PRMU, memo, metric_label
 from ..naming import (group_key, natural_key, parse_group_key, run_labels,
                       run_rows)
 from ..stats import ALPHAS, ALPHA_DEFAULT
+from ..util import stable_hash
+
+
+def vis(rq: str) -> str:
+    """Id of the store that is True while this workbench is on screen."""
+    return f"vis-{rq}"
+
+
+def gate(visible, inputs, last_sig) -> str:
+    """Compute only what is on screen, and only when something changed.
+
+    Returns the signature of this view (its inputs + the catalog version);
+    raises PreventUpdate when the workbench is hidden, or when it is shown
+    again with nothing changed. The signature lives in a per-client store,
+    so a second tab or a reload still renders."""
+    if not visible:
+        raise PreventUpdate
+    sig = stable_hash([inputs, db.scan_version()])
+    if sig == last_sig:
+        raise PreventUpdate
+    return sig
 
 
 def alpha_of(slider_value) -> float:
@@ -44,15 +65,19 @@ def value_cell(value, n=None, digits: int = 3, signed: bool = False,
 def datasets_with_runs() -> list[str]:
     """Datasets that have runs AND a document collection (runs whose dataset
     was removed stay visible on Overview as missing:dataset tags)."""
-    return [r[0] for r in db.q(
+    return memo("datasets_with_runs", lambda: [r[0] for r in db.q(
         """SELECT DISTINCT r.dataset FROM runs r
            WHERE EXISTS (SELECT 1 FROM documents d WHERE d.dataset = r.dataset)
-           ORDER BY 1""")]
+           ORDER BY 1""")])
+
+
+def _ann_keys(ds: str) -> list[str]:
+    return memo(("ann_keys", ds), lambda: [r[0] for r in db.q(
+        "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? ORDER BY 1", ds)])
 
 
 def ann_for(ds: str) -> str | None:
-    anns = [r[0] for r in db.q(
-        "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? ORDER BY 1", ds)]
+    anns = _ann_keys(ds)
     if not anns:
         return None
     return "@combined" if "@combined" in anns else anns[0]
@@ -63,23 +88,32 @@ def ann_options(datasets: list[str]) -> list[str]:
         return []
     common = None
     for ds in datasets:
-        anns = {r[0] for r in db.q(
-            "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=?", ds)}
+        anns = set(_ann_keys(ds))
         common = anns if common is None else (common & anns)
     return ["auto"] + sorted(common or [])
 
 
 def register_dataset_refresh(app, dropdown_id: str, multi: bool,
-                             prefer: list[str] | None = None):
-    """Keep an RQ dataset selector in sync with the catalog."""
+                             prefer: list[str] | None = None,
+                             rq: str | None = None):
+    """Keep an RQ dataset selector in sync with the catalog — when the
+    workbench is on screen (a hidden one catches up when shown)."""
     from dash import Input, Output, State
+    rq = rq or dropdown_id.split("-")[0]
 
     @app.callback(Output(dropdown_id, "options"),
                   Output(dropdown_id, "value"),
+                  Input(vis(rq), "data"),
                   Input("catalog-version", "data"),
-                  State(dropdown_id, "value"))
-    def _refresh(_v, current):
+                  State(dropdown_id, "options"),
+                  State(dropdown_id, "value"),
+                  prevent_initial_call=True)
+    def _refresh(visible, _v, cur_opts, current):
+        if not visible:
+            raise PreventUpdate
         ds = datasets_with_runs()
+        if cur_opts == ds and current:
+            raise PreventUpdate
         if multi:
             kept = [d for d in (current or []) if d in ds]
             if not kept:
@@ -99,16 +133,25 @@ def resolve_ann(ds: str, choice: str | None) -> str | None:
 
 def model_options(datasets: list[str]):
     """Models that have runs on the selected datasets."""
-    idx = scanner.cards()
-    models = sorted({r["model"] for r in run_rows(datasets or None)})
-    return [{"label": idx.model(m).name, "value": m} for m in models]
+    def build():
+        idx = scanner.cards()
+        models = sorted({r["model"] for r in run_rows(datasets or None)})
+        return [{"label": idx.model(m).name, "value": m} for m in models]
+    return memo(("model_options", tuple(datasets or ())), build)
 
 
 def run_options(datasets: list[str], require_all: bool = False,
                 models: list[str] | None = None):
-    """Options for a run picker — models first, then runs.
+    """Options for a run picker — models first, then runs (memoised per
+    catalog version: the update callback and the picker chain both ask)."""
+    return memo(("run_options", tuple(datasets or ()), require_all,
+                 tuple(models or ())),
+                lambda: _run_options(datasets, require_all, models), 65536)
 
-    require_all -> only (model, arch, run_id) triples present on every
+
+def _run_options(datasets: list[str], require_all: bool = False,
+                 models: list[str] | None = None):
+    """require_all -> only (model, arch, run_id) triples present on every
     selected dataset. models -> restrict to the selected models."""
     rows = run_rows(datasets or None)
     if models:
@@ -133,14 +176,19 @@ def run_options(datasets: list[str], require_all: bool = False,
 
 def register_model_run_chain(app, prefix: str, multi_ds: bool,
                              require_all: bool = False):
-    """Wire dataset -> models -> runs selection for one workbench."""
+    """Wire dataset -> models -> runs selection for one workbench (only
+    while it is on screen)."""
     from dash import Input, Output, State
 
     @app.callback(Output(f"{prefix}-models", "options"),
                   Output(f"{prefix}-models", "value"),
+                  Input(vis(prefix), "data"),
                   Input(f"{prefix}-ds", "value"),
-                  State(f"{prefix}-models", "value"))
-    def _models(ds_sel, current):
+                  State(f"{prefix}-models", "value"),
+                  prevent_initial_call=True)
+    def _models(visible, ds_sel, current):
+        if not visible:
+            raise PreventUpdate
         ds = (ds_sel or []) if multi_ds else ([ds_sel] if ds_sel else [])
         opts = model_options(ds)
         vals = {o["value"] for o in opts}
@@ -149,10 +197,14 @@ def register_model_run_chain(app, prefix: str, multi_ds: bool,
 
     @app.callback(Output(f"{prefix}-runs", "options"),
                   Output(f"{prefix}-runs", "value"),
+                  Input(vis(prefix), "data"),
                   Input(f"{prefix}-ds", "value"),
                   Input(f"{prefix}-models", "value"),
-                  State(f"{prefix}-runs", "value"))
-    def _runs(ds_sel, models_sel, current):
+                  State(f"{prefix}-runs", "value"),
+                  prevent_initial_call=True)
+    def _runs(visible, ds_sel, models_sel, current):
+        if not visible:
+            raise PreventUpdate
         ds = (ds_sel or []) if multi_ds else ([ds_sel] if ds_sel else [])
         opts = run_options(ds, require_all=require_all,
                            models=models_sel or None)
@@ -207,17 +259,47 @@ def runs_control(prefix: str, width: int = 380,
         className="dash-dropdown"), width)
 
 
-def metric_caption(measure: str, k: str, prmu: list[str], ann: str | None) -> str:
+def gold_phrase(ann_choice: str | None, datasets: list[str]) -> str:
+    """The gold actually used, per dataset — never assumed.
+
+    "auto" resolves to the union of every annotation set when a dataset has
+    several (@combined) and to its only set otherwise, so the caption names
+    what was resolved: "author gold (kp20k, kpbiomed); editor gold (kptimes)"
+    or "author+reader combined gold (semeval2010)"."""
+    groups: dict[str, list[str]] = {}
+    for ds in datasets or []:
+        ann = resolve_ann(ds, ann_choice)
+        if ann is None:
+            continue
+        if ann == "@combined":
+            parts = [a for a in _ann_keys(ds) if a != "@combined"]
+            name = "+".join(parts) + " combined gold"
+        else:
+            name = f"{ann} gold"
+        groups.setdefault(name, []).append(ds)
+    if not groups:
+        return "gold keyphrases"
+    return "; ".join(f"{g} ({', '.join(d)})" for g, d in groups.items())
+
+
+CONVENTIONS = ("predictions and gold lowercased, spaCy-tokenised, "
+               "Snowball (Porter2) stemmed and de-duplicated keeping rank "
+               "order; P@k = tp / min(k, #predictions) (no padding); "
+               "documents with no gold after filtering excluded")
+
+
+def metric_caption(measure: str, k: str, prmu: list[str], ann: str | None,
+                   datasets: list[str] | None = None) -> str:
     lab = metric_label(measure, k, prmu)
-    gold = ("author+reader combined gold" if (ann in (None, "auto", "@combined"))
-            else f"“{ann}” gold")
+    gold = gold_phrase(ann, datasets or [])
     extra = ""
     if prmu and sorted(prmu) != sorted(PRMU):
-        extra = (", gold restricted to the "
+        extra = (", restricted to the "
                  + "/".join({"P": "Present", "R": "Reordered", "M": "Mixed",
-                             "U": "Unseen"}[p] for p in prmu) + " classes")
-    return (f"{lab}: macro-averaged over documents; predictions lowercased, "
-            f"stemmed and deduplicated; {gold}{extra}.")
+                             "U": "Unseen"}[p] for p in prmu)
+                 + " classes (in-order PRMU)")
+    return (f"{lab}, macro-averaged over documents, against {gold}{extra}; "
+            f"{CONVENTIONS}.")
 
 
 def prmu_arg(prmu_sel: list[str]):
@@ -236,13 +318,19 @@ def rq_header(question: str, method: str):
 
 
 def figure_block(rq: str, height: int = 470, with_table: bool = True):
-    """Graph + caption editor + export bar + optional table container."""
+    """Graph + caption editor + export bar + optional table container.
+
+    The graph and table sit under a loading overlay that appears only after
+    300 ms (fast updates never flash a spinner) and keeps the previous
+    figure readable underneath; the fig-sig store remembers, per browser
+    tab, which view is already on screen."""
     kids = [
-        ui.graph({"type": "rq-graph", "rq": rq}, height=height),
+        dcc.Store(id={"type": "fig-sig", "rq": rq}),
+        ui.loading(ui.graph({"type": "rq-graph", "rq": rq}, height=height)),
         ui.caption_editor(rq),
         ui.export_bar(rq),
     ]
     if with_table:
-        kids.append(html.Div(id={"type": "rq-table", "rq": rq},
-                             style={"marginTop": "14px"}))
+        kids.append(ui.loading(html.Div(id={"type": "rq-table", "rq": rq},
+                                        style={"marginTop": "14px"})))
     return ui.card(kids)

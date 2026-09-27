@@ -6,19 +6,20 @@ the metric is recomputed with and without them and the delta reported with
 sample sizes."""
 from __future__ import annotations
 
-import json
-
 from dash import Input, Output, dcc, html
 
 from ... import db, scanner, ui
 from ...metrics import metric_label, run_scores
-from ...naming import run_labels, run_rows, parse_group_key
+from ...naming import run_labels, run_rows
 from ...stats import mann_whitney_u, p_str, sig_caption, sig_mark
+from dash import State
+from dash.exceptions import PreventUpdate
+
 from ..insights_common import (alpha_of, ann_options, datasets_with_runs,
-                               effective_runs, figure_block, metric_caption,
-                               metric_controls, models_control, prmu_arg,
-                               resolve_ann, rq_header, runs_control,
-                               selected_runs, value_cell)
+                               effective_runs, figure_block, gate,
+                               metric_caption, metric_controls, models_control,
+                               prmu_arg, resolve_ann, rq_header, runs_control,
+                               selected_runs, value_cell, vis)
 
 RQ = "rq2"
 
@@ -108,8 +109,11 @@ def register(app):
 
     @app.callback(Output(f"{RQ}-ann", "options"),
                   Output(f"{RQ}-label", "options"),
-                  Input(f"{RQ}-ds", "value"))
-    def opts(ds):
+                  Input(vis(RQ), "data"),
+                  Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
+    def opts(visible, ds):
+        if not visible:
+            raise PreventUpdate
         labels = ["(any)"] + [r[0] for r in db.q(
             """SELECT DISTINCT coalesce(label,'(unlabelled)') FROM leakage
                WHERE dataset_a=? OR dataset_b=? ORDER BY 1""", ds, ds)]
@@ -120,14 +124,23 @@ def register(app):
         Output({"type": "fig-spec", "rq": RQ}, "data"),
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
+        Output({"type": "fig-sig", "rq": RQ}, "data"),
+        Input(vis(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-models", "value"),
         Input(f"{RQ}-runs", "value"),
         Input(f"{RQ}-crit", "value"), Input(f"{RQ}-thr", "value"),
-        Input(f"{RQ}-label", "value"), Input("ins-alpha", "value"))
-    def update(ds, measure, k, prmu_sel, ann_choice, models_sel, runs_sel,
-               crit, thr, label, alpha_ix):
+        Input(f"{RQ}-label", "value"), Input("ins-alpha", "value"),
+        State({"type": "fig-sig", "rq": RQ}, "data"),
+        prevent_initial_call=True)
+    def update(visible, *args):
+        *inputs, last_sig = args
+        sig = gate(visible, inputs, last_sig)
+        return (*_update(*inputs), sig)
+
+    def _update(ds, measure, k, prmu_sel, ann_choice, models_sel, runs_sel,
+                crit, thr, label, alpha_ix):
         from ...figures import to_plotly
         if not ds:
             return (to_plotly({"kind": "bar", "series": []}), None, "",
@@ -167,12 +180,12 @@ def register(app):
                         sup_cache[sup] = _leak_docs(ds, thr or 0.8, label,
                                                     set(sup))
                     flagged |= sup_cache[sup]
-            per = per_all.get(key, {}).get("per_doc", {}) or {}
-            vals_all = list(per.values())
-            fl = [s for d, s in per.items() if d in flagged]
-            cl = [s for d, s in per.items() if d not in flagged]
-            if not vals_all:
+            per = per_all.get(key, {}).get("per_doc")
+            if per is None or not len(per):
                 continue
+            vals_all = per.values_array().tolist()
+            fl = per.select(flagged, inside=True).tolist()
+            cl = per.select(flagged, inside=False).tolist()
             base = {"mean": sum(vals_all) / len(vals_all), "n": len(vals_all)}
             excl = ({"mean": sum(cl) / len(cl), "n": len(cl)} if cl
                     else {"mean": None, "n": 0})
@@ -245,7 +258,8 @@ def register(app):
                         "flagged and the clean documents themselves (two-sided "
                         "Mann–Whitney U on per-document scores; "
                         + sig_caption(alpha) + "). "
-                        + metric_caption(measure, k, prmu_sel, ann_choice)),
+                        + metric_caption(measure, k, prmu_sel, ann_choice,
+                                         [ds])),
         }
         headers = ["Run", "All", "w/o flag", "w/ flag", "Δ (w/o − w/)"]
         spec["table"] = {"headers": headers, "rows": tex_rows,

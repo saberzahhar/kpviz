@@ -8,8 +8,7 @@ allocated from one budget here.
 """
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .hostinfo import usable_cpus, usable_ram_bytes
@@ -25,13 +24,9 @@ class Settings:
     workers: int = 0            # 0 -> derived from the budget
     io_workers: int = 0         # 0 -> derived (hashing / stat fan-out)
     db_threads: int = 0         # 0 -> derived (DuckDB during a scan)
-    host: str = "127.0.0.1"
-    port: int = 8050
-    debug: bool = False
     # Scope of the expensive derivations. "eval" = testing/validation splits
     # only (runs are evaluated on those), "all" = every split. Distribution
     # charts always cover every split through gold_agg regardless.
-    pos_scope: str = "eval"       # kept for CLI compatibility
     token_scope: str = "eval"     # per-tokenizer doc token counts + kp positions
     gold_scope: str = "eval"      # gold *instance* rows (+ always: flagged docs)
     # "auto": content-hash a file only when size/mtime moved (nothing to
@@ -79,11 +74,23 @@ class Settings:
 
         Workers hold parsed rows, phrase caches and (for context-window
         analysis) tokenizer state, so they are budgeted too — they are not
-        idle while ingestion happens."""
+        idle while ingestion happens. 1 GB stays reserved for the UI and the
+        OS, and DuckDB never takes more than half the machine: beyond its
+        limit it spills to the temp directory instead of pushing the scan
+        into the OOM killer. (memory_limit bounds DuckDB's buffer manager,
+        not the whole process.)"""
         total = usable_ram_bytes()
         per_worker = 384 * 2**20          # measured peak is well under this
         worker_budget = min(total * 0.45, self.workers * per_worker)
-        return int(max(1 * 2**30, total * 0.75 - worker_budget))
+        free = total - worker_budget - 2**30
+        return int(max(512 * 2**20, min(total * 0.5, free)))
+
+    @property
+    def duckdb_serve_bytes(self) -> int:
+        """DuckDB's budget while serving: UI queries are small aggregates,
+        so the buffer pool shrinks back after a scan (at most 2 GB, 20 % of
+        RAM)."""
+        return int(max(256 * 2**20, min(2 * 2**30, usable_ram_bytes() * 0.2)))
 
     @property
     def phrase_cache_max(self) -> int:
@@ -103,6 +110,7 @@ class Settings:
                 "usable_cpus": usable_cpus(),
                 "usable_ram_gb": round(usable_ram_bytes() / 2**30, 1),
                 "duckdb_memory_gb": round(self.duckdb_memory_bytes / 2**30, 1),
+                "duckdb_serve_gb": round(self.duckdb_serve_bytes / 2**30, 1),
                 "phrase_cache_max": self.phrase_cache_max,
                 "chunk_bytes": self.chunk_bytes,
                 "hash_mode": self.hash_mode,

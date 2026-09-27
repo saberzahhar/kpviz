@@ -4,11 +4,12 @@ from __future__ import annotations
 import json
 
 from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
 from ..costs import cost_formula
 from ..textproc import tokenizer_inner
-from ..util import fmt_num, human_cost, human_count, human_duration
+from ..util import human_cost, human_count
 
 
 def _canon(idx, token: str) -> str:
@@ -163,14 +164,19 @@ def _body(token):
 
 def register(app):
     @app.callback(Output("ar-pick", "options"), Output("ar-pick", "value"),
-                  Input("catalog-version", "data"), State("ar-pick", "value"))
-    def refresh_archs(_v, current):
+                  Input("vis-architectures", "data"),
+                  Input("catalog-version", "data"), State("ar-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_archs(visible, _v, current):
+        if not visible:
+            raise PreventUpdate
         opts = _arch_options()
         vals = {o["value"] for o in opts}
         value = current if current in vals else (opts[0]["value"] if opts else None)
         return opts, value
 
-    @app.callback(Output("ar-body", "children"), Input("ar-pick", "value"))
+    @app.callback(Output("ar-body", "children"), Input("ar-pick", "value"),
+                  prevent_initial_call=True)
     def body(token):
         if not token:
             return ui.empty_state("No architectures found — add cards and scan.")

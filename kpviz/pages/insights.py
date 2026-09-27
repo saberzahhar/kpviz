@@ -1,7 +1,7 @@
 """Insights — five research-question workbenches with LaTeX/PGF export."""
 from __future__ import annotations
 
-from dash import Input, Output, ctx, dcc, html
+from dash import ClientsideFunction, Input, Output, dcc, html
 
 from .. import ui
 from ..stats import ALPHAS, ALPHA_DEFAULT, alpha_str
@@ -49,15 +49,12 @@ def register(app):
     for _key, _t, mod in TABS:
         mod.register(app)
 
-    @app.callback(
-        [Output(f"panel-{k}", "style") for k, _, _ in TABS]
+    # tab switches never reach the server: the clicked tab becomes active and
+    # its visibility store (appfactory's route) wakes that workbench only
+    app.clientside_callback(
+        ClientsideFunction(namespace="kpviz", function_name="tabs"),
+        [Output("ins-active", "data")]
+        + [Output(f"panel-{k}", "style") for k, _, _ in TABS]
         + [Output(f"tab-{k}", "className") for k, _, _ in TABS],
         [Input(f"tab-{k}", "n_clicks") for k, _, _ in TABS],
         prevent_initial_call=True)
-    def switch(*_clicks):
-        active = (ctx.triggered_id or "tab-rq4").replace("tab-", "")
-        styles = [{"display": "block" if k == active else "none"}
-                  for k, _, _ in TABS]
-        classes = ["rq-tab active" if k == active else "rq-tab"
-                   for k, _, _ in TABS]
-        return styles + classes

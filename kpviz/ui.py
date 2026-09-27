@@ -119,6 +119,14 @@ def section(title: str, note: str | None = None):
     return out
 
 
+def loading(child):
+    """Spinner overlay for real work only: shown after 300 ms, over the
+    previous content (kept visible, dimmed) rather than instead of it."""
+    return dcc.Loading(child, delay_show=300, type="dot", color="#2a78d6",
+                       overlay_style={"visibility": "visible",
+                                      "opacity": 0.55})
+
+
 def graph(id, figure=None, height: int = 420, config: dict | None = None):
     from .figures import plotly_config
     return dcc.Graph(id=id, figure=figure or {},
@@ -159,10 +167,8 @@ def export_bar(rq: str):
 
 
 def caption_editor(rq: str, initial: str = ""):
-    """dcc.Textarea has no debounce; the callback it drives only builds two
-    LaTeX strings (the TeX engine probe is cached and no figure is rendered),
-    so per-keystroke cost is negligible. Figure rendering happens only on an
-    explicit download click, behind a cache."""
+    """Editable caption. The LaTeX snippets are rebuilt when it loses focus
+    (n_blur), not on every keystroke; downloads read its current value."""
     return html.Div(dcc.Textarea(
         id={"type": "caption", "rq": rq}, value=initial,
         placeholder="Caption used in exports…"), className="caption-box")

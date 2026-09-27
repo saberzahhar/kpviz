@@ -20,6 +20,7 @@ import bisect
 import importlib.util
 import os
 import re
+import time
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
@@ -112,24 +113,25 @@ def spacy_word_tokens(text: str, lang: str | None) -> list[str]:
     return [t.text for t in doc if not (t.is_punct or t.is_space)]
 
 
-def spacy_doc_tokens(text: str, lang: str | None) -> tuple[list[str], list[int]]:
+def spacy_doc_tokens(text: str, lang: str | None,
+                     lowered: str | None = None) -> tuple[list[str], list[int]]:
     """(lowercased word tokens, char END offset of each) for a document.
 
-    Uses Doc.to_array to stay in C — iterating Token objects in Python is
-    ~4× slower on long documents. The text is normalised to lowercase
-    before tokenising, so token strings are plain slices."""
-    lowered = norm_text(text)
+    Offsets refer to the *normalised* text (see `norm_offsets` to map them
+    back). Uses Doc.to_array and NumPy masks to stay in C — iterating Token
+    objects in Python is ~4x slower on long documents. Pass `lowered` when the
+    caller already has `norm_text(text)`."""
+    lowered = norm_text(text) if lowered is None else lowered
     doc = _blank(lang).tokenizer(lowered)
     try:
         from spacy.attrs import IDX, IS_PUNCT, IS_SPACE, LENGTH
         arr = doc.to_array([IDX, LENGTH, IS_PUNCT, IS_SPACE])
-        toks, ends = [], []
-        for i, l, p, s in arr.tolist():
-            if p or s:
-                continue
-            toks.append(lowered[i:i + l])
-            ends.append(i + l)
-        return toks, ends
+        if not len(arr):
+            return [], []
+        keep = (arr[:, 2] == 0) & (arr[:, 3] == 0)
+        starts = arr[keep, 0].tolist()
+        ends = (arr[keep, 0] + arr[keep, 1]).tolist()
+        return [lowered[a:b] for a, b in zip(starts, ends)], ends
     except Exception:
         toks, ends = [], []
         for t in doc:
@@ -140,53 +142,105 @@ def spacy_doc_tokens(text: str, lang: str | None) -> tuple[list[str], list[int]]
         return toks, ends
 
 
+def norm_offsets(text: str, lowered: str) -> list[int] | None:
+    """Map offsets in `norm_text(text)` back to offsets in `text`.
+
+    None when the two have the same length (the common case: offsets are
+    already shared). NFKC and lowercasing can change length ("ﬃ" -> "ffi",
+    "İ" -> "i̇"); token ends found in the normalised text must then be mapped
+    before they index the original document (token positions, highlighting).
+    Returns a list m with m[j] = original offset of normalised offset j."""
+    if len(text) == len(lowered):
+        return None
+    m = [0]
+    for i, ch in enumerate(text):
+        m.extend([i + 1] * len(norm_text(ch)))
+    if len(m) != len(lowered) + 1:        # normalisation not per-character:
+        n, L = len(text), max(1, len(lowered))   # fall back to proportional
+        return [round(j * n / L) for j in range(len(lowered) + 1)]
+    return m
+
+
 # --------------------------------------------------------------------------
 # Keyphrase analysis cache (worker-local; persisted in the keyphrases table)
 # --------------------------------------------------------------------------
 class PhraseCache:
-    """Analyse each unique (normalised) phrase exactly once per worker.
+    """Analyse each unique (language, normalised phrase) once per worker.
 
-    Memory-bounded: past `max_size` entries the lookaside cache resets
-    (repeats are cheap to recompute; the global table dedups anyway).
-    `persist` marks phrases that should reach the global table — the UI
-    only ever shows phrases referenced by stored gold rows or predictions,
-    so training-only phrases stay worker-local and are never POS-tagged.
-    First occurrence wins for the language (INSERT OR IGNORE semantics)."""
+    Keyed by language as well as text: spaCy's blank tokenisers split the
+    same string differently per language ("l'apprentissage", "e-commerce"),
+    so a text-only key made the tokens — and therefore matches and scores —
+    depend on which language a worker happened to see first.
 
-    __slots__ = ("_cache", "fresh", "_persisted", "max_size")
+    Memory-bounded without cliffs: two generations. When the current one is
+    full it becomes the old one; a hit in the old generation is promoted, so
+    hot phrases survive every rollover and only cold ones are dropped.
+    `persist` marks phrases that belong in the global `keyphrases` table
+    (gold phrases — the only ones the UI shows or POS-tags)."""
+
+    __slots__ = ("_new", "_old", "_raw", "fresh", "_persisted", "max_size",
+                 "hits", "misses")
 
     def __init__(self, max_size: int = 300_000):
-        self._cache: dict[str, dict] = {}
-        self.fresh: dict[str, dict] = {}      # to persist at next drain
-        self._persisted: set[str] = set()     # already drained this process
-        self.max_size = max_size
+        # (lang, raw string) -> entry: a repeated prediction string skips
+        # NFKC normalisation entirely (the dominant cost on cache hits)
+        self._raw: dict[tuple, dict] = {}
+        self._new: dict[tuple, dict] = {}
+        self._old: dict[tuple, dict] = {}
+        self.fresh: dict[tuple, dict] = {}    # to persist at next drain
+        self._persisted: set[tuple] = set()   # already drained this process
+        self.max_size = max(2, int(max_size))
+        self.hits = 0
+        self.misses = 0
 
     def analyze(self, raw: str, lang: str | None, persist: bool = True) -> dict:
+        lang2 = (lang or "en")[:2]
+        if not persist:
+            hit = self._raw.get((lang2, raw))
+            if hit is not None:
+                self.hits += 1
+                return hit
         norm = norm_phrase(raw)
-        entry = self._cache.get(norm)
+        key = (lang2, norm)
+        entry = self._new.get(key)
         if entry is None:
-            lang2 = (lang or "en")[:2]
-            tokens = spacy_word_tokens(norm, lang2)
-            entry = {
-                "kp": norm, "raw": " ".join(str(raw).split()), "lang": lang2,
-                "tokens": tokens,
-                "stems": get_stemmer(lang2).stemWords(tokens),
-                "n_tokens": len(tokens),
-            }
-            if len(self._cache) >= self.max_size:      # RAM bound
-                self._cache = dict(self.fresh)
-            self._cache[norm] = entry
-        if persist and norm not in self._persisted and norm not in self.fresh:
-            self.fresh[norm] = entry
+            entry = self._old.pop(key, None)
+            if entry is None:
+                self.misses += 1
+                tokens = spacy_word_tokens(norm, lang2)
+                stems = get_stemmer(lang2).stemWords(tokens)
+                entry = {"kp": norm, "raw": " ".join(str(raw).split()),
+                         "lang": lang2, "tokens": tokens, "stems": stems,
+                         "sstr": " ".join(stems), "n_tokens": len(tokens)}
+            else:
+                self.hits += 1
+            if len(self._new) >= self.max_size // 2:     # generation rollover
+                self._old, self._new = self._new, {}
+            self._new[key] = entry
+        else:
+            self.hits += 1
+        if persist:
+            if key not in self._persisted and key not in self.fresh:
+                self.fresh[key] = entry
+        else:
+            if len(self._raw) >= self.max_size // 2:
+                self._raw = {}
+            self._raw[(lang2, raw)] = entry
         return entry
 
     def drain(self) -> list[dict]:
-        out = list(self.fresh.values())
+        """Phrases to persist since the last drain (kp, raw, lang only)."""
+        out = [{"kp": e["kp"], "raw": e["raw"], "lang": e["lang"]}
+               for e in self.fresh.values()]
         self._persisted.update(self.fresh)
-        if len(self._persisted) > 2_000_000:           # RAM bound (set of str)
-            self._persisted.clear()
+        if len(self._persisted) > 2_000_000:           # RAM bound (set of keys)
+            self._persisted = set(list(self._persisted)[-1_000_000:])
         self.fresh = {}
         return out
+
+    def stats(self) -> dict:
+        return {"hits": self.hits, "misses": self.misses,
+                "size": len(self._new) + len(self._old), "raw": len(self._raw)}
 
 
 # --------------------------------------------------------------------------
@@ -250,6 +304,14 @@ _STOPWORDS: dict[str, frozenset[str]] = {
     "it": frozenset("di che e la il un a per in una sono mi si lo ma le ci con non del più questo al come da dei nel alla".split()),
     "pt": frozenset("de a o que e do da em um para é com não uma os no se na por mais as dos como mas foi ao ele das tem à seu sua".split()),
 }
+# token -> languages whose stop-word list contains it, built once: one pass
+# over the tokens instead of one generator per candidate language
+_STOP_INDEX: dict[str, tuple[str, ...]] = {}
+for _l, _ws in _STOPWORDS.items():
+    for _w in _ws:
+        _STOP_INDEX[_w] = _STOP_INDEX.get(_w, ()) + (_l,)
+
+
 def detect_language(text: str, candidates: list[str] | None = None,
                     min_tokens: int = 5,
                     tokens: list[str] | None = None) -> tuple[str | None, float]:
@@ -261,8 +323,16 @@ def detect_language(text: str, candidates: list[str] | None = None,
     langs = [l for l in (candidates or list(_STOPWORDS)) if l in _STOPWORDS]
     if not langs:
         return None, 0.0
+    counts = dict.fromkeys(langs, 0)
+    get = _STOP_INDEX.get
+    for t in toks:
+        hit = get(t)
+        if hit:
+            for l in hit:
+                if l in counts:
+                    counts[l] += 1
     n = len(toks)
-    scores = {l: sum(1 for t in toks if t in _STOPWORDS[l]) / n for l in langs}
+    scores = {l: counts[l] / n for l in langs}
     best = max(scores, key=scores.get)
     ordered = sorted(scores.values(), reverse=True)
     margin = ordered[0] - (ordered[1] if len(ordered) > 1 else 0.0)
@@ -286,25 +356,82 @@ def tokenizer_inner(spec: str) -> str:
     return m.group(2) if m else (spec or "")
 
 
+_NEG_TTL_S = 24 * 3600          # retry an unavailable asset once a day
+
+
+def offline() -> bool:
+    """True when the user asked for no network (demo halls, air-gapped HPC)."""
+    return any(os.environ.get(v, "").lower() in ("1", "true", "yes")
+               for v in ("KPVIZ_OFFLINE", "HF_HUB_OFFLINE",
+                         "TRANSFORMERS_OFFLINE"))
+
+
 class ModelTokenizer:
-    def __init__(self, spec: str, cache_dir: Path | None = None):
+    """A model tokenizer, exact when its asset is available, otherwise a
+    flagged word-ratio approximation.
+
+    Resolution happens once per scan in the parent (`allow_network=True`),
+    which caches assets under the state directory and records unavailable
+    ones in a `.unavailable` marker (retried after a day, or on request).
+    Workers are built with `allow_network=False` and the parent's verdict
+    (`expect`), so they only ever read local files: N workers no longer each
+    wait on DNS for the same missing asset."""
+
+    def __init__(self, spec: str, cache_dir: Path | None = None,
+                 allow_network: bool = True, expect: str | None = None):
         self.spec = spec
         m = _SPEC_RE.match(spec or "")
         self.backend = m.group(1).lower() if m else None
         self.name = m.group(2) if m else (spec or "")
         self.cache_dir = cache_dir
+        self.allow_network = allow_network and not offline()
+        self.expect = expect
+        self.why = ""
         self._impl = None
 
+    # -- asset locations -----------------------------------------------------
+    def _dir(self) -> Path | None:
+        if not self.cache_dir:
+            return None
+        return self.cache_dir / self.name.replace("/", "__")
+
+    def _marker(self) -> Path | None:
+        d = self._dir()
+        return d / ".unavailable" if d else None
+
+    def _known_unavailable(self) -> bool:
+        mk = self._marker()
+        try:
+            return bool(mk and mk.exists()
+                        and time.time() - mk.stat().st_mtime < _NEG_TTL_S)
+        except OSError:
+            return False
+
+    def _mark_unavailable(self, why: str) -> None:
+        mk = self._marker()
+        if not mk:
+            return
+        try:
+            mk.parent.mkdir(parents=True, exist_ok=True)
+            mk.write_text(why[:500], encoding="utf-8")
+        except OSError:
+            pass
+
+    # -- resolution ------------------------------------------------------------
     def _resolve(self):
         if self._impl is not None:
             return self._impl
         impl = None
-        if self.backend == "transformers":
-            impl = self._try_hf()
-        elif self.backend == "tiktoken":
-            impl = self._try_tiktoken()
+        if self.expect != "approx":
+            if self.backend == "transformers":
+                impl = self._try_hf()
+            elif self.backend == "tiktoken":
+                impl = self._try_tiktoken()
+            elif self.backend:
+                self.why = f"unknown tokenizer backend {self.backend!r}"
         if impl is None:
             impl = ("approx", _FALLBACK_RATIO.get(self.backend, 1.30))
+            self.why = self.why or "asset unavailable"
         self._impl = impl
         return impl
 
@@ -312,25 +439,37 @@ class ModelTokenizer:
         try:
             from tokenizers import Tokenizer
         except Exception:
+            self.why = "the `tokenizers` package is not installed"
             return None
-        if self.cache_dir:
-            local = self.cache_dir / self.name.replace("/", "__") / "tokenizer.json"
-            if local.exists():
+        d = self._dir()
+        local = [d / "tokenizer.json"] if d else []
+        # a local file path is also a valid spec: transformers[file:/x/tokenizer.json]
+        if self.name.startswith("file:"):
+            local.insert(0, Path(self.name[5:]))
+        for f in local:
+            if f.exists():
                 try:
-                    return ("hf", Tokenizer.from_file(str(local)))
-                except Exception:
-                    pass
+                    return ("hf", Tokenizer.from_file(str(f)))
+                except Exception as e:
+                    self.why = f"unreadable {f.name}: {e}"
+        if not self.allow_network:
+            self.why = self.why or ("offline" if offline() else "not cached locally")
+            return None
+        if self._known_unavailable():
+            self.why = "unavailable at the last attempt (retried daily)"
+            return None
+        last = ""
         for repo in dict.fromkeys([_HF_ALIASES.get(self.name, self.name),
                                    self.name, f"facebook/{self.name}"]):
             try:
                 tok = Tokenizer.from_pretrained(repo)
-            except Exception:
+            except Exception as e:
+                last = f"{type(e).__name__}: {str(e)[:160]}"
                 continue
-            if self.cache_dir:
-                # atomic: many workers may race on a cold cache and a torn
-                # tokenizer.json would silently degrade every later scan
+            if d:
+                # atomic: a torn tokenizer.json would silently degrade every
+                # later scan
                 try:
-                    d = self.cache_dir / self.name.replace("/", "__")
                     d.mkdir(parents=True, exist_ok=True)
                     tmp = d / f"tokenizer.json.{os.getpid()}.tmp"
                     tok.save(str(tmp))
@@ -338,19 +477,51 @@ class ModelTokenizer:
                 except Exception:
                     pass
             return ("hf", tok)
+        self.why = last or "download failed"
+        self._mark_unavailable(self.why)
         return None
 
     def _try_tiktoken(self):
         try:
             import tiktoken
-            return ("tiktoken", tiktoken.get_encoding(self.name))
         except Exception:
+            self.why = "the `tiktoken` package is not installed"
+            return None
+        if self.cache_dir and not os.environ.get("TIKTOKEN_CACHE_DIR"):
+            os.environ["TIKTOKEN_CACHE_DIR"] = str(self.cache_dir / "tiktoken")
+        if not self.allow_network and self.expect != "exact":
+            self.why = "not cached locally"
+            return None
+        if self.allow_network and self._known_unavailable():
+            self.why = "unavailable at the last attempt (retried daily)"
+            return None
+        try:
+            return ("tiktoken", tiktoken.get_encoding(self.name))
+        except Exception as e:
+            self.why = f"{type(e).__name__}: {str(e)[:160]}"
+            if self.allow_network:
+                self._mark_unavailable(self.why)
             return None
 
     @property
     def exact(self) -> bool:
         return self._resolve()[0] != "approx"
 
+    @property
+    def status(self) -> str:
+        """'exact' | 'approx' — what workers are told to expect."""
+        return "exact" if self.exact else "approx"
+
+    @property
+    def fingerprint(self) -> str:
+        """Identity of what counts tokens, for derivation signatures: a newly
+        available exact asset must re-derive the approximate counts."""
+        kind, obj = self._resolve()
+        if kind == "approx":
+            return f"approx:{obj}"
+        return f"exact:{kind}:{self.name}"
+
+    # -- counting ------------------------------------------------------------
     def count_batch(self, texts: list[str]) -> tuple[list[int], bool]:
         kind, obj = self._resolve()
         if kind == "hf":
@@ -365,15 +536,13 @@ class ModelTokenizer:
         return n[0], approx
 
     # -- per-document encoding, reused across every gold phrase -------------
-    def encode_cached(self, text: str):
-        """A reusable per-document encoding.
+    def encode_cached(self, text: str, word_starts: list[int] | None = None):
+        """A reusable per-document encoding, so `char_to_token` is a bisect
+        instead of a re-encode (or, when approximate, a re-scan of the prefix
+        per keyphrase — quadratic on long documents).
 
-        Returns a dict with an ascending array of token *end* positions plus
-        the token count, so `char_to_token` is a bisect instead of a re-encode.
         For tiktoken the ends are byte positions (tokens partition the UTF-8
-        bytes exactly), which keeps the answer exact — the previous code
-        re-encoded the whole prefix once per keyphrase, i.e. tokenised long
-        documents ~10× each."""
+        bytes exactly), which keeps the answer exact."""
         kind, obj = self._resolve()
         if kind == "hf":
             enc = obj.encode(text)
@@ -382,21 +551,21 @@ class ModelTokenizer:
         if kind == "tiktoken":
             ids = obj.encode_ordinary(text)
             try:
-                ends, acc = [], 0
-                for i in ids:
-                    acc += len(obj.decode_single_token_bytes(i))
-                    ends.append(acc)
+                from itertools import accumulate
+                ends = list(accumulate(map(len, obj.decode_tokens_bytes(ids))))
                 return {"kind": "tiktoken_bytes", "ends": ends, "n": len(ids)}
             except Exception:
                 return {"kind": "tiktoken_slow", "n": len(ids)}
-        return None
+        starts = (word_starts if word_starts is not None
+                  else [mt.start() for mt in _WORD_RE.finditer(text)])
+        return {"kind": "approx", "starts": starts}
 
     def char_to_token(self, text: str, char_end: int,
                       encoding=None) -> tuple[int, bool]:
         """Tokens covering text[:char_end] (1-based count)."""
         kind, obj = self._resolve()
+        enc = encoding if encoding is not None else self.encode_cached(text)
         if kind in ("hf", "tiktoken"):
-            enc = encoding if encoding is not None else self.encode_cached(text)
             if enc and enc.get("kind") == "hf":
                 return bisect.bisect_left(enc["ends"], char_end) + 1, False
             if enc and enc.get("kind") == "tiktoken_bytes":
@@ -404,18 +573,36 @@ class ModelTokenizer:
                 return bisect.bisect_left(enc["ends"], byte_end) + 1, False
             # exact but slow fallback (unknown tiktoken internals)
             return len(obj.encode_ordinary(text[:char_end])), False
-        words = len(_WORD_RE.findall(text[:char_end]))
+        # regex words of text[:char_end] == words starting before char_end
+        # (a word cut by the boundary still counts once, as findall did)
+        words = bisect.bisect_left(enc["starts"], char_end)
         return int(round(words * obj)), True
 
 
-_TOKENIZERS: dict[str, ModelTokenizer] = {}
+_TOKENIZERS: dict[tuple, ModelTokenizer] = {}
 
 
-def get_tokenizer(spec: str, cache_dir: Path | None = None) -> ModelTokenizer:
-    key = spec or ""
-    if key not in _TOKENIZERS:
-        _TOKENIZERS[key] = ModelTokenizer(spec, cache_dir=cache_dir)
-    return _TOKENIZERS[key]
+def get_tokenizer(spec: str, cache_dir: Path | None = None,
+                  allow_network: bool = True,
+                  expect: str | None = None) -> ModelTokenizer:
+    key = (spec or "", allow_network, expect)
+    tk = _TOKENIZERS.get(key)
+    if tk is None:
+        tk = _TOKENIZERS[key] = ModelTokenizer(spec, cache_dir=cache_dir,
+                                               allow_network=allow_network,
+                                               expect=expect)
+    return tk
+
+
+def forget_tokenizers(cache_dir: Path | None = None) -> None:
+    """Drop resolved tokenizers and unavailability markers ("retry downloads")."""
+    _TOKENIZERS.clear()
+    if cache_dir and cache_dir.is_dir():
+        for mk in cache_dir.glob("*/.unavailable"):
+            try:
+                mk.unlink()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------

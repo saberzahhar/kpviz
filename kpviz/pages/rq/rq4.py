@@ -6,19 +6,17 @@ cannot be resolved anywhere are drawn as dashed performance-only lines;
 incomplete runs fade with their document coverage."""
 from __future__ import annotations
 
-import json
+from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
-from dash import Input, Output, dcc, html
-
-from ... import db, scanner, ui
+from ... import scanner, ui
 from ...metrics import metric_label, run_scores
 from ...naming import encode_runs, group_key, run_labels, run_rows
-from ...util import fmt_num
 from ..insights_common import (ann_options, datasets_with_runs,
-                               effective_runs, figure_block, metric_caption,
-                               metric_controls, models_control, prmu_arg,
-                               resolve_ann, rq_header, run_options,
-                               runs_control, selected_runs)
+                               effective_runs, figure_block, gate,
+                               metric_caption, metric_controls, models_control,
+                               prmu_arg, resolve_ann, rq_header,
+                               runs_control, selected_runs, vis)
 
 RQ = "rq4"
 
@@ -68,8 +66,15 @@ def layout():
 
 
 def _frontier(pts: list[tuple[float, float]]):
-    """Pareto staircase for (cost asc, perf max)."""
-    pts = sorted(pts)
+    """Pareto staircase for (cost asc, perf max).
+
+    Equal costs are visited best-first (cost ascending, performance
+    descending), so a dominated point at a tied cost never enters the
+    frontier; non-finite costs are ignored."""
+    pts = sorted(((x, y) for x, y in pts
+                  if x is not None and y is not None and x == x and y == y
+                  and x not in (float("inf"), float("-inf"))),
+                 key=lambda p: (p[0], -p[1]))
     xs, ys, best = [], [], None
     for x, y in pts:
         if best is None or y > best:
@@ -86,8 +91,11 @@ def register(app):
                              prefer=["kp20k", "kpbiomed", "kptimes"])
     register_model_run_chain(app, RQ, multi_ds=True, require_all=True)
 
-    @app.callback(Output(f"{RQ}-ann", "options"), Input(f"{RQ}-ds", "value"))
-    def opts(ds_sel):
+    @app.callback(Output(f"{RQ}-ann", "options"), Input(vis(RQ), "data"),
+                  Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
+    def opts(visible, ds_sel):
+        if not visible:
+            raise PreventUpdate
         return ann_options(ds_sel or [])
 
     @app.callback(
@@ -95,14 +103,23 @@ def register(app):
         Output({"type": "fig-spec", "rq": RQ}, "data"),
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
+        Output({"type": "fig-sig", "rq": RQ}, "data"),
+        Input(vis(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-unit", "value"),
         Input(f"{RQ}-norm", "value"), Input(f"{RQ}-xscale", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
-        Input(f"{RQ}-labels", "value"))
-    def update(ds_sel, measure, k, prmu_sel, ann_choice, unit, norm, xscale,
-               models_sel, runs_sel, labels_on):
+        Input(f"{RQ}-labels", "value"),
+        State({"type": "fig-sig", "rq": RQ}, "data"),
+        prevent_initial_call=True)
+    def update(visible, *args):
+        *inputs, last_sig = args
+        sig = gate(visible, inputs, last_sig)
+        return (*_update(*inputs), sig)
+
+    def _update(ds_sel, measure, k, prmu_sel, ann_choice, unit, norm, xscale,
+                models_sel, runs_sel, labels_on):
         from ...figures import to_plotly
         ds_sel = ds_sel or []
         empty = to_plotly({"kind": "scatter", "series": []})
@@ -115,10 +132,12 @@ def register(app):
         eligible = chosen
         keys = selected_runs(chosen)
         prmu = prmu_arg(prmu_sel)
-        labels = run_labels(idx, rows_meta)
-        enc = encode_runs(idx, [r for r in rows_meta
-                                if group_key(r["model"], r["arch"], r["run_id"])
-                                in set(chosen)])
+        shown = [r for r in rows_meta
+                 if group_key(r["model"], r["arch"], r["run_id"]) in set(chosen)]
+        # labels name only the parameters that differ between the runs
+        # actually plotted (not every run of these datasets)
+        labels = run_labels(idx, shown)
+        enc = encode_runs(idx, shown)
         mlab = metric_label(measure, k, prmu)
 
         # per-dataset scores
@@ -151,7 +170,7 @@ def register(app):
                 covs.append(info["coverage"] if info["coverage"] is not None else 1.0)
                 c = (info["costs"] or {}).get(unit)
                 per_ds_txt.append(f"{ds}: {sc['mean']:.3f}"
-                                  + (f" · {fmt_num(c['total'], 4)} {unit}"
+                                  + (f" · {c['total']:.3g} {unit}"
                                      if c and c.get("known") else " · cost —"))
                 if c and c.get("known"):
                     costs_t.append(c["total"])
@@ -171,7 +190,7 @@ def register(app):
                 known_pts.append((x, perf))
                 hover = (f"<b>{lab}</b><br>{mlab} = {perf:.3f} (macro over "
                          f"{len(ds_sel)} datasets)<br>{UNIT_LABEL[unit]} = "
-                         f"{fmt_num(x, 5)} ({norm.replace('_', ' ')})<br>"
+                         f"{x:.3g} ({norm.replace('_', ' ')})<br>"
                          f"coverage = {100 * cov:.0f}%<br>"
                          + "<br>".join(per_ds_txt)
                          + (("<br>⚠ " + ", ".join(sorted(set(flags))))
@@ -185,7 +204,7 @@ def register(app):
                     "text": [lab], "show_text": bool(labels_on),
                     "hover": [hover], "in_legend": not labels_on,
                 })
-                table_rows.append([lab, f"{perf:.3f}", fmt_num(x, 5),
+                table_rows.append([lab, f"{perf:.3f}", f"{x:.3g}",
                                    ui.pct(cov, 0),
                                    ", ".join(sorted(set(flags))) or "—"])
             else:
@@ -225,7 +244,8 @@ def register(app):
                         "cost; marker transparency encodes document coverage"
                         + (f"; {enc_note}" if enc_note else "") + ". The grey "
                         "staircase is the Pareto frontier. "
-                        + metric_caption(measure, k, prmu_sel, ann_choice)),
+                        + metric_caption(measure, k, prmu_sel, ann_choice,
+                                         ds_sel)),
         }
         headers = ["Run", mlab, UNIT_LABEL.get(unit, unit), "Coverage", "Notes"]
         spec["table"] = {"headers": headers,

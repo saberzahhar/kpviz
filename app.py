@@ -14,7 +14,6 @@ import argparse
 import os
 import sys
 import threading
-import time
 import webbrowser
 from pathlib import Path
 
@@ -31,8 +30,6 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--workers", type=int, default=None,
                     help="scan worker processes (default: all cores)")
-    ap.add_argument("--pos-scope", choices=["eval", "all"], default="eval",
-                    help="(POS now tags unique phrases once; kept for compat)")
     ap.add_argument("--token-scope", choices=["eval", "all"], default="eval",
                     help="tokenizer-count documents for eval splits only (default) or all")
     ap.add_argument("--gold-scope", choices=["eval", "all"], default="eval",
@@ -48,6 +45,11 @@ def main() -> int:
                     dest="hash_mode",
                     help="auto: content-hash only files whose size/mtime moved "
                          "(default); always: hash everything every scan")
+    ap.add_argument("--offline", action="store_true",
+                    help="never touch the network (tokenizer assets must "
+                         "already be cached under the state directory)")
+    ap.add_argument("--ui-cache-mb", type=int, default=256,
+                    help="memory for cached per-document scores (default 256)")
     ap.add_argument("--no-autoscan", action="store_true",
                     help="do not scan automatically when the catalog is empty")
     ap.add_argument("--no-browser", action="store_true")
@@ -81,13 +83,17 @@ def main() -> int:
         kw["db_threads"] = args.db_threads
     if args.io_workers:
         kw["io_workers"] = args.io_workers
-    st = init_settings(data, pos_scope=args.pos_scope,
+    if args.offline:
+        os.environ["KPVIZ_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    st = init_settings(data,
                        token_scope=args.token_scope,
                        gold_scope=args.gold_scope,
                        hash_mode=args.hash_mode, **kw)
 
-    from kpviz import db, diag, scanner
+    from kpviz import db, diag, metrics, scanner
     db.connect()
+    metrics.set_cache_budget(args.ui_cache_mb * 2**20)
     print(f"· data root   {st.data_root}")
     print(f"· state store {st.db_path}")
     diag.print_banner(st)
@@ -99,11 +105,15 @@ def main() -> int:
     from kpviz.appfactory import build_app
     app = build_app()
 
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"! listening on {args.host}: anyone who can reach this port can "
+              "browse your documents (there is no authentication). KPViz is "
+              "a single-user, single-process tool.")
     url = f"http://{args.host}:{args.port}"
     print(f"· serving     {url}")
     if not args.no_browser:
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
     return 0
 
 
