@@ -9,6 +9,7 @@ picks (Insights → significance level), written into every caption.
 """
 from __future__ import annotations
 
+import functools
 import math
 
 try:
@@ -172,13 +173,25 @@ def friedman(groups: list[list[float]]) -> tuple[float | None, float | None]:
     n = len(groups[0])
     if n < MIN_N:
         return None, None
-    rank_sums = [0.0] * k
-    ties = 0.0
-    for i in range(n):
-        ranks, tie_term = _rankdata([g[i] for g in groups])
-        ties += tie_term
-        for j in range(k):
-            rank_sums[j] += ranks[j]
+    if _np is not None and n > 64 and k <= 16:
+        # every block at once: within-block average ranks from an n×k×k
+        # comparison, and Σ(t³−t) per block as Σ_j (c_j² − 1), c_j being
+        # how many values in the block equal the j-th (same numbers as the
+        # per-block loop below, 100× faster at 20 k documents)
+        X = _np.column_stack([_np.asarray(g, dtype=float) for g in groups])
+        less = (X[:, None, :] < X[:, :, None]).sum(axis=2)
+        eq = (X[:, None, :] == X[:, :, None]).sum(axis=2)
+        R = less + (eq + 1) / 2.0
+        rank_sums = R.sum(axis=0).tolist()
+        ties = float((eq.astype(float) ** 2 - 1).sum())
+    else:
+        rank_sums = [0.0] * k
+        ties = 0.0
+        for i in range(n):
+            ranks, tie_term = _rankdata([g[i] for g in groups])
+            ties += tie_term
+            for j in range(k):
+                rank_sums[j] += ranks[j]
     stat = (12.0 * sum((r - n * (k + 1) / 2.0) ** 2 for r in rank_sums)
             / (n * k * (k + 1)))
     denom = 1.0 - ties / (n * k * (k * k - 1)) if ties else 1.0
@@ -324,20 +337,36 @@ def t_sf(t: float, df: float) -> float:
     return tail if t > 0 else 1.0 - tail
 
 
+def _t_pdf(t: float, df: float) -> float:
+    return math.exp(math.lgamma((df + 1) / 2) - math.lgamma(df / 2)
+                    - 0.5 * math.log(df * math.pi)
+                    - (df + 1) / 2 * math.log1p(t * t / df))
+
+
+@functools.lru_cache(maxsize=4096)
+def _t_ppf(q: float, df: float) -> float:
+    z = norm_ppf(q)
+    # Cornish–Fisher start (Abramowitz & Stegun 26.7.5), then Newton on the cdf
+    g1 = (z ** 3 + z) / 4
+    g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / 96
+    g3 = (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / 384
+    x = z + g1 / df + g2 / df ** 2 + g3 / df ** 3
+    for _ in range(50):
+        f = (1.0 - t_sf(x, df)) - q
+        step = f / max(_t_pdf(x, df), 1e-300)
+        x -= step
+        if abs(step) < 1e-12 * max(1.0, abs(x)):
+            break
+    return x
+
+
 def t_ppf(q: float, df: float) -> float:
-    """Quantile of Student's t (bisection on t_sf; q in (0, 1))."""
+    """Quantile of Student's t (q in (0, 1)); cached, a few Newton steps."""
     if q == 0.5:
         return 0.0
-    lo, hi = -1e3, 1e3
-    for _ in range(200):
-        mid = 0.5 * (lo + hi)
-        if 1.0 - t_sf(mid, df) < q:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-12:
-            break
-    return 0.5 * (lo + hi)
+    if q < 0.5:
+        return -_t_ppf(1 - q, round(float(df), 9))
+    return _t_ppf(q, round(float(df), 9))
 
 
 def f_sf(f: float, d1: float, d2: float) -> float:

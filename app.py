@@ -48,8 +48,8 @@ def main() -> int:
     ap.add_argument("--offline", action="store_true",
                     help="never touch the network (tokenizer assets must "
                          "already be cached under the state directory)")
-    ap.add_argument("--ui-cache-mb", type=int, default=256,
-                    help="memory for cached per-document scores (default 256)")
+    ap.add_argument("--ui-cache-mb", type=int, default=192,
+                    help="memory for cached per-document scores (default 192)")
     ap.add_argument("--no-autoscan", action="store_true",
                     help="do not scan automatically when the catalog is empty")
     ap.add_argument("--no-browser", action="store_true")

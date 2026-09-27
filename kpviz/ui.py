@@ -81,15 +81,18 @@ def meta_row(chips: list):
 
 
 def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
-          row_ids: list | None = None, table_id: str | None = None):
+          row_ids: list | None = None, table_id: str | None = None,
+          nowrap_cols: set[int] | None = None):
     num_cols = num_cols or set()
+    nowrap = nowrap_cols or set()
     head = html.Thead(html.Tr([
         html.Th(h, className="num" if i in num_cols else "")
         for i, h in enumerate(headers)]))
     body_rows = []
     for ri, row in enumerate(rows):
         tds = [html.Td(c if isinstance(c, (str, int, float)) or c is None
-                       else c, className="num" if ci in num_cols else "")
+                       else c, className=("num" if ci in num_cols else "")
+                       + (" nowrap" if ci in nowrap else ""))
                for ci, c in enumerate(row)]
         kw = {}
         if row_ids is not None and table_id is not None:
@@ -127,11 +130,15 @@ def loading(child):
                                       "opacity": 0.55})
 
 
-def graph(id, figure=None, height: int = 420, config: dict | None = None):
+def graph(id, figure=None, height: int = 420, config: dict | None = None,
+          grow: bool = False):
+    """A graph `height` px tall; with grow=True that is a minimum, and a
+    figure that sets its own height (a dumbbell with 22 runs) gets it."""
     from .figures import plotly_config
     return dcc.Graph(id=id, figure=figure or {},
                      config=config or plotly_config(),
-                     style={"height": f"{height}px"})
+                     style=({"minHeight": f"{height}px"} if grow
+                            else {"height": f"{height}px"}))
 
 
 def export_bar(rq: str):

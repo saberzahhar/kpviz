@@ -355,6 +355,14 @@ def _plotly_layout(spec: dict) -> dict:
         lay["barmode"] = spec.get("barmode", "group")
         lay["bargap"] = 0.35
         lay["bargroupgap"] = 0.12
+        if spec.get("orientation") == "h":
+            cats = {c for s_ in spec.get("series", []) for c in s_.get("y", [])}
+            lay["yaxis"]["autorange"] = "reversed"      # first run on top
+            lay["yaxis"]["tickfont"] = dict(size=11.5, color=INK2)
+            lay["yaxis"]["gridcolor"] = "rgba(0,0,0,0)"
+            n_s = max(1, len(spec.get("series", [])))
+            if len(cats) > 8:
+                lay["height"] = len(cats) * (9 * n_s + 10) + 150
     return lay
 
 
@@ -480,7 +488,10 @@ def to_plotly(spec: dict) -> go.Figure:
                             and len(r["hover"]) > j else "" for r in rows],
                 hovertemplate="%{customdata}<extra>" + name + "</extra>"))
         fig.update_yaxes(tickvals=list(range(len(rows))), ticktext=ylabels,
-                         showgrid=False, autorange="reversed")
+                         showgrid=False, autorange="reversed",
+                         tickfont=dict(size=11.5, color=INK2))
+        if len(rows) > 12:          # one readable line per run
+            fig.update_layout(height=26 * len(rows) + 130)
         return fig
 
     # scatter / line / bar families ----------------------------------------
@@ -921,6 +932,7 @@ def to_mpl(spec: dict, pgf: bool = False):
             if horiz:
                 ax.set_yticks(range(len(cats)), [str(c) for c in cats])
                 ax.grid(axis="y", visible=False)
+                ax.set_ylim(len(cats) - 0.5, -0.5)          # first on top
             else:
                 long_cat = any(len(str(c)) > 8 for c in cats)
                 ax.set_xticks(range(len(cats)), [str(c) for c in cats],

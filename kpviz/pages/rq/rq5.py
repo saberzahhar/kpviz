@@ -305,6 +305,10 @@ def register(app):
 
         # ---- figure: the headline, one series per model ---------------------
         series = []
+        # a numeric parameter is an axis (a line per model shows the trend
+        # and the spacing of the values); a categorical one stays bars
+        numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                      for v in all_vals.values())
         # colour follows the model (the same slot on every page), not its
         # position in this chart
         mslot = db.color_seq("model", sorted(models))
@@ -318,7 +322,7 @@ def register(app):
                 mean = sum(c["mean"] for _d, c in per_ds) / len(per_ds)
                 ci = cfg.macro_ci([c["per_doc"].vals for _d, c in per_ds
                                    if c.get("per_doc") is not None])
-                xs.append(param_value_str(all_vals[vj]))
+                xs.append(all_vals[vj] if numeric else param_value_str(all_vals[vj]))
                 ys.append(round(mean, 4))
                 err.append(ci)
                 hv.append(f"{idx.model(m).name}<br>{param} = "
@@ -331,6 +335,12 @@ def register(app):
             if xs:
                 series.append({"name": idx.model(m).name, "x": xs, "y": ys,
                                "hover": hv, "err": err,
+                               "mode": "lines+markers", "width": 2,
+                               "mpl_marker": "os^Dv<>p"[i % 8],
+                               "shape": ["circle", "square", "triangle-up",
+                                         "diamond", "triangle-down",
+                                         "triangle-left", "triangle-right",
+                                         "pentagon"][i % 8],
                                "color": slot_color(mslot.get(m, i) % 8)})
 
         spec_p = None
@@ -345,7 +355,8 @@ def register(app):
             if spec_p.default is not None:
                 rng.append(f"default {fmt_num(spec_p.default)}")
         spec = {
-            "kind": "bar", "barmode": "group", "size": "2col",
+            **({"kind": "line"} if numeric else {"kind": "bar", "barmode": "group"}),
+            "size": "2col",
             "xlabel": f"{param}" + (f"  ({' · '.join(rng)})" if rng else ""),
             "ylabel": mlab, "series": series,
             "name": f"hyperparam-{param}",
@@ -375,5 +386,6 @@ def register(app):
             className="muted small", style={"marginBottom": "6px"})
         return (to_plotly(spec), spec, spec["caption"],
                 html.Div([note, ui.table(headers, trs,
-                                         num_cols=set(range(2, len(headers)))),
+                                         num_cols=set(range(2, len(headers))),
+                                         nowrap_cols={0, 1}),
                           stats_note(cfg, "multi", tested)]))

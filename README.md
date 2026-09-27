@@ -214,12 +214,30 @@ through the byte-offset index.
 
 **Insights** — research-question workbenches (dataset correlation, data
 quality & bias, extractability & truncation, cost–performance,
-hyperparameters), each with statistical tests built in (Mann–Whitney U,
-Wilcoxon signed-rank, Friedman — dependency-free), one shared significance
-level, and one-click export: copy the LaTeX, or download PGF / PDF / PNG /
-a zip bundle. Captions are auto-written from the exact configuration and
-stay editable; exported LaTeX is verified to compile under pdflatex,
-xelatex and lualatex.
+hyperparameters) with statistical inference built in and one-click export.
+
+- *Statistics* (one setting for every workbench, so a paper never mixes
+  procedures): rank-based tests (Wilcoxon signed-rank, Mann–Whitney U,
+  Friedman), mean-based tests (paired t, Welch t, repeated-measures ANOVA) or
+  resampling (paired sign-flip permutation — the approximate-randomisation
+  test of the NLP literature — and bootstrap); Holm, Bonferroni or
+  Benjamini–Hochberg correction across the runs of a table; 95 % Student-t
+  or bootstrap intervals as error bars and in every table; effect sizes
+  (rank-biserial r, Cohen's d_z, Hedges' g, Kendall's W, partial η²);
+  Pearson, Spearman and Kendall τ-b between benchmarks with Fisher-z
+  intervals. Dependency-free, verified against SciPy, and every resampled
+  p-value is seeded from its data, so it is reproducible.
+- *Export*: pick the paper (article, *ACL, ACM, IEEE, LNCS, NeurIPS/ICLR),
+  the width (column or full text width), height and legend placement, and
+  preview the figure at print size. Figures are drawn at the venue's real
+  `\columnwidth`/`\textwidth` in its figure font — never rescaled — and go
+  into `figure` or `figure*` accordingly; copy the LaTeX, or download
+  PGF / PDF / PNG / a zip bundle. Tables are booktabs, with value, interval
+  and significance mark per cell, a statistics note, and a caption that
+  points to their figure. Captions are auto-written from the exact
+  configuration and stay editable. Every workbench's export is compiled in
+  the test suite inside article, IEEEtran, llncs and acmart documents
+  (pdflatex, xelatex, lualatex) with nothing allowed into the margin.
 
 Evaluation conventions are stated in every caption: predictions lowercased,
 tokenised, stemmed and deduplicated keeping rank order; P/R/F1 at k ∈
@@ -240,7 +258,7 @@ runs against any tree.
 
 ```bash
 pip install pytest psutil playwright && playwright install chromium
-python -m pytest tests                  # contract, parity, determinism, UI (~1-2 min)
+python -m pytest tests                  # contract, parity, statistics vs SciPy, LaTeX in venue classes, UI (~2 min)
 python tools/bench/scan_profile.py --data sample_data --state /tmp/st --full
 python tools/bench/probe_ui.py http://127.0.0.1:8050   # against a running app
 python tools/bench/fingerprint.py --state .kpviz   # per-table content hashes

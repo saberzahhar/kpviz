@@ -65,10 +65,52 @@ def layout():
                     {"label": f"{n:,}", "value": n}
                     for n in (1000, 5000, 10000)]), 110),
         ], className="stats-bar filter-row"),
+        _guide(),
         *[html.Div(mod.layout(), id=f"panel-{key}",
                    style={"display": "block" if key == "rq4" else "none"})
           for key, _, mod in TABS],
     ], className="page")
+
+
+def _guide():
+    """Conventions and test choice, one click away — what a reviewer asks."""
+    def item(term, text):
+        return html.Div([html.Dt(term), html.Dd(text)], className="guide-item")
+    return html.Details([
+        html.Summary("How to read these results — metrics, tests, intervals"),
+        html.Div([
+            html.Dl([
+                item("P/R/F1@k", "per document, then macro-averaged: "
+                     "P@k = tp / min(k, #predictions) (no padding), R@k = tp / "
+                     "#gold; @O cuts at the number of gold keyphrases, @M "
+                     "keeps every prediction."),
+                item("PRMU", "in-order classes on stemmed tokens: Present "
+                     "(contiguous, in order), Reordered (all tokens, not in "
+                     "order), Mixed (some), Unseen (none)."),
+                item("Matching", "predictions and gold lowercased, spaCy-"
+                     "tokenised, Snowball (Porter2)-stemmed, de-duplicated "
+                     "keeping rank order."),
+            ], className="guide-col"),
+            html.Dl([
+                item("Rank-based", "robust default for per-document scores "
+                     "(bounded, many ties); tests whether one condition "
+                     "tends to score higher."),
+                item("Mean-based", "tests the macro-average itself — the "
+                     "number a paper reports; with hundreds of documents the "
+                     "t distribution is accurate."),
+                item("Resampling", "distribution-free: sign-flip "
+                     "permutation (the approximate-randomisation test of "
+                     "the NLP literature) and bootstrap; seeded from the "
+                     "data, so p-values are reproducible."),
+                item("Corrections", "a table tests many runs at once: Holm "
+                     "controls the family-wise error (default), Benjamini–"
+                     "Hochberg the false-discovery rate. Daggers follow "
+                     "the adjusted p; tables show both."),
+                item("Intervals", "95 % for each mean and each difference; "
+                     "effect sizes say how large, p-values only whether."),
+            ], className="guide-col"),
+        ], className="guide-body"),
+    ], className="guide")
 
 
 def register(app):

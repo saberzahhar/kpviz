@@ -1,6 +1,6 @@
 # KPViz performance plan: memory, parallel workers, efficiency, latency
 
-Status: **revision 2**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
+Status: **revision 3**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
 
 This plan covers everything that affects how fast KPViz responds, how much memory it holds, and how well it uses the machine's cores, from the first scan to the last click of the demo. Each action names the code it touches, how to change it, the measured reason for it, and the check that closes it.
 
@@ -31,10 +31,11 @@ Same machine, same 296 MB synthetic tree (Section 1.1). "Before" is the original
 | Time until the UI settles after first load | 28.3 s | **0.22 s** | ≤ 1.5 s | yes |
 | Idle requests per open tab, 10 s | 20 | **0** | 0 | yes |
 | Server RSS after first load | 766 MB | **136 MB** | ≤ 300 MB | yes |
-| Server RSS after the whole probe (every page, every workbench, exports) | ≥ 992 MB, unbounded | **391 MB**, byte-bounded cache | ≤ 400 MB | yes |
-| RQ3: change @k | 11.2 s | **0.98 s** | ≤ 0.4 s | **no** |
-| RQ5: change @k | 6.4 s | **0.93 s** | ≤ 0.4 s | **no** |
-| RQ2: change @k | 3.5 s | **0.45 s** | ≤ 0.25 s | **no** |
+| Server RSS after the whole probe (every page, every workbench, exports) | ≥ 992 MB, unbounded | **439 MB** with a TeX engine and Matplotlib loaded (391 MB without); byte-bounded cache, now 192 MB | ≤ 400 MB | **no** (TeX case) |
+| RQ3: change @k (cold, both panels, with tests and intervals) | 11.2 s | **0.64 s** (was 0.98 s in revision 2) | ≤ 0.4 s | **no** |
+| RQ5: change @k (cold) | 6.4 s | **0.34 s** (was 0.93 s) | ≤ 0.4 s | yes |
+| RQ2: change @k (cold) | 3.5 s | **0.26 s** (was 0.45 s) | ≤ 0.25 s | nearly |
+| Any workbench, revisited or after start-up/scan | — | cache hit (background warm-up of recently used views) | instant | yes |
 | RQ1 / RQ4: change @k | — | **0.09 / 0.13 s** | ≤ 0.4 s | yes |
 | Export click, PNG / PDF (no TeX on this machine) | TeX probe on the request path, 6.3 s per clipboard | **0.6–0.9 s / 0.6 s**, clipboards never wait | — | — |
 | Datasets page, first open | — | **1.9 s** | ≤ 0.2 s | **no** (C10) |
@@ -52,8 +53,8 @@ Same machine, same 296 MB synthetic tree (Section 1.1). "Before" is the original
 | Independent-reference parity grid (`pytest`) | vacuous-pass possible | **> 500 run × filter × k × measure cells, per document** | non-empty, exact | yes |
 
 What is still open, in order of demo impact:
-1. **RQ3/RQ5 at about 1 s.** The one-statement scoring is 0.1–0.2 s per call; RQ3 makes one call per window condition and RQ5 one per model. Next step: one statement for all windows (RQ3) and all models (RQ5), then B9 prefetch of the default views.
-2. **Datasets page at 1.9 s**: per-dataset pre-aggregates at finalize (C10).
+1. **RQ3 cold at 0.64 s**: three concurrent scoring statements (0.14 s each after the integer run index) plus the per-run tests. Revisits and the views warmed after start-up are instant.
+2. **Datasets page**: 0.28 s server-side; about 0.8 s end to end in a fresh browser (C10 pre-aggregates would halve it).
 3. **POS phase**: 2.9 s for 2,410 phrases is mostly spaCy model loading; D13b (start POS as soon as documents drain) hides it.
 4. **Real-data rehearsal on the demo laptop** (A8, G1, G2, G7): the one thing this machine cannot do.
 
@@ -86,7 +87,20 @@ Rules for Wave 4, from the plan reviews:
 - G1 comes first. The synthetic tree has 2,410 unique phrases and approximate tokenizers; real data has orders of magnitude more phrases and exact tokenizers, so scan-side priorities are re-ranked after G1 ([P6]).
 - No medium-risk scan rewrite after 3 Oct unless G1 shows the on-stage re-scan misses its 60 s budget ([P6]).
 
-### 0.4 What the plan reviews changed
+### 0.4 Revision 3: inference, export, reading
+
+Added after revision 2, on the request to make the tool excellent for statistical inference, LaTeX export and figure control:
+
+| Area | What changed | Evidence |
+|---|---|---|
+| Statistics | One *Statistics* bar for every workbench: rank-based / mean-based / resampling test families, Holm (default) / Bonferroni / Benjamini–Hochberg correction per table, 95 % Student-t or bootstrap intervals, effect sizes; correlation tests with Fisher-z intervals and Kendall τ-b in RQ1; intervals on every mean, difference and macro-average (Welch–Satterthwaite / per-dataset bootstrap) | `tests/test_stats.py` against SciPy |
+| Speed of inference | sign-flip permutation as bit-packed matrix products (11 ms at 20 k documents), bootstrap by multinomial value counts (1 ms), Friedman vectorised (8 ms instead of a per-document loop), `t_ppf` by Newton (0.04 ms), statistics per run in parallel threads | Section 6.5 |
+| Scoring | the statement returns an integer run index instead of a concatenated key per row: 267 → 140 ms at 440 k rows | parity grid unchanged |
+| Warm start (B9, G4) | the views a person used are persisted and recomputed in the background after start-up and after every scan | `/kpviz-perf` → `warm` |
+| LaTeX | paper presets with real column/text widths and figure fonts, `figure`/`figure*` by span, print-size preview, legend and height control, structured table cells, `table*` + adjustbox for wide tables, statistics notes, table captions that reference their figure; heatmaps as vector cells (a raster broke `.pgf`); Greek and math glyphs translated | `tests/test_latex.py`: every workbench compiles in article, ACL geometry, IEEEtran, llncs and acmart; xelatex and lualatex |
+| Reading | horizontal bars when a workbench shows more than 8 runs, plots that grow with their rows, lines for numeric hyperparameters, a *How to read these results* panel (metrics, PRMU, which test and correction), n in tooltips when an interval is shown | screenshots, Section 6.3 |
+
+### 0.5 What the plan reviews changed
 
 | Review point | Change in revision 2 |
 |---|---|
@@ -256,7 +270,7 @@ One model for every memory number in this plan ([P3]):
 | Quantity | What it counts | Measured by | Budget |
 |---|---|---|---|
 | **Server steady state** | RSS of the server process in serve mode: Python and library baseline (about 130 MB) + DuckDB buffer manager + result cache + export cache + in-flight requests | `probe_ui.py` (RSS after each action) | ≤ 400 MB after the full probe (E1) |
-| — result cache | sum of `nbytes` of the cached per-document arrays and aggregates | `metrics.cache_stats()` | 256 MB (`--ui-cache-mb`) |
+| — result cache | sum of `nbytes` of the cached per-document arrays and aggregates | `metrics.cache_stats()` | 192 MB (`--ui-cache-mb`) |
 | — export cache | bytes of cached renders | `export._cache_size` | 64 MB |
 | — DuckDB | buffer manager only. `memory_limit` caps DuckDB's buffers, **not** the process | `duckdb_memory()` | serve limit min(2 GB, 20 % RAM) |
 | **Scan peak** | parent RSS + Σ worker PSS (shared pages counted once), sampled every 250 ms | `tools/bench/scan_profile.py` | ≤ 1.1 GB on fixture M |
@@ -916,13 +930,13 @@ Status: **done** = implemented and verified on this branch; **partial** = the pa
 | B6 | Split monolithic callbacks | 3 | B1 | partial | Datasets browser split out (keeps its search); RQ3 panels still share one callback |
 | B7 | Lighter figures + Patch | 3 | A4 | partial | `uirevision`; payload trimming open |
 | B8 | Compression | after | — | open | — |
-| B9 | Prefetch default views | 4 | C4 | open | — |
+| B9 | Prefetch default views | 4 | C4 | done | recently used views (persisted) warmed after start-up and after each scan |
 | B10 | URL state | after | B1 | open | — |
 | B11 | waitress | after | — | open | Flask threaded server kept |
 | C1 | One-statement scoring | 2 | A5 | done | parity grid; RQ1/RQ4 ≤ 0.13 s, RQ2 0.45 s |
 | C2 | NumPy fetch | 2 | — | done | `db.qnp`; gold packs built by one SQL aggregation |
 | C3 | Per-doc arrays over a doc index | 2 | C1 | done | `metrics.DocIndex`, `PerDoc`; stats vectorised, identical ranks and ties |
-| C4 | Byte LRU + single-flight | 2 | — | done | `ByteLRU`, 256 MB; server 391 MB after the full probe |
+| C4 | Byte LRU + single-flight | 2 | — | done | `ByteLRU`, 192 MB default |
 | C5 | No UI writes to DuckDB | 2 | C18 | done | colours in `colors.json`; `agg_cache` removed |
 | C6 | Integer keys | after | C18 | open | — |
 | C7 | Clustering / zone maps | after | C6 | open | — |
@@ -980,7 +994,7 @@ Status: **done** = implemented and verified on this branch; **partial** = the pa
 | G1 | Real-data rehearsal | 4 | A8 | open | re-scan ≤ 60 s on the chosen subtree |
 | G2 | Offline kit | 4 | D6 | partial | `--offline`, negative cache, `file:` tokenizer specs; the kit itself is built on the demo laptop |
 | G3 | Scripted walkthrough | 2 | B1 | partial | `tests/test_ui.py` renders and exports every workbench; the §6 end-to-end script is open |
-| G4 | Warm start | 4 | B9 | open | — |
+| G4 | Warm start | 4 | B9 | done | automatic (B9) |
 | G5 | Performance strip | 4 | A2 | open | — |
 | G6 | Paper claim alignment | 2 | A8 | open | — |
 | G7 | Fallback kit | 4 | G1 | open | restore ≤ 30 s |
@@ -1040,7 +1054,21 @@ Derived row counts are identical, except `keyphrases` (2,413 → 2,410): the phr
 
 ### 6.4 Correctness gates
 
-`python -m pytest tests`: 37 tests, about 100 s, all passing. They cover the data contract as the README writes it (JSONC cards, both language spellings, both similarity-key spellings, ISO timestamps, missing run cards, illegal parameters, broken inputs reported), the independent scoring reference over every dataset × annotation set × filter × k × measure, worker-count determinism, incremental = clean rebuild, no-op scans, concurrent scan starts, the ingest barrier, and render + export of every workbench.
+`python -m pytest tests`: 59 tests, about 2 min, all passing (37 in revision 2; added: statistics against SciPy, LaTeX compilation in venue classes, every workbench under three statistics settings). They cover the data contract as the README writes it (JSONC cards, both language spellings, both similarity-key spellings, ISO timestamps, missing run cards, illegal parameters, broken inputs reported), the independent scoring reference over every dataset × annotation set × filter × k × measure, worker-count determinism, incremental = clean rebuild, no-op scans, concurrent scan starts, the ingest barrier, and render + export of every workbench.
+
+### 6.5 Workbench latency after revision 3
+
+Callbacks called directly on the scaled store, result cache cleared (cold) and repeated (warm); default statistics (rank-based, Holm, t-intervals):
+
+| Workbench | Cold | Warm |
+|---|---|---|
+| RQ1 correlation (3 datasets) | 0.23 s | 0.06 s |
+| RQ2 data quality (22 runs) | 0.26 s | 0.10 s |
+| RQ3 extractability, both panels (22 runs) | 0.64 s | 0.12 s |
+| RQ4 cost–performance with intervals (3 datasets) | 0.50 s | 0.04 s |
+| RQ5 hyperparameters (3 datasets, Friedman) | 0.34 s | 0.10 s |
+
+In the browser (probe): first load 0.29 s; export PDF typeset through pdflatex 1.7 s, PNG 1.0 s.
 
 ---
 

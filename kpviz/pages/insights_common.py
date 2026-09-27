@@ -58,12 +58,19 @@ def value_cell(value, n=None, digits: int = 3, signed: bool = False,
     if mark:
         kids.append(html.Sup(mark))
     lo, hi = ci if ci else (None, None)
-    if lo is not None and hi is not None:
+    has_ci = lo is not None and hi is not None
+    if has_ci:
         f = (lambda v: f"{v:+.{digits}f}") if signed else (lambda v: f"{v:.{digits}f}")
         kids.append(html.Span(f" [{f(lo)}, {f(hi)}]", className="ci"))
+    title = None
     if n is not None:
-        kids.append(html.Span(f" (n={n})", className="muted"))
-    return html.Span(kids), {"v": value, "lo": lo, "hi": hi, "n": n,
+        # with an interval the cell is already two numbers wide: n moves to
+        # the tooltip (and stays in the exported table if asked for)
+        if has_ci:
+            title = f"n = {n} documents"
+        else:
+            kids.append(html.Span(f" (n={n})", className="muted"))
+    return html.Span(kids, title=title, className="vcell"), {"v": value, "lo": lo, "hi": hi, "n": n,
                              "mark": mark, "signed": signed, "digits": digits}
 
 
@@ -384,7 +391,8 @@ def figure_block(rq: str, height: int = 470, with_table: bool = True):
     tab, which view is already on screen."""
     kids = [
         dcc.Store(id={"type": "fig-sig", "rq": rq}),
-        ui.loading(ui.graph({"type": "rq-graph", "rq": rq}, height=height)),
+        ui.loading(ui.graph({"type": "rq-graph", "rq": rq}, height=height,
+                            grow=True)),
         ui.caption_editor(rq),
         ui.export_bar(rq),
     ]

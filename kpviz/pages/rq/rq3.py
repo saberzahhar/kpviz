@@ -272,14 +272,21 @@ def register(app):
         name_win = COND_WIN + _n_txt(n_win_seen)
         methods_a = cfg.method_text("paired", n_tests_a)
         ci_txt = cfg.ci_text()
+        # many runs: horizontal bars, one readable row per run (rotated
+        # labels ate more room than the plot); few runs: columns
+        horiz = len(xs) > 8
+        ser = [{"name": name_all, "x": xs, "y": ys_all, "hover": hv_all,
+                "color": "#2a78d6", "err": err_all},
+               {"name": name_win, "x": xs, "y": ys_win, "hover": hv_win,
+                "color": "#1baf7a", "text": marks, "err": err_win}]
+        if horiz:
+            ser = [dict(sr, x=sr["y"], y=sr["x"]) for sr in ser]
         specA = {
-            "kind": "bar", "size": "2col", "ylabel": mlab,
-            "series": [
-                {"name": name_all, "x": xs, "y": ys_all, "hover": hv_all,
-                 "color": "#2a78d6", "err": err_all},
-                {"name": name_win, "x": xs, "y": ys_win, "hover": hv_win,
-                 "color": "#1baf7a", "text": marks, "err": err_win},
-            ],
+            "kind": "bar", "size": "2col",
+            **({"orientation": "h", "xlabel": mlab,
+                "aspect": min(1.35, 0.22 + 0.034 * len(xs))} if horiz
+               else {"ylabel": mlab}),
+            "series": ser,
             "name": f"extractability-{ds}",
             "caption": (f"{mlab} on {ds} against present gold keyphrases "
                         "(class P, in-order occurrence) under two conditions: "
@@ -294,7 +301,8 @@ def register(app):
                         + f"Paired per-document comparison: {methods_a}. "
                         + metric_caption(measure, k, None, ann_choice, [ds])),
         }
-        headers = (["Run", "Context window", name_all, name_win, "Δ (trunc − full)"]
+        headers = (["Run", "Context window", "full document", "truncated",
+                    "Δ (trunc − full)"]
                    + p_headers(cfg) + [cfg.effect_name("paired")])
         specA["table"] = {"headers": headers, "rows": tex_rows,
                           "label": f"extract-{ds}",
@@ -429,8 +437,7 @@ def register(app):
                         + metric_caption(measure, k, None, ann_choice, [ds])),
         }
         headersB = (["Run", "Context window",
-                     "documents within the window",
-                     "documents beyond the window",
+                     "docs within window", "docs beyond window",
                      "Δ (within − beyond)"]
                     + p_headers(cfg) + [cfg.effect_name("indep")])
         specB["table"] = {"headers": headersB, "rows": splitB_tex,

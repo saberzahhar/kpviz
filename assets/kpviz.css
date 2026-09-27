@@ -347,3 +347,19 @@ table.kp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
 .exp-preview .paper-meta { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
 .exp-preview img { display: block; box-shadow: 0 0 0 1px var(--grid); }
+.kp-table .vcell { white-space: nowrap; }
+.kp-table td.nowrap { white-space: nowrap; }
+
+/* ---------- reading guide (Insights) ---------- */
+.guide { margin: -6px 0 14px; font-size: 12.5px; color: var(--ink-2); }
+.guide summary { cursor: pointer; color: var(--accent-ink); font-weight: 600;
+  font-size: 12.5px; padding: 2px 0; }
+.guide-body { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 28px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 16px; margin-top: 6px; }
+.guide-col { margin: 0; }
+.guide-item { margin: 4px 0; }
+.guide dt { font-weight: 650; color: var(--ink); display: inline; }
+.guide dt::after { content: " — "; color: var(--muted); font-weight: 400; }
+.guide dd { display: inline; margin: 0; line-height: 1.45; }
+@media (max-width: 900px) { .guide-body { grid-template-columns: 1fr; } }

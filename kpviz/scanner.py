@@ -373,6 +373,12 @@ def _scan_main(full_rehash: bool):
                 pass
     STATE.finish(error=error, cancelled=cancelled)
     _write_scan_stats(full_rehash)
+    if not error and not cancelled and not STATE.skipped:
+        try:                       # the views people use, ready before asked
+            from . import metrics
+            metrics.warm_async()
+        except Exception:
+            pass
 
 
 def _write_scan_stats(full_rehash: bool):

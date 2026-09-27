@@ -44,7 +44,7 @@ from . import db
 KS = ["5", "10", "O", "M"]
 MEASURES = ["f1", "p", "r"]
 PRMU = ["P", "R", "M", "U"]
-CACHE_BYTES = 256 * 2**20       # overridable via set_cache_budget()
+CACHE_BYTES = 192 * 2**20       # overridable via set_cache_budget()
 def _max_concurrent() -> int:
     """Scoring statements allowed at once: DuckDB runs them outside the GIL,
     so up to one per core overlaps well; beyond that they only queue."""
@@ -234,7 +234,7 @@ def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
     Parameters are named: $ds, $ann, $k, $r{i}_{0..2} (run keys) and, when
     the corresponding filter is on, $prmu, $tok, $tok_limit. Filters that are
     off are left out of the SQL text entirely."""
-    runs = ",".join(f"($r{i}_0, $r{i}_1, $r{i}_2)" for i in range(n_runs))
+    runs = ",".join(f"({i}, $r{i}_0, $r{i}_1, $r{i}_2)" for i in range(n_runs))
     filtered = prmu or need_pos or tok
     if filtered:
         conds = ["g.dataset = $ds", "g.ann_key = $ann"]
@@ -270,11 +270,11 @@ def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
     elif doc_filter == "exclude":
         dfilter = "AND m.doc_id NOT IN (SELECT doc_id FROM kp_docfilter)"
     return f"""
-    WITH sel(model, arch, run_id) AS (VALUES {runs}),
+    WITH sel(ri, model, arch, run_id) AS (VALUES {runs}),
     di AS (SELECT doc_id, (row_number() OVER (ORDER BY doc_id) - 1)::INTEGER AS ord
            FROM (SELECT DISTINCT doc_id FROM documents WHERE dataset = $ds)),{gold_cte}
     base AS (
-      SELECT m.model, m.arch, m.run_id, m.doc_id, m.n_uniq,
+      SELECT sel.ri, m.doc_id, m.n_uniq,
              {n_allowed} AS n_al, m.pred_ranks, m.gold_idxs{allowed}
       FROM matches m {join}
       JOIN sel ON sel.model = m.model AND sel.arch = m.arch AND sel.run_id = m.run_id
@@ -284,25 +284,26 @@ def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
                         ELSE TRY_CAST($k AS INTEGER) END AS cut
       FROM base WHERE n_al > 0),
     t AS (
-      SELECT c.model, c.arch, c.run_id, c.doc_id, c.n_al,
+      SELECT c.ri, c.doc_id, c.n_al,
              {tp}::DOUBLE AS tp,
              CASE WHEN c.n_uniq > 0 THEN least(c.cut, c.n_uniq) ELSE 0 END AS dp
       FROM c),
     s AS (
-      SELECT model, arch, run_id, doc_id,
+      SELECT ri, doc_id,
              CASE WHEN dp > 0 THEN tp / dp ELSE 0.0 END AS p,
              tp / n_al AS r
       FROM t),
     skipped AS (
-      SELECT model || '||' || arch || '||' || run_id AS run, count(*) AS n
-      FROM base WHERE n_al <= 0 GROUP BY 1)
-    SELECT s.model || '||' || s.arch || '||' || s.run_id AS run, di.ord,
+      SELECT ri, count(*) AS n FROM base WHERE n_al <= 0 GROUP BY 1)
+    -- the run is returned as its position in `sel` (a small integer): a
+    -- concatenated key per row was 440 k Python strings to fetch and sort
+    SELECT s.ri AS run, di.ord,
            s.p, s.r,
            CASE WHEN s.p + s.r > 0 THEN 2 * s.p * s.r / (s.p + s.r) ELSE 0.0 END AS f1,
            -1::BIGINT AS n_skipped
     FROM s JOIN di ON di.doc_id = s.doc_id
     UNION ALL      -- one row per run with its count of gold-less documents
-    SELECT run, -1, 0.0, 0.0, 0.0, n FROM skipped
+    SELECT ri, -1, 0.0, 0.0, 0.0, n FROM skipped
     ORDER BY run, ord
     """
 
@@ -337,7 +338,7 @@ def _compute(dataset: str, run_keys: list[tuple], ann_key: str, k: str,
         finally:
             cur.close()
 
-    runs = np.asarray(cols["run"], dtype=object)
+    runs = np.asarray(cols["run"], dtype=np.int64)
     n_sk = np.asarray(cols["n_skipped"], dtype=np.int64)
     skip_rows = n_sk >= 0
     skipped = {runs[i]: int(n_sk[i]) for i in np.flatnonzero(skip_rows)}
@@ -354,8 +355,8 @@ def _compute(dataset: str, run_keys: list[tuple], ann_key: str, k: str,
         for a, b in zip(starts.tolist(), ends.tolist()):
             bounds[runs[a]] = (a, b)
     out = {}
-    for key in run_keys:
-        name = "||".join(key)
+    for ri, key in enumerate(run_keys):
+        name = ri
         a, b = bounds.get(name, (0, 0))
         o = ords[a:b].copy()
         out[tuple(key)] = {m: PerDoc(o, vals[m][a:b].copy(), index)
@@ -395,6 +396,9 @@ def run_scores(dataset: str, run_keys: list[tuple[str, str, str]],
                    for m, pd in r.items() if m != "n_skipped")
         return res, size
 
+    if use_cache and doc_ids is None and exclude_doc_ids is None:
+        _note_recent(dataset, run_keys, ann_key, k, prmu, tok_limit,
+                     require_position)
     if use_cache:
         key = ("scores", dataset, tuple(sorted(run_keys)), ann_key, str(k),
                tuple(sorted(prmu)) if prmu is not None else None,
@@ -418,6 +422,145 @@ def run_scores(dataset: str, run_keys: list[tuple[str, str, str]],
             item["per_doc"] = pd
         out[key] = item
     return out
+
+
+# ---------------------------------------------------------------------------
+# Warm-up: the views a person actually looked at are recomputed in the
+# background after the server starts and after every scan, so the first
+# click after either is a cache hit (the demo's "warm start").
+# ---------------------------------------------------------------------------
+_RECENT: "OrderedDict[str, dict]" = OrderedDict()
+_RECENT_MAX = 48
+_recent_lock = threading.Lock()
+_warm_state = {"running": False, "done": 0, "total": 0, "generation": 0}
+
+
+def _recent_path():
+    try:
+        from .config import settings
+        return settings().state_dir / "recent_views.json"
+    except Exception:
+        return None
+
+
+def _load_recent() -> None:
+    import json
+    p = _recent_path()
+    if not p or not p.exists() or _RECENT:
+        return
+    try:
+        for kw in json.loads(p.read_text(encoding="utf-8")):
+            _RECENT[json.dumps(kw, sort_keys=True)] = kw
+    except Exception:
+        pass
+
+
+def _note_recent(dataset, run_keys, ann_key, k, prmu, tok_limit,
+                 require_position) -> None:
+    import json
+    import os
+    kw = {"dataset": dataset, "run_keys": sorted([list(r) for r in run_keys]),
+          "ann_key": ann_key, "k": str(k),
+          "prmu": sorted(prmu) if prmu is not None else None,
+          "tok_limit": list(tok_limit) if tok_limit is not None else None,
+          "require_position": bool(require_position)}
+    sig = json.dumps(kw, sort_keys=True)
+    with _recent_lock:
+        _load_recent()
+        new = sig not in _RECENT
+        _RECENT[sig] = kw
+        _RECENT.move_to_end(sig)
+        while len(_RECENT) > _RECENT_MAX:
+            _RECENT.popitem(last=False)
+        items = list(_RECENT.values()) if new else None
+    if items is None:
+        return
+    p = _recent_path()
+    if p:
+        try:
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(items), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError:
+            pass
+
+
+def _default_views() -> list[dict]:
+    """Before anything was viewed: every dataset's full-run per-document
+    scores (RQ2, RQ3 panel b, RQ4 intervals, RQ5 all start from these)."""
+    out = []
+    try:
+        for (ds,) in db.q("SELECT DISTINCT dataset FROM run_metrics ORDER BY 1"):
+            keys = [list(r) for r in db.q(
+                "SELECT DISTINCT model, arch, run_id FROM run_metrics WHERE dataset=?",
+                ds)]
+            anns = [r[0] for r in db.q(
+                "SELECT DISTINCT ann_key FROM run_metrics WHERE dataset=? ORDER BY 1", ds)]
+            if not keys or not anns:
+                continue
+            ann = "@combined" if "@combined" in anns else anns[0]
+            out.append({"dataset": ds, "run_keys": sorted(keys), "ann_key": ann,
+                        "k": "O", "prmu": None, "tok_limit": None,
+                        "require_position": False})
+    except Exception:
+        pass
+    return out
+
+
+_warm_enabled = [False]
+_warm_thread = [None]
+
+
+def enable_warm() -> None:
+    """Only a serving process warms (a command-line scan exiting while a
+    daemon thread sits inside DuckDB aborts the interpreter). The exit hook
+    stops a running warm-up and waits for it."""
+    import atexit
+    if not _warm_enabled[0]:
+        _warm_enabled[0] = True
+        atexit.register(_stop_warm)
+
+
+def _stop_warm() -> None:
+    _warm_state["generation"] += 1
+    th = _warm_thread[0]
+    if th is not None and th.is_alive():
+        th.join(timeout=5)
+
+
+def warm_async() -> None:
+    """Recompute recent views (most recent first) in one background thread.
+    A newer call or a catalog change supersedes a running warm-up."""
+    if not _warm_enabled[0]:
+        return
+    with _recent_lock:
+        _load_recent()
+        views = list(reversed(_RECENT.values())) or _default_views()
+        _warm_state["generation"] += 1
+        gen = _warm_state["generation"]
+        _warm_state.update(running=True, done=0, total=len(views))
+
+    def run():
+        version = db.scan_version()
+        for kw in views:
+            if _warm_state["generation"] != gen or db.scan_version() != version:
+                return
+            try:
+                run_scores(per_doc=True, **dict(kw, run_keys=[tuple(r) for r in kw["run_keys"]],
+                                                tok_limit=tuple(kw["tok_limit"])
+                                                if kw.get("tok_limit") else None))
+            except Exception:
+                pass
+            _warm_state["done"] += 1
+        if _warm_state["generation"] == gen:
+            _warm_state["running"] = False
+    th = threading.Thread(target=run, daemon=True, name="kpviz-warm")
+    _warm_thread[0] = th
+    th.start()
+
+
+def warm_status() -> dict:
+    return dict(_warm_state)
 
 
 # ---------------------------------------------------------------------------

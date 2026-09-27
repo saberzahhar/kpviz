@@ -103,6 +103,10 @@ def build_app() -> dash.Dash:
                     suppress_callback_exceptions=True,
                     update_title="Updating… · KPViz")
     start_tex_probe()
+    from .metrics import enable_warm, warm_async
+    enable_warm()
+    if db.scan_version():
+        warm_async()
 
     pages = {
         "/": home.layout, "/datasets": datasets.layout,
@@ -244,7 +248,9 @@ def _install_timing(app):
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
         except Exception:
             pass
+        from .metrics import warm_status
         return jsonify({"callbacks": rows, "cache": cache_stats(),
+                        "warm": warm_status(),
                         "peak_rss_mb": rss, "catalog_version": db.scan_version()})
 
 
