@@ -1,69 +1,120 @@
 # KPViz performance plan: memory, parallel workers, efficiency, latency
 
-Status: plan only (no code changed). Written 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct).
+Status: **revision 2**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
 
 This plan covers everything that affects how fast KPViz responds, how much memory it holds, and how well it uses the machine's cores, from the first scan to the last click of the demo. Each action names the code it touches, how to change it, the measured reason for it, and the check that closes it.
 
-Sources: a full read of this repository, a new baseline measured for this plan (Section 1), and the six external reviews supplied with the request. The reviews are cited as **[RA §]** for `REVIEW.md`, **[RB §]** for `KPViz-review.md` and **[R1]**–**[R5]** for the five reviewer notes.
+Sources:
+- a full read of this repository;
+- a baseline measured for this plan (Section 1), and a before/after re-measurement on the same machine (Section 6);
+- the six external reviews of the code, cited as **[RA §]** for `REVIEW.md`, **[RB §]** for `KPViz-review.md` and **[R1]**–**[R5]** for the five reviewer notes;
+- the six reviews of revision 1 of this plan, cited as **[P1]**–**[P6]**.
 
-Evaluation-semantics fixes (PRMU definition, padding, gold de-duplication, missing-document policy, and so on) are out of scope here, except where they interact with parallelism or caching. They change published numbers, so they belong in separate, labelled PRs with a `CODE_VERSION` bump ([RA §2], [RB §3]).
+**Correctness first.** Revision 1 kept evaluation-semantics fixes out of scope. The plan reviews showed that correctness and performance meet in the same code (the incremental scan, the caches, the scoring statement), and that "parity" can otherwise mean preserving a bug ([P3], [P4], [P5]). Revision 2 therefore:
+- adds a correctness block (C13–C25) as Wave 1;
+- distinguishes two kinds of change:
+  - an **optimisation** keeps every derived number identical under a fixed evaluation contract;
+  - a **correctness fix** changes numbers on purpose, is labelled as such, and says why;
+- checks parity against an **independent reference** written from the documented conventions (`tests/test_metrics.py`), not only against the previous implementation.
 
 ---
 
 ## 0. Summary
 
-### 0.1 Where we are and where we are going
+### 0.1 Where we were, where we are
 
-| Metric (demo-scale synthetic tree, 4 vCPU) | Measured today | Target | Main actions |
-|---|---|---|---|
-| Callbacks fired by the first page load | 96–98 (56 of them the 1 Hz poll) | ≤ 15 | B1, B2, B3 |
-| Time until the UI settles after first load | 28.3 s | ≤ 1.5 s | B1, B3, C1 |
-| Server RSS: before load → after first load | 131 → 766 MB | ≤ 300 MB | B1, C3, C4, C11 |
-| Server RSS growth per heavy interaction | +17 to +153 MB; only a 4,096-entry cap bounds it | ≤ 5 MB steady; hard byte cap | C3, C4 |
-| RQ3 interaction (change @k) | 11.2 s | ≤ 0.4 s | C1–C3, C9 |
-| RQ5 interaction | 6.4 s | ≤ 0.4 s | C1, C9 |
-| RQ2 interaction | 3.5 s | ≤ 0.25 s | C1 |
-| Idle requests per open browser tab | 20 per 10 s, forever, on every page | 0 | B2 |
-| Filtered/per-document scoring kernel (22 runs × 20 k docs) | 2.7–3.2 s | ≤ 0.15 s | C1, C2 |
-| One memoised per-document result | 47 MB | ≤ 2 MB | C3 |
-| Cold scan (75 k docs, 1.32 M prediction lines) | 43.4 s | ≤ 25 s (to verify) | D2, D5, D6, D8, D9, D12 |
-| Mean CPU use while matching predictions | 62 % | ≥ 90 % | D2, D3, D5 |
-| No-op "Scan for changes" | 3.2 s, and it bumps the catalog version | ≤ 0.4 s, no bump | D6, D7 |
-| POS phase for 2,413 new phrases | 4.9 s and 1.1 GB of worker memory | ≤ 1.5 s, ≤ 400 MB | D8a |
-| Peak scan memory (parent RSS + workers PSS) | 1.87 GB | ≤ 1.1 GB | D8, D12, D17 |
-| NDJSON spill written for `matches` alone | 252 MB | ≤ 10 MB | D2, D3 |
-| DuckDB file after one re-derivation | 50.8 → 97.8 MB | ≈ live size | D14, D16 |
+Same machine, same 296 MB synthetic tree (Section 1.1). "Before" is the original code measured the same day; the UI "before" is the Section 1 baseline.
 
-The targets are engineering goals. Workstream A validates each of them; none is a measurement yet.
+| Metric | Before | Now (this branch) | Target | Met? |
+|---|---|---|---|---|
+| Callbacks fired by the first page load | 96–98 | **1** | ≤ 15 | yes |
+| Time until the UI settles after first load | 28.3 s | **0.22 s** | ≤ 1.5 s | yes |
+| Idle requests per open tab, 10 s | 20 | **0** | 0 | yes |
+| Server RSS after first load | 766 MB | **136 MB** | ≤ 300 MB | yes |
+| Server RSS after the whole probe (every page, every workbench, exports) | ≥ 992 MB, unbounded | **391 MB**, byte-bounded cache | ≤ 400 MB | yes |
+| RQ3: change @k | 11.2 s | **0.98 s** | ≤ 0.4 s | **no** |
+| RQ5: change @k | 6.4 s | **0.93 s** | ≤ 0.4 s | **no** |
+| RQ2: change @k | 3.5 s | **0.45 s** | ≤ 0.25 s | **no** |
+| RQ1 / RQ4: change @k | — | **0.09 / 0.13 s** | ≤ 0.4 s | yes |
+| Export click, PNG / PDF (no TeX on this machine) | TeX probe on the request path, 6.3 s per clipboard | **0.6–0.9 s / 0.6 s**, clipboards never wait | — | — |
+| Datasets page, first open | — | **1.9 s** | ≤ 0.2 s | **no** (C10) |
+| Cold scan (75 k docs, 1.32 M prediction lines) | 36.8 s | **25.9 s**, including 1.2 s of content hashing the old code skipped (C13) | ≤ 25 s | nearly |
+| — inferences phase | 16.9 s | **10.8 s** | — | — |
+| — documents phase | 11.5 s | **8.4 s** | — | — |
+| — POS phase | 4.5 s | **2.9 s** | ≤ 1.5 s | **no** |
+| — finalize | 3.0 s | **2.2 s** | — | — |
+| Mean CPU while matching predictions | 67 % | **84 %** | ≥ 85 % | nearly |
+| No-op "Scan for changes" | 1.9 s, bumps the catalog version | **0.27 s**, no version change | ≤ 0.4 s, no bump | yes |
+| Peak scan memory (parent RSS + workers PSS) | 1,853 MB | **1,194 MB** | ≤ 1.1 GB | nearly |
+| Parent RSS while matching predictions | 835 MB | **382 MB** | — | — |
+| DuckDB `memory_limit` while serving | 10.3 GB | **2 GB** (serve budget) | ≤ 2 GB | yes |
+| Metric parity with the original code (sample tree) | — | **2,040 / 2,040 cells identical** | all | yes |
+| Independent-reference parity grid (`pytest`) | vacuous-pass possible | **> 500 run × filter × k × measure cells, per document** | non-empty, exact | yes |
 
-### 0.2 The ten changes that matter most
+What is still open, in order of demo impact:
+1. **RQ3/RQ5 at about 1 s.** The one-statement scoring is 0.1–0.2 s per call; RQ3 makes one call per window condition and RQ5 one per model. Next step: one statement for all windows (RQ3) and all models (RQ5), then B9 prefetch of the default views.
+2. **Datasets page at 1.9 s**: per-dataset pre-aggregates at finalize (C10).
+3. **POS phase**: 2.9 s for 2,410 phrases is mostly spaCy model loading; D13b (start POS as soon as documents drain) hides it.
+4. **Real-data rehearsal on the demo laptop** (A8, G1, G2, G7): the one thing this machine cannot do.
 
-1. **B1. Compute only what is on screen.** Hidden pages and workbenches fire about 40 of the first-load callbacks, including the four that take 7–22 s, so they account for nearly all of the 28 s. The 1 Hz poll fires most of the rest (56 of 96) for as long as the page stays busy.
-2. **C1 + C2. One DuckDB statement per scoring request, fetched as Arrow/NumPy.** This takes 3 s down to 0.13 s. Most of the old cost was `fetchall()` building Python lists: 1.93 of the 2.7 s.
-3. **C3 + C4. Per-document results as float32 arrays, in a byte-bounded single-flight cache.** An entry shrinks from 47 MB to 1.7 MB, and concurrent identical requests are computed once.
-4. **B2. Stop polling when nothing is scanning.** The Overview poll runs on every page. It sent 56 of the 96 first-load requests and 24 of the 27 requests during a single RQ3 interaction.
-5. **B3. Take the TeX probe off the request path.** Six callbacks at first load wait on it.
-6. **D6 + D7. Resolve tokenizers once per scan and make no-op scans free.** Today every worker retries the download (about 1 s each), and every scan bumps the catalog version, which re-fires every workbench.
-7. **D2. Coalesce tiny prediction files into real tasks.** 2,640 tasks of 0.08 MB each became up to 7,900 spill files and 11.9 s of ingest.
-8. **D8a. Size the POS phase by the amount of work.** It loads spaCy models into every worker (488 MB each) to tag 2,413 phrases.
-9. **D5. Remove the serial post-ingest `UPDATE`s.** They cost 5.6 s on the scan thread.
-10. **G1–G3. Rehearse the demo on the demo laptop with the real data, from a script.** At real scale a live "delete `.kpviz/` and re-scan" is estimated at 40–45 minutes on 4 cores for the documents phase alone (Section 1.3), so the on-stage step needs a planned subset.
+### 0.2 The ten changes that mattered most (all implemented)
 
-### 0.3 Schedule to the demo
+1. **B1. Compute only what is on screen.** Every heavy callback takes a visibility store as its first Input and a per-client signature as State. First load went from 96 callbacks to 1.
+2. **C1 + C2. One DuckDB statement per scoring request, fetched with `fetchnumpy`.** Per-document scores for all runs of a dataset in one statement, with the PRMU, position, token-limit and document filters in SQL.
+3. **C3 + C4. Per-document results as float arrays over a shared document index, in a byte-bounded single-flight cache.** RSS is bounded by bytes, and concurrent identical requests compute once.
+4. **B2. Poll only while a scan runs.** 0 idle requests.
+5. **B3. TeX probe in a background thread, persisted.** Clipboard callbacks never wait on it.
+6. **D6 + D7a. Tokenizers resolved once per scan with a negative cache, offline workers, and no-op scans that publish nothing.**
+7. **D2. Coalesced prediction tasks** of 1–8 MB instead of one task per 0.08 MB batch file.
+8. **D8a. POS sized to the work, gold phrases only, caches dropped before spaCy loads.**
+9. **D5. Zero post-ingest UPDATEs.**
+10. **C13–C25. The correctness block**: content hashes for new files, both language spellings, JSONC cards, versioned phrase cache, honest column names, source-hash code version, reported parse errors, export fixes.
 
-| Window | Tier | Content |
+### 0.3 Waves, not tiers
+
+Revision 1 ordered the work by tier, which mixed correctness, demo path and throughput items in one list. The plan reviews asked for waves, so that small speed-ups cannot crowd out coherence work under time pressure ([P4], [P5]), and for a `blocked_by` column (Section 5).
+
+| Wave | Content | Status |
 |---|---|---|
-| 28–30 Sep | Tier 0 | Workstream A essentials: A1–A5 (about 2–3 days, reusing Review A's scripts) |
-| 30 Sep – 7 Oct | Tier 1 (demo-critical) | B1–B5, C1, C2, C4, D6, D7a, A6, A8, E1, G2, G7 (about 8 days) |
-| 8–9 Oct | Tier 2, in this order, as time allows | G3, B9 + G4, F1 + F2, C9, C11, D8a, D5, C3, C5, D2, D12, B6, G5; then A7, C12, D1, D8d, D9a–c, D9f, D15, D17, E2, E3, F3, G6 |
-| 10 Oct | Freeze | Bug fixes only. Real-data rehearsal on the demo laptop (G1) |
-| after the demo | Tier 3 | B7, B8, B10, B11, C6, C7, C8, C10, D3, D4, D7b–c, D8b, D8c, D8e, D8f, D9d, D9e, D9g, D10, D11, D13, D14, D16 |
+| **1. Correctness and measurement** | A1–A6 · C12–C25 · D4 · D6 · D8d · D15 | done, except A1's large-vocabulary fixture (A1 L) and A2's in-app `mem` block |
+| **2. Demo path and incremental contract** | B1–B5 · C1–C5 · C9 · C11 · D5 · D7a · D10a · D14 (cheap half) · D17 · E1 · E2 · G3 · G6 | done, except G6 (paper text), full G3, and C9's catalog snapshot |
+| **3. Throughput** | D1 · D2 · D8a · D8b · D9a–e · F3 · B6 · C10 · B7 | done, except C10 and B6/B7 in part |
+| **4. Rehearsal (before the 10 Oct freeze)** | A8 · G1 · G2 · G4 · G5 · G7 · F1 · B9 · RQ3/RQ5 single statement | open: needs the demo laptop and the Zenodo tree |
+| **After the demo** | A7 · B8 · B10 · B11 · C6 · C7 · C8 · D3 · D7b–c · D8c · D8e · D8f · D9f · D10b–d · D11 · D12 · D13 · D14 (full) · D16 · F2 | deferred, each with the reason in its item |
 
-With one developer, Tier 0 and Tier 1 fill most of the time to the freeze, and Tier 2 is picked in the order listed. If only Tier 1 lands, the demo still gets the large perceived wins: fast first load, near-instant "Scan for changes", and sub-second workbenches.
+Rules for Wave 4, from the plan reviews:
+- G1 comes first. The synthetic tree has 2,410 unique phrases and approximate tokenizers; real data has orders of magnitude more phrases and exact tokenizers, so scan-side priorities are re-ranked after G1 ([P6]).
+- No medium-risk scan rewrite after 3 Oct unless G1 shows the on-stage re-scan misses its 60 s budget ([P6]).
+
+### 0.4 What the plan reviews changed
+
+| Review point | Change in revision 2 |
+|---|---|
+| D4 is a correctness bug, not T3 polish ([P2], [P3], [P6]) | Wave 1; implemented; a slow-flush test proves `drain()` is a barrier |
+| Missing correctness items: auto-hash, `language`/`languages`, per-file purge, phrase-cache versioning, `axvspan` ([P5]) | C13–C17 added; all implemented except C15, which the contract makes moot (one collection file per dataset) |
+| Lying column names, source-hash invalidation, pinned requirements, parse diagnostics ([P4]) | C18–C20, C25; implemented |
+| Empty-filter collision, dataset-specific run lookup, escaped ids, optimisation vs correctness ([P3]) | C21 and the "correctness first" rule; implemented |
+| Type 3 fonts, `\resizebox` on PGF, export on missing values ([P6], [P2]) | C22; implemented |
+| D8d changes scores; predictions must be re-tokenised per annotation language ([P6]) | Labelled as a correctness fix; implemented, including mixed-language combined sets |
+| D9f changes what is computed ([P2], [P3]) | Boundaries written down; deferred, off by default |
+| F2 conflicts with E1/B1 ([P2], [P3], [P6]) | Deferred until F1 is measured; PNG only, debounced, cancellable if ever done |
+| D3 adds pyarrow to every worker; do D2 first ([P2], [P6]) | Deferred to an experiment after D2 (done) |
+| D12 thread and fork-safety traps ([P3], [P6]) | Moved to an experiment with named traps |
+| C5 colours must persist; effort underestimated ([P2], [P4]) | Colours in `state_dir/colors.json`; effort M; done |
+| D5 can be zero-UPDATE ([P2]) | Done that way |
+| D14: keep it simple; do the cheap half now ([P1], [P2]) | Cheap half done; the full version is a file swap, not a tracker |
+| One memory accounting model; `memory_limit` is not a process cap ([P3]) | Section 2.1 |
+| Outcome-based acceptance instead of proxies (task count, CPU %, statement count) ([P3]) | D2, D3, D7, D10 criteria rewritten |
+| Parity grid must cover filters, token limits, exclusion sets, per-doc; table-level hashes ([P2]) | `tests/test_metrics.py`, `tools/bench/fingerprint.py`, `tests/test_scan.py` |
+| Benchmark tools must be committed; `playwright install chromium`; machine spec; 120 % budget ([P1], [P4], [P6]) | `tools/bench/`; Section 7; the machine spec is recorded in every `scan_stats` file |
+| Waves and `blocked_by` ([P4], [P5]) | Section 0.3 and Section 5 |
+| Coherence and a pleasing interface, not only milliseconds ([P3]) | stable colours (C5), `uirevision` (B7), loading overlays that keep the old figure (B5), axis labels that fit (C24), captions naming the gold actually used (C24) |
 
 ---
 
 ## 1. Baseline measured for this plan
+
+This is revision 1's baseline, kept as measured. File and line references in Sections 1 and 3 point at the code before this branch; Section 6 has the same-day before/after comparison.
 
 ### 1.1 Setup
 
@@ -76,7 +127,7 @@ With one developer, Tier 0 and Tier 1 fill most of the time to the freeze, and T
 | Tree | 5 datasets, 66 runs, 75,190 documents, 1.32 M prediction lines, 296 MB, 5,366 files |
 | Derived rows | 320 k gold · 725 k `gold_tokpos` · 1.32 M `preds` · 1.32 M `matches` · 2,413 unique keyphrases |
 | Not available | HuggingFace/tiktoken downloads (blocked, so tokenizers ran approximate) and TeX |
-| Harness | a memory-sampling scan runner (parent + every child: RSS/PSS/USS per phase), a Playwright UI probe (callback round trips, settle time, idle traffic, server RSS), cProfile of one worker chunk of each kind, and kernel micro-benchmarks. It lives in the session scratchpad today; A1–A4 turn it into committed tooling |
+| Harness | a memory-sampling scan runner (parent + every child: RSS/PSS/USS per phase), a Playwright UI probe (callback round trips, settle time, idle traffic, server RSS), cProfile of one worker chunk of each kind, and kernel micro-benchmarks. Now committed as `tools/bench/scan_profile.py` and `tools/bench/probe_ui.py` (A2, A3) |
 
 Caveats:
 
@@ -189,18 +240,95 @@ The scan spent **11.9 s** ingesting the same rows from up to 7,900 small spill f
 ## 2. Rules of engagement
 
 1. **Measure, change, re-measure.** No action is "done" without its acceptance number from Workstream A.
-2. **Numbers never move in a performance PR.** Every one of them must pass the parity and determinism gates (A5). Semantic changes go in separate PRs, with a `CODE_VERSION` bump and release notes.
-3. **Push arithmetic into DuckDB.** It runs vectorised, uses every core and releases the GIL. The Python in callbacks should only shape results.
-4. **Nothing expensive or blocking on the request path.** No network, TeX, model loading or DuckDB writes inside a UI callback.
-5. **Bound every cache by bytes**, never by entry count.
-6. **Work is proportional to what is visible and to what changed.**
-7. **Keep the architecture.** Keep one process, one DuckDB writer and one scan pool. Do not add Celery/Redis, a multi-process WSGI server, the `fork` start method or a frontend rewrite (Section H).
+2. **Optimisations never move numbers.** Every one must pass the parity and determinism gates (A5): the independent reference grid, worker-count determinism, incremental = clean rebuild.
+3. **Correctness fixes move numbers on purpose.** They are labelled, explained, and ship under one code-version change with the other fixes of the same wave. Parity is then checked against the corrected reference, never against the old bug.
+4. **Push arithmetic into DuckDB.** It runs vectorised, uses every core and releases the GIL. The Python in callbacks should only shape results.
+5. **Nothing expensive or blocking on the request path.** No network, TeX, model loading or DuckDB writes inside a UI callback.
+6. **Bound every cache by bytes**, never by entry count.
+7. **Work is proportional to what is visible and to what changed.**
+8. **Keep the architecture.** Keep one process, one DuckDB writer and one scan pool. Do not add Celery/Redis, a multi-process WSGI server, the `fork` start method or a frontend rewrite (Section H).
+9. **Budgets are enforced at 120 %.** A scripted step that exceeds 120 % of its budget fails (G3) ([P4]).
+
+### 2.1 Memory accounting model
+
+One model for every memory number in this plan ([P3]):
+
+| Quantity | What it counts | Measured by | Budget |
+|---|---|---|---|
+| **Server steady state** | RSS of the server process in serve mode: Python and library baseline (about 130 MB) + DuckDB buffer manager + result cache + export cache + in-flight requests | `probe_ui.py` (RSS after each action) | ≤ 400 MB after the full probe (E1) |
+| — result cache | sum of `nbytes` of the cached per-document arrays and aggregates | `metrics.cache_stats()` | 256 MB (`--ui-cache-mb`) |
+| — export cache | bytes of cached renders | `export._cache_size` | 64 MB |
+| — DuckDB | buffer manager only. `memory_limit` caps DuckDB's buffers, **not** the process | `duckdb_memory()` | serve limit min(2 GB, 20 % RAM) |
+| **Scan peak** | parent RSS + Σ worker PSS (shared pages counted once), sampled every 250 ms | `tools/bench/scan_profile.py` | ≤ 1.1 GB on fixture M |
+| — scan DuckDB | `memory_limit` during a scan = max(512 MB, min(50 % RAM, RAM − workers × worker peak − 1 GB)) | `config.describe()` | — |
+| **Export worker** (F1, when it lands) | its own RSS, counted in the server steady state | `probe_ui.py` | inside E1 |
+
+`tracemalloc` complements these for Python allocations; it does not replace process-level numbers.
 
 ---
 
 ## 3. Workstreams and actions
 
-Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L > 3 days) · risk. Then *Where*, *Do*, *Why* (measured where possible) and *Done when*.
+Format per action: **ID. Title** · tier or wave · effort (S < ½ day, M 1–3 days, L > 3 days) · risk. Then *Where*, *Do*, *Why* (measured where possible) and *Done when*. Tiers (T0–T3) are revision 1's labels; Section 0.3 maps them to waves and Section 5 gives the current status of every item.
+
+### C0. Correctness prerequisites (Wave 1)
+
+Every later number depends on these. Each is small; together they are what the paper's reproducibility claim rests on ([P4], [P5]). All ship under one `SCHEMA_VERSION` bump (5) and one code-version change.
+
+**C13. Content-hash every new file** · done
+- *Where:* `scanner._discover`.
+- *Was:* in `auto` mode new files were never hashed, so the "content hash" guarantee was false after the first scan, and the first `--full` re-derived everything ([P5], Section 1.2).
+- *Now:* new files and files with no stored hash are hashed at discovery (1.2 s for 5,366 files, 296 MB). A legacy `None` hash with an unchanged stat counts as unchanged, so upgrading does not re-derive.
+
+**C14. Both language spellings** · done
+- *Where:* `util.declared_langs`, `cards`, `derive`.
+- *Now:* a section or annotation set may declare `"languages": [...]` or `"language": "..."`. The sample tree uses both, and `tests/test_contract.py` checks that a `languages`-only annotation set is analysed in its language.
+
+**C15. Purge by (dataset, file)** · not needed
+- The contract names exactly one collection file per dataset (`documents/document.{dataset}.jsonl`), so purging by dataset purges by file. Revisit only if the contract ever allows split collections.
+
+**C16. Version the phrase cache on what produces it** · done
+- *Where:* `scanner._sync_phrase_cache`.
+- *Now:* `keyphrases` records the code version and the installed spaCy model versions. New normalisation code drops the rows (the documents re-derive under the same code-version change and restage every gold phrase). A new tagger model, or a store that predates the record, keeps the keys and re-tags. `tests/test_scan.py::test_phrase_cache_retags_on_tagger_change`.
+
+**C17. Shading after the axis limits** · done
+- *Where:* `figures.to_mpl`. `axvspan` now runs after `set_xlim`, so the truncation shading in RQ3 is correct under every `xrange`.
+
+**C18. Honest column names, one schema bump** · done
+- `gold.first_char`/`first_word` stored *end* offsets; they are now `end_char`/`end_word` ([P4]). The same bump removes `agg_cache`, `color_assign` (C5), `preds.known_doc` and `batches.n_docs` (D5).
+
+**C19. Code version from the source** · done
+- `CODE_VERSION = "<manual rev>-<blake2b(derive.py + textproc.py)>"`. A forgotten manual bump can no longer serve stale numbers ([P4]).
+
+**C20. Parse errors are output, not silence** · done
+- Cards are read as JSONC (`//`, `/* */`, BOM), exactly as the README shows them.
+- An unreadable card is listed on the Overview with file, line and column (`kv card_errors`).
+- Malformed JSONL lines are counted per collection and per run, with the byte offset of the first one, and lines without `_id` and duplicate document ids are reported (`kv collection_issues`, `run_issues`, run tags).
+
+**C21. Identity and filter defects** · done
+- An empty document selection means "no documents", even after the unfiltered result for the same runs was cached ([RB E06]).
+- RQ3 looks up each run's context window per dataset ([RB E09]), and invalid parameter values fall back instead of crashing.
+- Cost-variable names reach SQL as bound JSON-path parameters, so a name with quotes cannot break the scan.
+- Timestamps: ISO 8601 with fractions and offsets, converted to naive UTC; slash dates still accepted.
+
+**C22. Exports that compile and embed correctly** · done
+- Matplotlib saves inside the rc context, so `pdf.fonttype = 42` applies: no Type 3 fonts.
+- Two-column figures use `figure*` at the natural width instead of `\resizebox` on a PGF ([P6]).
+- Missing values (`None`) render as gaps instead of crashing the export.
+- The render cache key excludes the caption and the table (E2).
+
+**C23. Contract details the synthetic tree now exercises** · done
+- Coverage is computed within the run's majority split and capped at 1.0; runs spanning several splits get a `multi_split` tag.
+- A run without its run card gets `missing:run`; `n.a` architectures stay performance-only.
+
+**C24. What the reader sees is what was computed** · done
+- Captions name the gold actually used per dataset ("author gold (kp20k)", "author+reader combined gold (semeval2010)").
+- RQ4's Pareto frontier sorts by (cost, −performance) and drops non-finite points.
+- A mixed-language `@combined` gold set analyses each gold phrase in its own language.
+- RQ3's axis label lists window sizes only; which run has which window moves to the caption, so the label no longer overflows the figure.
+
+**C25. Pinned requirements** · done
+- `dash<5`, `plotly<8`, `duckdb>=1.1,<2`, NumPy explicit; the spaCy models stay pinned to 3.8.0 wheels ([P4]). CI wiring stays open (A7).
 
 ### A. Measurement, regression and determinism harness (do first)
 
@@ -409,7 +537,8 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 - *Where:* `db.cache_put` (`db.py:392-395`), `db.color_seq` (`:406-414`, called by `naming.encode_runs` on every RQ render), `db.kv_set`.
 - *Do:*
   1. Keep scalar results in C4 only, and drop the `agg_cache` table writes.
-  2. Make colour slots deterministic without writes: sorted entity order per scope, computed at finalize and published with the generation. This also fixes colours changing after a rebuild [RA C8].
+  2. Keep colour slots stable without DuckDB writes: the assignment lives in `state_dir/colors.json`, new entities are appended in sorted order and the file is replaced atomically. Colours follow the entity across sessions and rebuilds ([RA C8], [P2]), and no UI path takes `_wlock`.
+- *Effort, revised:* M, not S ([P4]). It removes `agg_cache` and `color_assign`, so it ships with the schema bump of C18.
 - *Why:* UI writes take `_wlock`, which the ingest thread holds for whole `read_json` batches, so a click during a scan can queue behind the ingest.
 - *Done when:* grep finds no `_wlock` / `execute` on any UI callback path, and interactions during a scan stay fast.
 
@@ -423,7 +552,7 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 **C7. Physical clustering for zone maps** · T3 · S · low
 - *Do:* insert `matches` and `gold` ordered by (dataset, ann_key, run_ord, doc_ord), either at ingest or in a finalize rewrite. Verify with `EXPLAIN ANALYZE` that single-dataset queries skip row groups.
 
-**C8. Precompute the common filtered views** · T3 · S · low
+**C8. Precompute the common filtered views** · Wave 4 · S · low · blocked by the evaluation-convention fixes ([P6]); precompute only a handful of views, never every filter combination ([P3])
 - *Where:* `metrics.rebuild_run_metrics`.
 - *Do:* extend `run_metrics` with a `view` column: `all`, `P` with position, and `RMU` (absent). These are the default views of RQ3 panel (a) and of Fig. 1 (absent R@M), so they become 10 ms lookups.
 - *Cost:* about 0.5 s per view at finalize, on fixture M.
@@ -461,7 +590,7 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 
 **C12. `db.q` retries only what is retryable** · T2 · S · low
 - *Where:* `db.py:276-282`.
-- *Do:* retry only on connection or cursor invalidation. Raise parser, binder and catalog errors at once, with the original traceback ([RA G2], [R2 #2]).
+- *Do:* retry only on connection or cursor invalidation: `duckdb.ConnectionException`, and an `InvalidInputException` / `InternalException` whose message says the connection or cursor is closed ([P5]). Parser, binder, catalog, conversion and constraint errors raise at once, with the original traceback ([RA G2], [R2 #2]).
 
 ### D. Scan engine: parallel workers and throughput
 
@@ -471,7 +600,7 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   1. Default `workers = cpus − 1` on ≤ 8 cores and `cpus − 2` above, because the parent's ingest thread, pool driver and DuckDB need a core.
   2. Give DuckDB `max(1, cpus − workers)` threads during a scan.
   3. Add `--workers auto|N` and a sweep in A2 (N ∈ {1, 2, …, cpus}) that reports throughput, peak PSS and CPU %.
-  4. Choose the default from the sweep, on 4, 8 and 16 cores.
+  4. Choose the default from the sweep, on 4, 8 and 16 cores. The metric is scan wall time within the memory budget, not CPU utilisation ([P3], [P5]); sweep workers ∈ {cpus/2, cpus, 2·cpus}.
 - *Why:* today the default is all cores, plus DuckDB threads on top ([RA S16]). Yet measured CPU was only 62–79 %, which points at serial phases and per-task overhead (D2, D5), not oversubscription. The sweep separates the two.
 
 **D2. Coalesce small prediction files into real tasks** · T2 · M · medium
@@ -482,31 +611,33 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   3. Keep dataset-major order, so each worker loads each gold pack once.
   4. Track `remaining` per run key across tasks.
 - *Why:* 2,640 tasks of 0.08 MB produced up to 7,900 spill files and 11.9 s of ingest. One `read_json` of the same rows takes 0.9 s (F3).
-- *Done when:* fixture M has ≤ 100 prediction tasks, inference ingest is ≤ 3 s, and CPU during matching is ≥ 85 %.
+- *Done when:* the inferences phase is faster end to end within the memory budget, with determinism (A5) intact ([P3]). Task count and CPU % are diagnostics, not the target.
+- *Order:* bound the task size in bytes (the target above) so a coalesced task cannot grow past the per-worker memory budget; D8f refines this for long documents ([P1]).
 
-**D3. Columnar spills (Parquet)** · T3 · M · medium
+**D3. Columnar spills (Parquet)** · after the demo · M · medium · an experiment, decided on data after D2 ([P2], [P6])
 - *Where:* `derive._write_ndjson`, `ingest.py`, `db.ingest_ndjson`.
 - *Do:*
   1. Workers accumulate **column lists**, not row dicts, and write Parquet (zstd) with `pyarrow`. That adds one dependency, already present in most environments.
   2. The ingestor issues `INSERT INTO t SELECT * FROM read_parquet([...])`.
   3. Keep NDJSON as a fallback when `pyarrow` is missing.
 - *Why:* for `matches`, 252 MB of NDJSON becomes 4.4 MB of Parquet, and the one-statement ingest drops from 0.91 s to 0.31 s. Workers also stop holding a list of row dicts *and* a `BytesIO` copy of the whole chunk (`derive.py:99-109`).
-- *Done when:* tmp spill bytes are ≤ 5 % of today's, and parity (A5) holds.
+- *Done when:* spill size **plus** serialisation time, ingest time, worker peak memory and total scan time all improve, and the post-ingest tables are byte-identical to the NDJSON path (A5 fingerprints), including list columns, NULL vs missing and large integers, on multi-file ingests ([P3], [P4]).
+- *Caveat:* `pyarrow` in every worker costs import time and RSS, which works against D8 and E1 ([P2]). After D2 the NDJSON ingest is 4.9 s of worker-side time spread over the phase; measure whether Parquet still pays.
 
-**D4. Ingestor: acknowledged barrier and byte-aware backpressure** · T3 · S · low
+**D4. Ingestor: acknowledged barrier and byte-aware backpressure** · Wave 1 · S · low · a correctness fix, done before D2 ([P2], [P3], [P6])
 - *Where:* `ingest.py:55-147`.
 - *Do:*
   1. Have `drain()` wait on a `Future` that completes *after* the write. Today `n_pending` drops when a path is dequeued, before it is written ([RB D02]).
   2. Keep a persistent error state that wakes waiters, and route every flush path through one exception boundary.
   3. Apply backpressure on the sum of queued spill bytes, not on the file count.
-- *Done when:* a deliberately delayed write keeps `drain()` waiting, and an injected write error surfaces.
+- *Done when:* a deliberately slow flush keeps `drain()` waiting, and an injected write error surfaces on every later call (`tests/test_units.py`).
 
 **D5. Remove the serial post-ingest UPDATEs** · T2 · S · low
 - *Where:* `scanner.py:929-945`.
 - *Do:*
-  1. Compute `known_doc` in the worker, from a compact per-dataset id set covering **all** splits: sorted ids plus offsets, shipped next to the gold pack.
-  2. Alternatively, drop the column and derive `unresolved_ids` with an anti-join inside `_aggregate_runs_sql`.
-  3. Compute `batches.n_docs` inside `_aggregate_runs_sql` instead of `UPDATE`.
+  1. Drop `preds.known_doc` and derive unresolved ids with an anti-join inside `_aggregate_runs_sql` ([P2]).
+  2. Drop `batches.n_docs`; `_aggregate_runs_sql` counts documents itself.
+  3. The result is zero post-ingest UPDATEs, not fewer.
 - *Why:* 5.6 s serial on the scan thread (F6).
 - *Done when:* the inferences phase has no statement touching all of `preds`.
 
@@ -529,7 +660,11 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   - **b.** Partition finalize: re-aggregate and re-score only the affected runs (`DELETE … WHERE run IN changed`, then `INSERT … SELECT … WHERE run IN changed`). Recompute costs for every run only when an architecture card changed.
   - **c.** Store `checked_at` separately from the catalog generation.
 - *Why:* 3.2 s today, and the version bump re-fires every `catalog-version`-driven callback. Before B1 that meant every hidden workbench. Step 1 of the paper's walkthrough is exactly this button.
-- *Done when:* a no-op scan takes ≤ 0.4 s with no generation change, and editing one run touches only that run's rows.
+- *Done when:*
+  - a no-op scan takes ≤ 0.4 s with no generation change and no cache invalidation;
+  - an edit that cannot change a derived row (a card description) re-derives nothing;
+  - editing one run touches only that run's rows (b);
+  - after any edit, the incremental store equals a clean rebuild, table by table (A5 fingerprints). This is the contract behind the paper's "recomputes only what changed" ([P5]).
 
 **D8. Worker memory**
 - **a. Size the POS phase to the work** · T2 · S · low
@@ -546,13 +681,17 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   - *Do:* decode into a chunk-local dict and drop it at the end of the chunk, or keep a bounded LRU of decoded entries. Keep the raw bytes as the only long-lived form.
 - **c. Share the pack across workers by memory mapping** · T3 · M · medium
   - *Do:* the parent writes one pack file plus a sorted `(doc_id → offset, len)` index per dataset, and workers `mmap` both. Page-cache pages are shared, so PSS counts the pack once rather than once per worker.
-  - Do this only if the fixture L profile (A2) shows RSS scaling as workers × pack.
+  - Do this only if the fixture L profile (A2) shows RSS scaling as workers × pack. Moved to the post-demo appendix ([P5]).
+  - *Done when:* total process-group PSS grows less with the worker count than before. Sharing reduces the replicated pack; it cannot remove each worker's private state ([P3]).
 - **d. Caches without cliffs, keyed for determinism** · T2 · S · medium
   - *Where:* `textproc.PhraseCache` (`:146-189`), `derive._MATCH_STEMS` (`:79-96`).
   - *Do:*
     - Replace clear-all resets with a two-generation scheme: on overflow the current dict becomes "old", lookups promote from old to new, and the old generation is dropped at the next overflow ([R2 #6–7], [R4 3.1]).
     - Bound `_persisted` without triggering re-persist storms.
     - Key by `(lang2, norm)`. This is the determinism fix of [RA E9], and A5 checks it across worker counts.
+    - Analyse predictions **per annotation language**, not once in the dataset's main language and re-stemmed ([P6]). A mixed-language combined set analyses each gold in its own language.
+    - This changes numbers where languages differ, so it is labelled as a correctness fix and ships under the same `CODE_VERSION` change as the other convention fixes ([P6]).
+    - Test the cliff scenario explicitly: vocabulary larger than the cache cap, skewed phrase frequencies, then a second scan ([P4]).
   - Record hit rates in the task results.
 - **e. Columnar accumulation and streamed writes** · T3 · S · low
   - Comes with D3. No list of row dicts, and no whole-chunk `BytesIO`.
@@ -581,12 +720,17 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 - **e. Stay in NumPy for spaCy attributes** · T3 · S · low
   - *Where:* `textproc.spacy_doc_tokens` (`:125-132`).
   - *Do:* select with boolean masks on the `to_array` result instead of `.tolist()` over every token.
-- **f. Seeded sampling of training splits for distribution charts** · T2 · M · low
+- **f. Seeded sampling of training splits for distribution charts** · after the demo · M · **medium** — it changes what the tool computes ([P2], [P3])
   - *Where:* `derive_doc_chunk`, new `--dist-sample N` (default 50 k per split).
   - *Do:*
     - Sample only the expensive NLP for training documents: spaCy, stemming, PRMU, language ID and tokenizer counts run when a seeded uniform sample selects the document.
     - **Every** training document still gets its cheap `documents` row (id, split, byte offsets), because RQ2's leakage criterion joins counterpart training documents by id (`rq2._leak_docs`).
     - Captions state "n = 50,000 of 530,809, uniform sample" ([RA S14]). The Overview says that language flags on training splits come from the sample.
+  - *Boundaries* ([P2], [P3]):
+    - never sampled: document identities, splits and byte offsets; coverage ratios; RQ2 leakage relationships; the document browser; every test-split number;
+    - sampled only: descriptive distributions of training splits, named per chart;
+    - a stable selection rule (hash of `doc_id` with a stored seed), so the sample is identical across scans and machines, and the sample identity is stored with the figure spec;
+    - an explicit `--dist-sample` mode, off by default. The default stays exhaustive.
   - *Why:* training splits dominate the real 14.2 GB tree (F10). This is the single largest lever on a real cold scan.
 - **g. Hoist per-document closures** · T3 · S · low
   - *Do:* define `stream` and `agg_add` once per chunk (`derive.py:220, 259`).
@@ -597,17 +741,23 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   - **b.** Detect appends to a JSONL collection (prefix hash unchanged, file grew) and derive only the tail.
   - **c.** Give runs per-batch signatures: purge and re-derive only the changed batch files.
   - **d.** Have a run's signature reference a **hash of its dataset's gold pack**, not the document file's signature. Editing document text that does not change gold then leaves the runs untouched.
-- *Done when:* appending one document re-derives one chunk and zero runs (today it is 1 collection + 9 runs [R1 C.3]).
+- *Done when:* only affected dependencies recompute, and the incremental output equals a clean rebuild (A5). Appending documents can legitimately change coverage or resolve previously unresolved predictions, so "zero runs re-derived" is the target only when the appended ids are not referenced by any run ([P3], [P5]).
+- *Blocked by:* D14, so that incremental re-derivation never exposes torn reads ([P5]).
 
 **D11. Hash while reading** · T3 · S · low
 - *Where:* `scanner._discover` (`:482-527`), worker chunk readers.
 - *Do:* workers compute a blake2b per byte range as they read, and the parent combines them in order. Remove the separate hashing pass, and the spurious re-derivation after the first scan (Section 1.2 "First `--full`", [RA S11], [R5 1.1]).
 
-**D12. Warm workers through forkserver preload** · T2 · S · low
+**D12. Warm workers through forkserver preload** · experiment, after the demo · S · **medium** ([P3], [P6])
 - *Where:* `scanner._mp_context` (`:74-96`).
 - *Do:* `ctx.set_forkserver_preload(["kpviz.derive", "kpviz.textproc", "spacy", "Stemmer", "orjson", "numpy"])`. The API is present on the installed Python.
 - *Why:* workers fork from an image that has already imported the heavy modules. Start-up is faster and the import pages are shared copy-on-write, which lowers PSS.
-- *Done when:* A2 shows lower per-worker USS and a faster first task.
+- *Traps:*
+  - Preloading spaCy imports NumPy, and OpenBLAS sizes its thread pool at import, before `init_worker` pins threads. Set `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `RAYON_NUM_THREADS` in the parent before the forkserver starts ([P6]).
+  - Imported libraries can start threads inside the forkserver, which breaks its fork-safety assumptions ([P3]). Check the thread count of the forkserver after preload.
+  - Linux and macOS only; keep `spawn` as the fallback ([P2]).
+  - Warm `_blank`, the stemmers and the tagger models explicitly in the preload, or nothing is shared ([P2]).
+- *Done when:* A2 shows lower per-worker USS and a faster first task, and a per-worker thread count equal to the pinned value.
 
 **D13. Scheduling across phases** · T3 · S · low
 - *Do:*
@@ -622,10 +772,13 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   2. The UI reads only the published generation, and every cache is keyed on it.
   3. On cancel or failure, keep the previous generation and delete unclaimed spills ([RB D01], [R1 A.8], [R4 2.7]).
 - *Why (latency):* no torn reads during a scan, and a single cache invalidation at publish.
+- *Keep it simple* ([P1]): build the new generation in a fresh `.duckdb` file and swap it in with an atomic rename, or rely on one DuckDB transaction; no application-level generation tracker. That also delivers D16.
+- *Cheap half, done now* ([P2]): a failed or cancelled scan records `last_scan_ok = false`, bumps the version so every cache is invalidated, and deletes unclaimed spills; the next scan then never takes the no-op shortcut.
 
 **D15. Scan start under a lock, cancellation everywhere** · T2 · S · low
 - *Where:* `scanner.start_scan` (`:238-246`), the POS, hashing and ingest loops.
-- *Do:* do the check-and-set under a module lock ([RA G1]), and add cancel checkpoints to every long loop.
+- *Do:* do the check-and-set under a module lock ([RA G1]), and add cancel checkpoints to every long loop, including the POS phase and tokenizer batches ([P4]).
+- *Done when:* eight concurrent starts run one scan; a cancel mid-phase leaves the previous catalog readable and marks the store for a full next pass ([P3]).
 
 **D16. Keep the store compact** · T3 · S · low
 - *Do:* with D14, write each new generation into a fresh file and swap it in. That compacts by construction. Until then, add a `kpviz compact` command that rebuilds with `CREATE TABLE … AS` into a new file (F5).
@@ -657,10 +810,12 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 - *Where:* `export.py` (`fig_png`, `fig_pdf`, `fig_pgf` under `_render_lock`).
 - *Do:* use a `ProcessPoolExecutor(max_workers=1)` created at start, with Matplotlib imported and rcParams isolated. The server sends a spec and receives bytes.
 - *Why:* rendering stops holding the server's GIL, global rcParams races disappear, and a TeX crash cannot take the server down.
+- The worker is pre-warmed at start (Matplotlib imported, fonts cached), so no click pays process start-up ([P1]); it counts against E1.
 
-**F2. Speculative pre-render** · T2 · S · low
-- *Do:* when a `fig-spec` has been stable for 1 s, render PDF, PNG and PGF in the export process in the background. A newer spec replaces the pending job. Clicking "PDF" or ".pgf" then returns cached bytes.
-- *Why:* step 4 of the demo is "Copy LaTeX and PGF", so it must be instant.
+**F2. Speculative pre-render** · deferred until F1 is measured · S · medium
+- *Do (if still needed):* after 1–2 s of idleness on a stable `fig-spec`, pre-render **PNG only** in the export process, at low priority, deduplicated, and cancelled when the spec changes ([P2], [P3], [P6]).
+- *Why deferred:* every control change produces a new spec, so eager rendering would spend about 1 s of CPU per slider tick while the user explores, against E1 and B1. With the caption-free cache key (E2) and the persisted TeX probe (B3), the measured export click is 0.6–0.9 s today.
+- *Done when:* the download click is ≤ 100 ms **and** interactive latency does not regress, with the speculative work included in the memory account.
 
 **F3. Cache failures, demote engines, say why** · T2 · S · low
 - *Where:* `export.py:170-186` (`fig_pgf` returns `None` and re-runs TeX on every click).
@@ -685,7 +840,7 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   3. Persist the TeX probe (B3).
   4. Use a pinned environment lock ([RA U2], [RB M02]).
 
-**G3. Scripted walkthrough test** · T2 · S · —
+**G3. Scripted walkthrough test** · Wave 2 · S · — ([P6])
 - *Do:* a Playwright script plays §6 end to end:
   1. Scan for changes.
   2. Open RQ3 and select the kptimes models.
@@ -694,7 +849,7 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   5. Delete the store and re-scan.
   6. Assert the figure spec hash is identical.
 
-  Each step asserts its latency budget. Run it daily until the demo, and on the demo laptop at the freeze.
+  Each step fails if it exceeds 120 % of its budget ([P4]). Run it daily until the demo, and on the demo laptop at the freeze.
 
 **G4. Warm start** · T2 · S · —
 - *Do:* start the app a few minutes before the session. B9 warms every default view, so the first click of the demo is a cache hit.
@@ -705,8 +860,9 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
   - afterwards: the last interaction latency (A6).
 - *Why:* it makes the paper's efficiency claims visible, so the audience watches the engine rather than a spinner.
 
-**G6. Align the paper's performance claims with what the code runs** · T2 · S · —
+**G6. Align the paper's performance claims with what the code runs** · Wave 2 · S · — ([P5], [P6])
 - *Do:* quote end-to-end numbers from A on named hardware, for example "N predictions matched in X s on a 4-core laptop; interactions ≤ Y ms". Re-time Table 2 on the shipped code path: spaCy tokenisation, same-definition PRMU ([RA C1], [R1 B.2]).
+- Keep a claim table: each paper claim → the code path → the measurement or test that supports it ([P5]). Q&A is likely to land on Table 2's tokenizer row, the in-order PRMU definition and Porter2 ([P6]). The byte-offset story of Fig. 2 must survive any schema change (C6 derived keys only) ([P4]).
 
 **G7. Fallback kit** · T1 · S · —
 - *Do:* keep a pre-scanned copy of `.kpviz/` (restorable in seconds), pre-rendered exports and screenshots of every step, and the demo video. If anything misbehaves live, restore and continue.
@@ -722,109 +878,197 @@ Format per action: **ID. Title** · tier · effort (S < ½ day, M 1–3 days, L 
 - **No optimisation without its A-series benchmark**, and no merge without A5.
 
 ---
-
 ## 4. Dependencies between actions
 
+The `Blocked by` column in Section 5 is authoritative. The main chains:
+
 ```
-A1..A5 ──► every other action (baseline + gates)
-B1 ─┬─► B6, B9, B10        C1 ─► C3 ─► C6 ─► C7
-B3 ─┘                      C4 ─► B9, C5
-D6 ─► D7a                  C9 ─► C5 (catalog snapshot carries colours)
-D2 ─► D3 ─► D8e            D14 ─► D16, C4 (generation keys)
-D8d ─► A5 determinism passes    D9f ─► G1 (real-scale demo subtree)
-F1 ─► F2                   A8 ─► G1 ─► G3, G7
+A1..A6, C13..C25 ──► every performance action (baseline, gates, correct inputs)
+D4 ─► D2 ─► D3 (experiment)          D8f ─► D2 at real scale (task bytes bounded)
+D6 ─► D7a                            D14 (cheap half) ─► D7a ─► D7b ─► D10b..d
+D14 (full) ─► D10, D16               C18 ─► C5, D5 (one schema bump)
+C1 ─► C3 ─► C6 ─► C7                 evaluation fixes (C21..C24, D8d) ─► C8
+C4 ─► B9, G4                         B1 ─► B6, B9, B10
+F1 ─► F2 (only if still needed)      A8 ─► G1 ─► G3 (real budgets), G7, D9f decision
 ```
 
 ---
 
 ## 5. Tracker
 
-| ID | Action | Tier | Effort | Risk | Expected effect | Acceptance (fixture M unless noted) |
-|---|---|---|---|---|---|---|
-| A1 | Fixture generator S/M/L | T0 | M | low | reproducible baseline | fixed seed, Section 1 tree |
-| A2 | Scan memory/pool profiler | T0 | S | low | per-phase peaks archived | `mem`/`pool` blocks in scan_stats |
-| A3 | UI probe | T0 | S | low | callback, idle and RSS numbers | Section 1.2 table in ≤ 90 s |
-| A4 | Kernel benchmarks | T0 | S | low | per-kernel medians | JSON output |
-| A5 | Parity + determinism gates | T0 | M | low | numbers can't move silently | injected change fails |
-| A6 | Per-callback timing | T1 | S | low | p50/p95 per callback | `/kpviz-perf` |
-| A7 | Budget + CI | T2 | S | low | regressions blocked | CI red on regression |
-| A8 | Real-data baseline | T1 | S | low | demo numbers | recorded |
-| B1 | Visible-only computation | T1 | M | low | removes ~40 hidden callbacks and the 7–22 s ones | with B2+B3: ≤ 15 callbacks, settle ≤ 1.5 s |
-| B2 | Poll only while scanning | T1 | S | low | 20/10 s → 0 idle | 0 idle requests |
-| B3 | TeX probe off request path | T1 | S | low | −6 slow callbacks | clipboards ≤ 50 ms |
-| B4 | Clientside toggles | T1 | S | low | 0 round trips to switch | — |
-| B5 | Loading overlay | T1 | S | low | visible progress | — |
-| B6 | Split monolithic callbacks | T2 | M | low | concurrent panels | 1 callback per control |
-| B7 | Lighter figures + Patch | T3 | S | low | smaller payloads | RQ3 ≤ 60 KB |
-| B8 | Compression | T3 | S | low | faster first paint remotely | — |
-| B9 | Prefetch default views | T2 | S | low | first click cached | cache hit |
-| B10 | URL state | T3 | M | low | shareable views | — |
-| B11 | waitress | T3 | S | low | robustness | — |
-| C1 | One-statement scoring | T1 | M | med | 3.0 s → 0.13 s | parity; RQ3 ≤ 0.4 s |
-| C2 | Arrow/NumPy fetch | T1 | S | low | 1.93 s → 0.22 s fetch | no large `fetchall` |
-| C3 | Per-doc arrays (`doc_ord`) | T2 | M | med | 47 → 1.7 MB per entry | stats parity |
-| C4 | Byte LRU + single-flight | T1 | S | low | bounded RSS | ≤ budget + 150 MB |
-| C5 | No UI writes to DuckDB | T2 | S | low | no lock waits in scans | no `_wlock` in callbacks |
-| C6 | Integer keys | T3 | M | med | faster joins, less memory | parity |
-| C7 | Clustering / zone maps | T3 | S | low | row groups skipped | `EXPLAIN ANALYZE` |
-| C8 | Precomputed filtered views | T3 | S | low | 10 ms defaults | parity |
-| C9 | Catalog snapshot, no N+1 | T2 | M | low | ≤ 3 SQL per interaction | A6 |
-| C10 | Datasets pre-aggregates | T3 | S | low | page ≤ 200 ms | — |
-| C11 | Serve-mode DuckDB memory | T2 | S | low | RSS returns to OS | E1 |
-| C12 | Retry only retryable | T2 | S | low | honest errors | — |
-| D1 | Measured CPU budget | T2 | S | low | right worker count | sweep chart |
-| D2 | Coalesced prediction tasks | T2 | M | med | ingest 11.9 → ≤ 3 s | ≤ 100 tasks, CPU ≥ 85 % |
-| D3 | Parquet spills | T3 | M | med | 252 MB → ≤ 13 MB | parity |
-| D4 | Acknowledged ingest barrier | T3 | S | low | correct drain | fault test |
-| D5 | Drop post-ingest UPDATEs | T2 | S | low | −5.6 s serial | no full-table UPDATE |
-| D6 | Tokenizers resolved once, offline workers | T1 | S | low | −1.85 s per scan, −1 s per worker | 0 sockets in workers |
-| D7 | No-op / partial finalize | T1/T3 | S/M | low | 3.2 → ≤ 0.4 s | no generation change |
-| D8a | POS sized to work, gold only | T2 | S | low | 4.9 s / 1.1 GB → ≤ 1.5 s / 400 MB | fixture L flat in workers |
-| D8b | Bounded decoded pack | T3 | S | low | worker RSS bounded | — |
-| D8c | mmap-shared pack | T3 | M | med | PSS ÷ workers | only if A2 shows need |
-| D8d | Generational caches keyed by language | T2 | S | med | no cliffs, deterministic | A5 across workers |
-| D8e | Columnar accumulation | T3 | S | low | less worker RAM | — |
-| D8f | Memory-aware chunks | T3 | S | low | long docs bounded | — |
-| D9a–c | Normalise once, one-pass LID, O(log n) approx positions | T2 | S | low | up to −1.2 s per 8 MB chunk | identical outputs |
-| D9d–e,g | Single exact encode, NumPy attributes, hoisted closures | T3 | S | low | fewer passes | identical outputs |
-| D9f | Training-split sampling | T2 | M | low | ≈ train/test× faster real cold scan | caption states n of N |
-| D10 | Finer incrementality | T3 | M–L | med | append = one chunk | 0 runs re-derived |
-| D11 | Hash while reading | T3 | S | low | no double read | no spurious re-derive |
-| D12 | forkserver preload | T2 | S | low | lower PSS, faster start | A2 |
-| D13 | Longest-first, POS overlap | T3 | S | low | shorter tail | — |
-| D14 | Atomic generations | T3 | L | med | no torn reads | fault injection |
-| D15 | Scan lock + cancel points | T2 | S | low | one scan at a time | double-click test |
-| D16 | Compaction | T3 | S | low | file ≈ live size | — |
-| D17 | Scan DuckDB budget | T2 | S | low | no OOM on laptops | A2 sweep |
-| E1 | Memory budget | T1 | S | low | ≤ 400 MB steady | A3 after 50 interactions |
-| E2 | Export cache in bytes, caption-free key | T2 | S | low | bounded, fewer re-renders | — |
-| E3 | No large transients | T2 | S | low | flat RSS | `tracemalloc` |
-| F1 | Export process | T2 | S | low | no GIL contention | — |
-| F2 | Speculative pre-render | T2 | S | low | instant download | click ≤ 100 ms |
-| F3 | Failure caching and demotion | T2 | S | low | no repeated TeX runs | — |
-| G1 | Real-data rehearsal | T1 | M | — | known on-stage timings | re-scan ≤ 60 s subtree |
-| G2 | Offline kit | T1 | S | — | exact tokens, no network | airplane-mode run |
-| G3 | Scripted walkthrough | T2 | S | — | daily regression | all steps in budget |
-| G4 | Warm start | T2 | S | — | instant first click | — |
-| G5 | Performance strip | T2 | S | low | efficiency visible | — |
-| G6 | Paper claim alignment | T2 | S | — | defensible numbers | — |
-| G7 | Fallback kit | T1 | S | — | recoverable demo | restore ≤ 30 s |
+Status: **done** = implemented and verified on this branch; **partial** = the part named is done; **open** = not started; **deferred** = after the demo, with its reason in the item; **n/a** = not needed.
+
+| ID | Action | Wave | Blocked by | Status | Acceptance and evidence |
+|---|---|---|---|---|---|
+| A1 | Fixture generators | 1 | — | partial | `tools/make_sample_src.py`, `make_sample_data.py`, `make_scaled_data.py` committed, seeded; the large-vocabulary L fixture is open |
+| A2 | Scan memory/pool profiler | 1 | — | partial | `tools/bench/scan_profile.py` (parent + children RSS/PSS/USS per phase); machine spec in every `scan_stats`; the in-app `mem` block is open |
+| A3 | UI probe | 1 | — | done | `tools/bench/probe_ui.py`, Section 6.2 |
+| A4 | Kernel benchmarks | 3 | A1 | open | — |
+| A5 | Parity + determinism gates | 1 | — | done | `tests/test_metrics.py` (independent reference, > 500 cells), `tests/test_scan.py` (workers 1 vs 4, incremental = clean), `tools/bench/fingerprint.py`, `tools/bench/metrics_snapshot.py` (2,040/2,040 vs original code) |
+| A6 | Per-callback timing | 1 | — | done | `/kpviz-perf`; callbacks > 0.5 s logged |
+| A7 | Budget + CI | after | A5 | open | no CI in the repository yet |
+| A8 | Real-data baseline | 4 | demo laptop | open | — |
+| B1 | Visible-only computation | 2 | — | done | first load 1 callback, settle 0.22 s |
+| B2 | Poll only while scanning | 2 | B1 | done | 0 idle requests |
+| B3 | TeX probe off request path | 2 | — | done | background thread, persisted in `tex_probe.json` |
+| B4 | Clientside toggles | 2 | B1 | done | `assets/route.js` |
+| B5 | Loading overlay | 2 | — | done | `ui.loading` (300 ms delay, previous figure stays visible) |
+| B6 | Split monolithic callbacks | 3 | B1 | partial | Datasets browser split out (keeps its search); RQ3 panels still share one callback |
+| B7 | Lighter figures + Patch | 3 | A4 | partial | `uirevision`; payload trimming open |
+| B8 | Compression | after | — | open | — |
+| B9 | Prefetch default views | 4 | C4 | open | — |
+| B10 | URL state | after | B1 | open | — |
+| B11 | waitress | after | — | open | Flask threaded server kept |
+| C1 | One-statement scoring | 2 | A5 | done | parity grid; RQ1/RQ4 ≤ 0.13 s, RQ2 0.45 s |
+| C2 | NumPy fetch | 2 | — | done | `db.qnp`; gold packs built by one SQL aggregation |
+| C3 | Per-doc arrays over a doc index | 2 | C1 | done | `metrics.DocIndex`, `PerDoc`; stats vectorised, identical ranks and ties |
+| C4 | Byte LRU + single-flight | 2 | — | done | `ByteLRU`, 256 MB; server 391 MB after the full probe |
+| C5 | No UI writes to DuckDB | 2 | C18 | done | colours in `colors.json`; `agg_cache` removed |
+| C6 | Integer keys | after | C18 | open | — |
+| C7 | Clustering / zone maps | after | C6 | open | — |
+| C8 | Precomputed filtered views | after | C21–C24 | open | — |
+| C9 | Catalog snapshot, no N+1 | 2 | — | partial | helpers memoised per catalog version (RQ3 run limits, RQ5 variations, options); a single snapshot object is open |
+| C10 | Datasets pre-aggregates | 3 | D4 | partial | browser paged in SQL; aggregates open (page 1.9 s) |
+| C11 | Serve-mode DuckDB memory | 2 | — | done | 2 GB serve limit, allocator flush |
+| C12 | Retry only retryable | 1 | — | done | `db._retryable` |
+| C13 | Content-hash new files | 1 | — | done | `tests/test_scan.py` no-op and incremental tests |
+| C14 | `language` and `languages` | 1 | — | done | `tests/test_contract.py` |
+| C15 | Purge by file | 1 | — | n/a | one collection file per dataset |
+| C16 | Versioned phrase cache | 1 | C19 | done | `test_phrase_cache_retags_on_tagger_change` |
+| C17 | Shading after axis limits | 1 | — | done | `figures.to_mpl` |
+| C18 | Honest names, one schema bump | 1 | — | done | `SCHEMA_VERSION = 5` |
+| C19 | Source-hash code version | 1 | — | done | `scanner.CODE_VERSION` |
+| C20 | JSONC cards, reported parse errors | 1 | — | done | `test_broken_inputs_are_reported_not_dropped` |
+| C21 | Identity and filter defects | 1 | — | done | `test_empty_document_filter_is_not_no_filter` |
+| C22 | Export correctness | 1 | — | done | `test_matplotlib_pdf_has_no_type3_fonts`, `test_figure_environment_follows_size`, `test_missing_values_export` |
+| C23 | Coverage, run tags | 1 | — | done | `test_issue_tags` |
+| C24 | Captions and encodings | 1 | — | done | `test_caption_names_the_gold_actually_used`, `test_pareto_ties_and_non_finite` |
+| C25 | Pinned requirements | 1 | — | done | `requirements.txt` |
+| D1 | Measured CPU budget | 3 | A2 | partial | 4-vCPU sweep kept the all-cores default; 8/16-core sweeps open (A8) |
+| D2 | Coalesced prediction tasks | 3 | D4 | done | inferences 16.9 → 10.8 s, CPU 67 → 84 % |
+| D3 | Parquet spills | after | D2 | deferred | experiment |
+| D4 | Acknowledged ingest barrier | 1 | — | done | `test_drain_waits_for_the_write`, `test_ingest_error_is_sticky` |
+| D5 | Zero post-ingest UPDATEs | 2 | C18 | done | no statement touches all of `preds` |
+| D6 | Tokenizers once, offline workers | 1 | — | done | negative cache, `HF_HUB_OFFLINE` in workers, `--offline`; `test_offline_tokenizer_never_downloads` |
+| D7a | No-op scans publish nothing | 2 | D6, D14 cheap | done | 0.27 s, version unchanged (`test_noop_scan_publishes_nothing`) |
+| D7b–c | Partial finalize | after | D7a | open | — |
+| D8a | POS sized to work, gold only | 3 | — | done | 4.5 → 2.9 s |
+| D8b | Bounded decoded pack | 3 | — | done | 200 k decoded entries per worker |
+| D8c | mmap-shared pack | after | A1 L | deferred | only if the L profile shows need |
+| D8d | Language-keyed caches, per-language analysis | 1 | — | done | `test_language_keyed_phrase_cache`; determinism test |
+| D8e | Columnar accumulation | after | D3 | deferred | — |
+| D8f | Memory-aware chunks | after | A1 L | open | — |
+| D9a–c | Normalise once, one-pass LID, O(log n) positions | 3 | A5 | done | `test_detect_language_matches_reference`, `test_approx_positions_equal_prefix_rescan`, `test_norm_offsets_map_back_to_source` |
+| D9d–e | One exact encode, NumPy attributes | 3 | C22 | done | determinism and parity gates |
+| D9f | Training-split sampling | after | G1 | deferred | boundaries written; off by default |
+| D9g | Hoisted closures | after | — | open | — |
+| D10a | Signature from derivation-relevant card fields | 2 | — | done | `test_description_edit_rederives_nothing` |
+| D10b–d | Append / per-batch / gold-hash incrementality | after | D14 | open | — |
+| D11 | Hash while reading | after | C13 | open | C13 covers correctness; the double read remains |
+| D12 | forkserver preload | after | — | deferred | experiment with named traps |
+| D13 | Longest-first, POS overlap | after | — | open | — |
+| D14 | Atomic generations | 2 (cheap) / after (full) | — | partial | failed or cancelled scans invalidate caches and force a full next pass |
+| D15 | Scan lock + cancel points | 1 | — | done | `test_concurrent_start_starts_one_scan` |
+| D16 | Compaction | after | D14 | open | — |
+| D17 | Scan DuckDB budget | 2 | A2 | done | `config.duckdb_memory_bytes` |
+| E1 | Memory budget | 2 | C4 | done | 391 MB after the full probe (Section 2.1 model) |
+| E2 | Export cache in bytes, caption-free key | 2 | — | done | `test_caption_edit_does_not_rerender` |
+| E3 | No large transients | 2 | C3 | partial | by construction; a `tracemalloc` check is open |
+| F1 | Export process | 4 | — | open | — |
+| F2 | Speculative pre-render | after | F1 | deferred | — |
+| F3 | Failure caching and demotion | 3 | B3 | done | engines pdflatex → xelatex → lualatex, failures cached, reason shown |
+| G1 | Real-data rehearsal | 4 | A8 | open | re-scan ≤ 60 s on the chosen subtree |
+| G2 | Offline kit | 4 | D6 | partial | `--offline`, negative cache, `file:` tokenizer specs; the kit itself is built on the demo laptop |
+| G3 | Scripted walkthrough | 2 | B1 | partial | `tests/test_ui.py` renders and exports every workbench; the §6 end-to-end script is open |
+| G4 | Warm start | 4 | B9 | open | — |
+| G5 | Performance strip | 4 | A2 | open | — |
+| G6 | Paper claim alignment | 2 | A8 | open | — |
+| G7 | Fallback kit | 4 | G1 | open | restore ≤ 30 s |
 
 ---
 
-## 6. How the baseline was produced
+## 6. Measured results
 
-The Section 1 numbers came from the sequence below. `make_sample_src.py`, `make_scaled_data.py` and `bench_scores.py` are in Review A's tools zip. `scan_profile.py` and `probe.py` are the plan author's session scripts and are **not in the repository**: A2 and A3 specify their committed replacements (per-phase parent/children RSS·PSS·USS sampling, and Playwright callback, idle and RSS probing).
+### 6.1 Machine and method
+
+| Item | Value |
+|---|---|
+| Machine | 4 usable vCPU, 15.7 GB RAM, Linux 6.18, Python 3.11 |
+| Libraries | Dash 4.4.1, Plotly 7.1.0, DuckDB 1.5.5, spaCy 3.8.16 (+ `en_core_web_sm`, `fr_core_news_sm` 3.8.0), PyStemmer 3.1.0, orjson 3.12.0, NumPy 2.4.6, Matplotlib 3.11.2 |
+| Tree | `tools/make_scaled_data.py . sample_src scaled_data 20000`: 5 datasets, 66 runs, 75,190 documents, 1.32 M prediction lines, 296 MB, 5,366 files |
+| Network | offline (`KPVIZ_OFFLINE=1`), so tokenizers are approximate; no TeX |
+| Before | the original code, run the same day on the same tree, page cache warm for both |
+
+The before cold scan measured 36.8 s here against 43.4 s in Section 1; Section 1's run had a cold page cache. Both columns of 6.2 use the same-day runs.
+
+### 6.2 Scan
+
+| Phase | Before | Now |
+|---|---|---|
+| discover | 0.22 s (0 files hashed) | 1.39 s (5,366 files hashed, C13) |
+| documents | 11.50 s | 8.38 s |
+| inferences | 16.87 s | 10.80 s |
+| keyphrases (POS) | 4.45 s | 2.85 s |
+| finalize | 3.04 s | 2.21 s |
+| **total, cold** | **36.8 s** | **25.9 s** |
+| no-op re-scan | 1.90 s, version 1 → 2 | 0.27 s, version unchanged |
+
+| Peak memory (MB) | Before: parent RSS / workers PSS | Now: parent RSS / workers PSS |
+|---|---|---|
+| documents | 276 / 528 | 229 / 487 |
+| inferences | 835 / 699 | 382 / 812 |
+| keyphrases | 762 / 1,091 | 326 / 908 |
+| finalize | 933 / 15 | 679 / 15 |
+| **overall peak (parent + workers)** | **1,853** | **1,194** |
+
+Derived row counts are identical, except `keyphrases` (2,413 → 2,410): the phrase cache is now keyed by language and holds gold phrases only (D8a, D8d), a labelled correctness change.
+
+### 6.3 UI (`probe_ui.py`, headless Chromium, 1440 × 1000)
+
+| Action | Callbacks | Slowest callback | Server RSS |
+|---|---|---|---|
+| server start | — | — | 126 MB |
+| first load `/` | 1 | 0.37 s | 136 MB |
+| idle 10 s on Overview | 0 requests | — | — |
+| open Insights (RQ4 default) | 7 | 0.27 s | 154 MB |
+| first open of RQ1 / RQ2 / RQ3 / RQ5 | 11 / 11 / 12 / 9 | 0.14 / 0.48 / 1.15 / 0.90 s | 154 → 281 MB |
+| change @k on RQ1 / RQ2 / RQ3 / RQ4 / RQ5 | 2 / 2 / 3 / 2 / 2 | 0.09 / 0.45 / 0.98 / 0.13 / 0.93 s | → 380 MB |
+| tab away and back (unchanged inputs) | 15–20, all answered by `PreventUpdate` or the signature | ≤ 0.30 s | flat |
+| export PNG / PDF | — | 0.91 / 0.64 s | — |
+| open Datasets / Models / Architectures | 11 / 2 / 2 | 1.89 / 0.09 / 0.12 s | 394 MB |
+| end of probe | — | — | 391 MB, 0 console errors |
+
+### 6.4 Correctness gates
+
+`python -m pytest tests`: 37 tests, about 100 s, all passing. They cover the data contract as the README writes it (JSONC cards, both language spellings, both similarity-key spellings, ISO timestamps, missing run cards, illegal parameters, broken inputs reported), the independent scoring reference over every dataset × annotation set × filter × k × measure, worker-count determinism, incremental = clean rebuild, no-op scans, concurrent scan starts, the ingest barrier, and render + export of every workbench.
+
+---
+
+## 7. How to reproduce
+
+Every script below is in the repository.
 
 ```bash
-pip install -r requirements.txt psutil playwright pyarrow
-python make_sample_src.py sample_src
+pip install -r requirements.txt
+pip install pytest psutil playwright
+playwright install chromium        # or pass --chromium PATH to probe_ui.py
+
+python -m pytest tests             # contract, parity, determinism, UI
+
+python tools/make_sample_src.py sample_src
 python tools/make_sample_data.py --src sample_src --out sample_data
-python make_scaled_data.py . sample_src ../scaled_data 20000      # 296 MB, 66 runs
-python scan_profile.py . ../scaled_data ../scaled_state           # cold scan + memory per phase
-python scan_profile.py . ../scaled_data ../scaled_state           # no-op scan
-python app.py --data ../scaled_data --state ../scaled_state --no-browser --port 8085 &
-python probe.py http://127.0.0.1:8085 <server-pid>                # UI: callbacks, idle, RSS
-# stop the server first (DuckDB single-writer lock):
-python bench_scores.py ../scaled_data ../scaled_state kp20k       # Python loop vs one SQL statement
+python tools/make_scaled_data.py . sample_src scaled_data 20000          # 296 MB, 66 runs
+
+python tools/bench/scan_profile.py --data scaled_data --state /tmp/st --json scan.json   # cold
+python tools/bench/scan_profile.py --data scaled_data --state /tmp/st                    # no-op
+python tools/bench/fingerprint.py --state /tmp/st                                        # table hashes
+
+python app.py --data scaled_data --state /tmp/st --no-browser --port 8091 &
+python tools/bench/probe_ui.py http://127.0.0.1:8091 --json ui.json --screenshots shots
+
+# metric parity between two code versions or stores
+python tools/bench/metrics_snapshot.py --data sample_data --state /tmp/st_a --out a.json
+python tools/bench/metrics_snapshot.py --compare a.json b.json
 ```
+
+Record the machine spec with every result (`scan_stats/*.json` already carries it). Keep the before/after results of each wave in `docs/benchmark_results_jcdl26.txt` with the date ([P4]).

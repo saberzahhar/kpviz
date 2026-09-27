@@ -19,6 +19,8 @@ the export, from the same figure spec.
 
 Everything runs on your machine; the only network access is the one-time
 download of tokenizer assets (cached, with a flagged offline fallback).
+`python app.py --offline` guarantees no network access at all: tokenizers
+that are not already cached fall back to flagged approximations at once.
 
 ## Quick start
 
@@ -30,6 +32,7 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
+python tools/make_sample_data.py   # optional: a small generated tree (~1 s)
 python app.py                      # serves ./data, else ./sample_data
 ```
 
@@ -47,7 +50,10 @@ architectures, seventy-five runs) is archived on Zenodo:
 
 Download it and place it as a `data/` folder at the repository root, then run
 `python app.py`. `app.py` needs a `data/` folder (or a `sample_data/` folder,
-or `--data PATH`) to start; the repository itself ships no data.
+or `--data PATH`) to start; the repository itself ships no data, but
+`tools/make_sample_data.py` generates a self-contained `sample_data/` tree
+(five datasets, every card type, deliberate contract edge cases) and
+`tools/make_scaled_data.py` scales it up for load testing.
 
 Optional: any TeX distribution (TeX Live, MiKTeX) enables PGF-typeset PDF
 exports — the figure is then set in your paper's own fonts. Without TeX,
@@ -71,6 +77,13 @@ data/
       batch_%05d.json                    # batch metadata (timestamps, batch-level costs)
       batch_%05d.jsonl                   # predictions: {"_id", "inferences", "costs"?}
 ```
+
+Cards are JSON; `//` and `/* */` comments are accepted (JSONC), exactly as
+in the examples below. A section or annotation set may declare its languages
+as `"languages": ["en"]` or `"language": "en"`. A card that cannot be parsed
+is listed with its line and column on the Overview page rather than
+silently ignored; the same holds for malformed JSONL lines in collections
+and runs.
 
 Folder tokens resolve to cards by file-name token first, then by declared
 ids/names (`openai_api` finds `architecture.api.json` through its `arch_id`).
@@ -223,7 +236,21 @@ Every scan archives its exact per-step timings to `.kpviz/scan_stats/`.
 The `tools/` folder contains the verification harnesses used to check the
 platform itself (metric parity between the SQL and Python paths, LaTeX
 compilation of exports, headless scans); each takes `--data`/`--state` and
-runs against any tree. `tools/kpviz_scaling_benchmark.py` is the self-contained
+runs against any tree.
+
+```bash
+pip install pytest psutil playwright && playwright install chromium
+python -m pytest tests                  # contract, parity, determinism, UI (~1-2 min)
+python tools/bench/scan_profile.py --data sample_data --state /tmp/st --full
+python tools/bench/probe_ui.py http://127.0.0.1:8050   # against a running app
+python tools/bench/fingerprint.py --state .kpviz   # per-table content hashes
+```
+
+The test suite generates its own data tree, checks every SQL score against
+an independent reference implementation, verifies that the worker count
+and incremental re-scans never change a derived number, and renders and
+exports every workbench. `docs/PERFORMANCE_PLAN.md` records the
+performance work and its measured results. `tools/kpviz_scaling_benchmark.py` is the self-contained
 scaling benchmark behind Table 2 of the paper (`pip install nltk PyStemmer`,
 then `python tools/kpviz_scaling_benchmark.py`); its original output is in
 `docs/benchmark_results_jcdl26.txt`.
