@@ -53,6 +53,35 @@ def slot_color(i: int) -> str:
     return PALETTE[i] if 0 <= i < len(PALETTE) else OTHER_GRAY
 
 
+DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+
+
+def shade(hex_color: str, t: float) -> str:
+    """`hex_color` mixed with white by t ∈ [0, 1) (0 = unchanged): one hue,
+    several lightness steps."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    mix = lambda c: round(c + (255 - c) * max(0.0, min(0.9, t)))  # noqa: E731
+    return f"#{mix(r):02x}{mix(g):02x}{mix(b):02x}"
+
+
+def assign_all_slots(idx) -> None:
+    """Colour slots for every model, domain group and run of the catalog,
+    in sorted order, once per scan: a figure's colours then never depend on
+    which page was opened first (pages only read these slots)."""
+    rows = db.q("SELECT DISTINCT model, arch, run_id FROM runs ORDER BY 1, 2, 3")
+    models = sorted({r[0] for r in rows})
+
+    def group_of(model: str) -> str:
+        card = idx.model(model)
+        if card.domains:
+            return card.domains[0].get("domain") or "Other"
+        return card.family_top or "Other"
+    db.color_seq("model", models)
+    db.color_seq("group", sorted({group_of(m) for m in models}))
+    db.color_seq("run", sorted(group_key(*r) for r in rows))
+
+
 # ---- splits: one colour and one order, everywhere ------------------------
 # A split means the same thing on every page, so it gets a fixed hue and a
 # fixed reading order (the pipeline order: you train, you tune, you test).
@@ -110,11 +139,14 @@ def limit_str(v: int | float | None) -> str:
     return str(v)
 
 
-def window_str(tokz: str | None, limit, is_default: bool = False) -> str:
-    """"512 (bart-base)" · "128k (o200k)" · "1024 (bart-base, default)"."""
+def window_str(tokz: str | None, limit, is_default: bool = False,
+               reserved: int = 0) -> str:
+    """"512 (bart-base)" · "128k (o200k)" · "1024 (bart-base, default)" ·
+    "1022 (bart-base, 2 reserved)" — `limit` is what the document can use."""
     if limit is None:
         return "—"
-    inner = tokenizer_label(tokz) + (", default" if is_default else "")
+    inner = (tokenizer_label(tokz) + (", default" if is_default else "")
+             + (f", {reserved:,} reserved" if reserved else ""))
     return f"{limit_str(limit)} ({inner})"
 
 
@@ -248,7 +280,11 @@ def encode_runs(idx: CardIndex, runs: list[dict]) -> dict[str, dict]:
             info = r["resolved"].get(p) or {}
             return json.dumps(info.get("value"), sort_keys=True, default=str)
 
-        val_order = {p: sorted({pval(r, p) for r in rs}) for p in dims}
+        # values in *value* order (1, 4, 10 — not "1", "10", "4"), so an
+        # ordinal parameter reads as an ordered colour sequence
+        val_order = {p: sorted({pval(r, p) for r in rs},
+                               key=lambda s: value_key(json.loads(s)))
+                     for p in dims}
         seq = db.color_seq("run", sorted(uniq.keys()))
         for k, r in uniq.items():
             ci = (val_order[dims[0]].index(pval(r, dims[0]))
@@ -280,11 +316,24 @@ def encode_runs(idx: CardIndex, runs: list[dict]) -> dict[str, dict]:
     groups = sorted({group_of(m) for m in models})
     gseq = db.color_seq("group", groups)
     mseq = db.color_seq("model", models)
+    # runs of one model share its hue and shape: they are told apart by a
+    # lightness ramp (in label order) and, for lines, a dash pattern
+    by_model: dict[str, list[str]] = {}
+    for k, r in uniq.items():
+        by_model.setdefault(r["model"], []).append(k)
+    rank: dict[str, tuple[int, int]] = {}
+    for m, ks in by_model.items():
+        ks.sort(key=lambda k: natural_key(labels[k]))
+        for i, k in enumerate(ks):
+            rank[k] = (i, len(ks))
     for k, r in uniq.items():
         g = group_of(r["model"])
         card = idx.model(r["model"])
+        i, n = rank[k]
+        base = slot_color(gseq[g] % len(PALETTE))
         out[k] = {
-            "color": slot_color(gseq[g] % len(PALETTE)),
+            "color": shade(base, 0.6 * i / max(1, n - 1)) if n > 1 else base,
+            "dash": DASHES[i % len(DASHES)] if n > 1 else "solid",
             "shape": PLOTLY_SHAPES[mseq[r["model"]] % len(PLOTLY_SHAPES)],
             "mpl_marker": MPL_SHAPES[mseq[r["model"]] % len(MPL_SHAPES)],
             "size": _size_from_params(card.n_parameters),

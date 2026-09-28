@@ -15,13 +15,20 @@ Component        SoTA (as used by the field)            Ours (KPViz)
 ---------------  -------------------------------------  ----------------------------
 Tokenisation     word_tokenize (NLTK; pke, redefining-abs-kps) regex  [^\\W_]+  (NFKC+lower)
 Stemming         PorterStemmer (NLTK; ~everyone)         PyStemmer (Snowball/Porter2, C)
-PRMU             redefining-abs-kps (redefining-absent-kps)     indexed, in-order (bisect)
+PRMU             redefining-abs-kps (redefining-absent-kps)     indexed, contiguous (rarest-stem anchor)
 
-Each component is measured three ways:
+Each component is measured four ways:
     SoTA          the standard implementation, every occurrence
-    Ours          KPViz's implementation, every occurrence
-    Ours (cached) KPViz's implementation, each *unique* phrase analysed once
-                  (the cache KPViz keeps across a corpus)
+    Ours          KPViz's algorithm on regex tokens, every occurrence
+    Ours (cached) the same, each *unique* phrase analysed once (the cache
+                  KPViz keeps across a corpus)
+    Shipped       the code path KPViz actually runs, imported from
+                  kpviz.textproc: spaCy blank tokeniser + PyStemmer +
+                  contiguous PRMU with segment boundaries, phrases through
+                  its PhraseCache (run from the repository root)
+
+All PRMU columns use the same definition (Boudin & Gallina's contiguous P),
+so the comparison is like for like.
 
 The SoTA blocks reproduce the cited code verbatim in spirit:
   * redefining-abs-kps stems with a fresh PorterStemmer() per word and tests
@@ -38,7 +45,7 @@ Usage:
     python kpviz_scaling_benchmark.py --quick         # smaller/faster
 """
 from __future__ import annotations
-import argparse, bisect, random, re, statistics, sys, time, unicodedata
+import argparse, random, re, sys, time, unicodedata
 
 from nltk.stem import PorterStemmer
 from nltk.tokenize import word_tokenize
@@ -98,24 +105,28 @@ def position_index(stems: list[str]) -> dict:
         idx.setdefault(s, []).append(i)
     return idx
 
-def inorder_chain_end(kp_stems, index) -> int:
-    pos = -1
-    for s in kp_stems:
+def contiguous_end(kp_stems, doc_stems, index) -> int:
+    """kpviz.textproc.contiguous_end without segments (one section)."""
+    n = len(kp_stems)
+    anchor, best = 0, None
+    for j, s in enumerate(kp_stems):
         lst = index.get(s)
         if not lst:
             return -1
-        j = bisect.bisect_right(lst, pos)
-        if j >= len(lst):
-            return -1
-        pos = lst[j]
-    return pos
+        if best is None or len(lst) < best:
+            anchor, best = j, len(lst)
+    for q in index[kp_stems[anchor]]:
+        p = q - anchor
+        if p >= 0 and p + n <= len(doc_stems) and doc_stems[p:p + n] == kp_stems:
+            return p + n - 1
+    return -1
 
-def ours_prmu(kp_stems_list, index) -> list[str]:
+def ours_prmu(kp_stems_list, index, doc_stems) -> list[str]:
     out = []
     for stems in kp_stems_list:
         if not stems:
             out.append("U"); continue
-        if inorder_chain_end(stems, index) >= 0:
+        if contiguous_end(stems, doc_stems, index) >= 0:
             out.append("P"); continue
         uniq = set(stems)
         present = sum(1 for s in uniq if s in index)
@@ -187,11 +198,16 @@ def bench_tokenize(docs, mode):
     # keyphrases are what recur and get cached; documents are tokenised once
     # (inside PRMU) so they are excluded here.
     strings = [kp for _, kps in docs for kp in kps]
+    if mode == "shipped":
+        tp = _shipped()
+        tp.spacy_word_tokens("warm up", "en")
     t0 = time.perf_counter()
     if mode == "sota":
         for s in strings: sota_tokenize(s)
     elif mode == "ours":
         for s in strings: ours_tokenize(s)
+    elif mode == "shipped":  # spaCy blank tokeniser, every occurrence
+        for s in strings: tp.spacy_word_tokens(s, "en")
     else:  # ours+cache: unique strings only
         cache = {}
         for s in strings:
@@ -204,7 +220,7 @@ def bench_stem(docs, mode):
     t0 = time.perf_counter()
     if mode == "sota":
         for ws in lists: sota_stem_fair(ws)
-    elif mode == "ours":
+    elif mode in ("ours", "shipped"):   # the same PyStemmer call
         for ws in lists: ours_stem(ws)
     else:  # ours+cache: each unique word stemmed once
         cache = {}
@@ -222,21 +238,43 @@ def bench_prmu(docs, mode):
             sota_prmu([], tt, tk)
     elif mode == "ours":
         for text, kps in docs:
-            idx = position_index(ours_stem(ours_tokenize(text)))
+            ds = ours_stem(ours_tokenize(text))
+            idx = position_index(ds)
             kp_stems = [ours_stem(ours_tokenize(k)) for k in kps]
-            ours_prmu(kp_stems, idx)
-    else:  # ours+cache: unique keyphrase -> stems cached across the corpus
+            ours_prmu(kp_stems, idx, ds)
+    elif mode == "cache":  # unique keyphrase -> stems cached across the corpus
         cache = {}
         for text, kps in docs:
-            idx = position_index(ours_stem(ours_tokenize(text)))
+            ds = ours_stem(ours_tokenize(text))
+            idx = position_index(ds)
             kp_stems = []
             for k in kps:
                 st = cache.get(k)
                 if st is None:
                     st = ours_stem(ours_tokenize(k)); cache[k] = st
                 kp_stems.append(st)
-            ours_prmu(kp_stems, idx)
+            ours_prmu(kp_stems, idx, ds)
+    else:  # shipped: kpviz.textproc as the scan workers run it
+        tp = _shipped()
+        pc = tp.PhraseCache()
+        stem = tp.get_stemmer("en").stemWords
+        for text, kps in docs:
+            low = tp.norm_text(text)
+            words, _ends, seg = tp.spacy_doc_stream(text, "en", low, [0])
+            doc = tp.StemmedDoc(stem(words), seg)
+            for k in kps:
+                tp.prmu_classify([pc.analyze(k, "en")["stems"]], doc)
     return time.perf_counter() - t0
+
+
+def _shipped():
+    """kpviz.textproc from this repository (the real scan path)."""
+    import os
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from kpviz import textproc
+    return textproc
 
 BENCH = {"Tokenise": bench_tokenize, "Stem": bench_stem, "PRMU": bench_prmu}
 
@@ -251,7 +289,8 @@ def run_point(N, V, L, repeats):
     n_occ = sum(len(kps) for _, kps in docs)
     row = {}
     for comp, fn in BENCH.items():
-        row[comp] = {m: timed(fn, docs, m, repeats) for m in ("sota", "ours", "cache")}
+        row[comp] = {m: timed(fn, docs, m, repeats)
+                     for m in ("sota", "ours", "cache", "shipped")}
     return n_occ, row
 
 def fmt(s):
@@ -264,11 +303,12 @@ def print_block(title, points, repeats):
         print(f"\n  {label}   (N={N} docs, V={V} vocab, L={L} tok, "
               f"{n_occ} keyphrase occurrences)")
         print(f"    {'component':10s} {'SoTA':>10s} {'Ours':>10s} "
-              f"{'Ours+cache':>11s} {'Ours×':>7s} {'cache×':>7s}")
+              f"{'Ours+cache':>11s} {'Shipped':>10s} {'Ours×':>7s} "
+              f"{'cache×':>7s} {'ship×':>7s}")
         for comp in BENCH:
-            s, o, c = (row[comp][m] for m in ("sota", "ours", "cache"))
-            print(f"    {comp:10s} {fmt(s)} {fmt(o)} {fmt(c)} "
-                  f"{s/o:6.1f}× {s/c:6.1f}×")
+            s, o, c, sh = (row[comp][m] for m in ("sota", "ours", "cache", "shipped"))
+            print(f"    {comp:10s} {fmt(s)} {fmt(o)} {fmt(c)} {fmt(sh)} "
+                  f"{s/o:6.1f}× {s/c:6.1f}× {s/sh:6.1f}×")
 
 def main():
     ap = argparse.ArgumentParser()

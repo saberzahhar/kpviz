@@ -6,14 +6,13 @@ the metric is recomputed with and without them and the delta reported with
 sample sizes."""
 from __future__ import annotations
 
-from dash import Input, Output, dcc, html
+from dash import Input, Output, State, dcc, html
 
 from ... import db, scanner, ui
 from ...scanner import TRAIN_SPLIT_SQL
 from ...metrics import memo, metric_label, run_scores
 from ...naming import run_labels, run_rows
 from ...stats import fmt_effect, p_str, sig_mark
-from dash import State
 from dash.exceptions import PreventUpdate
 
 from ..insights_common import (ann_options, datasets_with_runs,
@@ -22,7 +21,7 @@ from ..insights_common import (ann_options, datasets_with_runs,
                                p_cells, p_headers, prmu_arg, resolve_ann,
                                rq_header, runs_control, selected_runs,
                                stats_cfg, stats_inputs, stats_note, value_cell,
-                               vis)
+                               vis, shown)
 from .rq3 import _ci_hover, _pmap
 
 RQ = "rq2"
@@ -41,9 +40,12 @@ def layout():
                   "Documents are flagged by data-quality checks — detected "
                   "language disagreeing with the declared one, or testing "
                   "documents whose similarity pairs point back to a model's "
-                  "own supervision data (train→test leakage). The metric is "
-                  "recomputed excluding the flagged documents; the delta is "
-                  "the bias those documents inject."),
+                  "own supervision data (possible train→test leakage). The "
+                  "metric is recomputed without the flagged documents: the "
+                  "change is how much they move the reported score. A flag "
+                  "is evidence to inspect, not proof — flagged documents can "
+                  "also differ in domain, length or difficulty, and an "
+                  "unflagged document is not thereby verified clean."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds,
@@ -121,9 +123,9 @@ def register(app):
 
     @app.callback(Output(f"{RQ}-ann", "options"),
                   Output(f"{RQ}-label", "options"),
-                  Input(vis(RQ), "data"),
+                  State(vis(RQ), "data"), Input(shown(RQ), "data"),
                   Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
-    def opts(visible, ds):
+    def opts(visible, _shown, ds):
         if not visible:
             raise PreventUpdate
         labels = ["(any)"] + [r[0] for r in db.q(
@@ -137,17 +139,20 @@ def register(app):
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
-        Input(vis(RQ), "data"),
+        State(vis(RQ), "data"), Input(shown(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-models", "value"),
         Input(f"{RQ}-runs", "value"),
         Input(f"{RQ}-crit", "value"), Input(f"{RQ}-thr", "value"),
         Input(f"{RQ}-label", "value"), *stats_inputs(),
+        Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
-    def update(visible, *args):
-        *inputs, last_sig = args
+    def update(visible, _shown, *args):
+        # the catalog version is an input so exactly the visible workbench
+        # re-renders once when a scan publishes; gate() signs it itself
+        *inputs, _catalog, last_sig = args
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
@@ -200,7 +205,7 @@ def register(app):
                           per.select_ords(fo, inside=False)))
 
         # Are flagged documents scored differently from clean ones under this
-        # run? Two independent groups; the dagger sits on the (w/o − w/) delta
+        # run? Two independent groups; the dagger sits on the (unflagged − flagged) delta
         def _st(item):
             _key, va, fl, cl = item
             return {"ci_all": cfg.mean_ci(va),
@@ -237,7 +242,7 @@ def register(app):
                              if excl["mean"] is not None else "—")
                           + (f"<br>reported score moves {shift:+.3f}"
                              if shift is not None else "")
-                          + (f"<br>Δ (w/o − w/) = {t['diff']:+.3f} "
+                          + (f"<br>Δ (unflagged − flagged) = {t['diff']:+.3f} "
                              + _ci_hover((t.get("lo"), t.get("hi")))
                              + f"<br>{cfg.test_name('indep')}: p={p_str(p)}"
                              + (f", adjusted {p_str(pj)}"
@@ -275,18 +280,23 @@ def register(app):
         spec = {
             "kind": "dumbbell", "size": "2col",
             "rows": rows_out,
-            # the three points are a verdict, not a palette: gold = what you
-            # would report, green = the clean subset, red = the documents the
-            # criteria flagged. Distance between red and green is the bias.
+            # three subsets, not a verdict: dark = what you would report,
+            # blue = the unflagged documents, orange = the flagged ones (no
+            # green/red: a flag is evidence to inspect, not a judgement)
             "points": [
-                {"key": "x0", "name": "all documents", "color": "#C9971C"},
-                {"key": "x1", "name": "without flagged", "color": "#0f7a3d"},
-                {"key": "x2", "name": "flagged only", "color": "#d03b3b"},
+                {"key": "x0", "name": "all documents", "color": "#3d3c39"},
+                {"key": "x1", "name": "unflagged", "color": "#2a78d6"},
+                {"key": "x2", "name": "flagged", "color": "#eb6834"},
             ],
             "xlabel": mlab, "name": f"quality-impact-{ds}",
-            "caption": (f"Impact of data-quality filtering on {mlab} for {ds}: "
-                        f"score over all evaluated documents vs. excluding "
-                        f"documents flagged by {'; '.join(crit_txt) or 'no criterion'}. "
+            "caption": (f"Score change after excluding flagged documents, {mlab} "
+                        f"on {ds}: all evaluated documents, the unflagged "
+                        f"ones, and those flagged by "
+                        f"{'; '.join(crit_txt) or 'no criterion'}. Flags are "
+                        "heuristic evidence (language identification, "
+                        "similarity pairs), not established contamination; "
+                        "the subsets can also differ in domain, length or "
+                        "difficulty. "
                         + (f"Whiskers: {ci_txt}. " if ci_txt else "")
                         + "The dagger marks a significant difference between "
                         "the clean and the flagged documents themselves "
@@ -294,7 +304,7 @@ def register(app):
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          [ds])),
         }
-        headers = (["Run", "All", "w/o flag", "w/ flag", "Δ (w/o − w/)"]
+        headers = (["Run", "All", "Unflagged", "Flagged", "Δ (unflagged − flagged)"]
                    + p_headers(cfg) + [cfg.effect_name("indep")])
         spec["table"] = {"headers": headers, "rows": tex_rows,
                          "label": f"quality-{ds}",

@@ -1,7 +1,8 @@
 """Insights — five research-question workbenches with LaTeX/PGF export."""
 from __future__ import annotations
 
-from dash import ClientsideFunction, Input, Output, dcc, html
+from dash import ClientsideFunction, Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import ui
 from ..stats import ADJUST, ALPHAS, ALPHA_DEFAULT, RESAMPLES, alpha_str
@@ -23,10 +24,12 @@ def layout():
                "slice, read the figure, then copy the LaTeX or download the "
                "PGF/PDF/PNG — captions are auto-written from the exact "
                "configuration and stay editable.", className="page-desc"),
-        html.Div([html.Button(t, id=f"tab-{key}",
+        html.Div(id="ins-banner", className="ins-banner", role="status",
+                 style={"display": "none"}),
+        html.Div([html.Button(t, id=f"tab-{key}", role="tab",
                               className="rq-tab" + (" active" if key == "rq4" else ""),
                               n_clicks=0)
-                  for key, t, _ in TABS], className="rq-tabs"),
+                  for key, t, _ in TABS], className="rq-tabs", role="tablist"),
         # one inference procedure for every workbench: daggers, intervals,
         # captions and exported tables all read these, so a paper cannot mix
         # thresholds, tests or corrections
@@ -34,6 +37,7 @@ def layout():
             html.Div("Statistics", className="stats-bar-title",
                      title="Applies to every workbench, its captions and its "
                            "exported tables"),
+            html.Div([
             ui.control("Significance level", dcc.Slider(
                 id="ins-alpha", min=0, max=len(ALPHAS) - 1, step=None,
                 marks={i: f"p<{alpha_str(a)}" for i, a in enumerate(ALPHAS)},
@@ -53,6 +57,7 @@ def layout():
                 value="holm",
                 options=[{"label": v, "value": k} for k, v in ADJUST.items()]),
                 220),
+            ], id="stats-tests", className="stats-group"),
             ui.control("Intervals", dcc.Dropdown(
                 id="ins-ci", clearable=False, className="dash-dropdown",
                 value="t", options=[
@@ -84,12 +89,17 @@ def _guide():
                      "P@k = tp / min(k, #predictions) (no padding), R@k = tp / "
                      "#gold; @O cuts at the number of gold keyphrases, @M "
                      "keeps every prediction."),
-                item("PRMU", "in-order classes on stemmed tokens: Present "
-                     "(contiguous, in order), Reordered (all tokens, not in "
-                     "order), Mixed (some), Unseen (none)."),
+                item("PRMU", "on stemmed tokens (Boudin & Gallina, 2021): "
+                     "Present — the tokens occur as a contiguous sequence, "
+                     "in order, within one section; Reordered — all occur, "
+                     "not as that sequence; Mixed — some; Unseen — none. A "
+                     "PRMU filter restricts the gold only: every prediction "
+                     "still counts in P@k."),
                 item("Matching", "predictions and gold lowercased, spaCy-"
-                     "tokenised, Snowball (Porter2)-stemmed, de-duplicated "
-                     "keeping rank order."),
+                     "tokenised, Snowball (Porter2)-stemmed; predictions "
+                     "de-duplicated keeping rank order, gold de-duplicated "
+                     "per annotation set; a repeated document or prediction "
+                     "line counts once (first line)."),
             ], className="guide-col"),
             html.Dl([
                 item("Rank-based", "robust default for per-document scores "
@@ -116,6 +126,39 @@ def _guide():
 def register(app):
     for _key, _t, mod in TABS:
         mod.register(app)
+
+    @app.callback(Output("ins-banner", "children"), Output("ins-banner", "style"),
+                  State("vis-insights", "data"), Input("shown-insights", "data"), Input("catalog-version", "data"),
+                  Input("scan-poll", "disabled"), prevent_initial_call=True)
+    def banner(visible, _shown, _v, _poll_off):
+        """Why the figures are not moving: a scan is writing the store, or
+        the last one stopped half-way (figures and exports then stay on the
+        last coherent view until a scan completes)."""
+        from .insights_common import catalog_unavailable
+        if not visible:
+            raise PreventUpdate
+        why = catalog_unavailable()
+        if why == "scanning":
+            msg = ("The catalog is being updated — figures stay as they are "
+                   "and refresh once, when the scan finishes.")
+        elif why == "incomplete":
+            msg = ("The last scan did not complete, so the catalog may mix old "
+                   "and new data. Analyses and exports are paused until a scan "
+                   "completes (Overview → Scan for changes).")
+        else:
+            return "", {"display": "none"}
+        return msg, {"display": "block"}
+
+    # RQ4 tests nothing (it plots intervals only): the test controls say so
+    app.clientside_callback(
+        """function (active) {
+            var off = active === "rq4";
+            return [{opacity: off ? 0.45 : 1, display: "contents"},
+                    off ? "RQ4 runs no test: only the interval setting applies"
+                        : ""];
+        }""",
+        Output("stats-tests", "style"), Output("stats-tests", "title"),
+        Input("ins-active", "data"))
 
     # tab switches never reach the server: the clicked tab becomes active and
     # its visibility store (appfactory's route) wakes that workbench only

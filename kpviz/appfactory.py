@@ -27,10 +27,8 @@ from dash import (ALL, MATCH, ClientsideFunction, Input, Output, State, ctx,
 from . import __version__, db, scanner
 from .config import settings
 from .figures import geometry
-from .export import (export_bundle, fig_pdf, fig_pgf, fig_png, figure_env,
-                     latex_figure,
-                     latex_table, slugify, start_tex_probe, table_caption,
-                     tex_status)
+from .export import (export_bundle, export_name, fig_pdf, fig_pgf, fig_png,
+                     figure_env, snippets, start_tex_probe)
 
 # Identifies this server process. A browser tab holds the callback signatures
 # of the build that rendered it, so a tab left open across an upgrade posts a
@@ -103,6 +101,7 @@ def build_app() -> dash.Dash:
                     suppress_callback_exceptions=True,
                     update_title="Updating… · KPViz")
     start_tex_probe()
+    db.mark_missing_optional_modules()
     from .metrics import enable_warm, warm_async
     enable_warm()
     scanner.enable_preload()
@@ -125,6 +124,10 @@ def build_app() -> dash.Dash:
             dcc.Store(id="ins-active", data="rq4"),
             *[dcc.Store(id=vis_id(page_key(h)), data=False) for h in PAGES],
             *[dcc.Store(id=vis_id(rq), data=False) for rq in RQS],
+            # bumped each time a page / workbench is shown: the only thing
+            # that wakes it (hiding one writes vis-* = False, a State only)
+            *[dcc.Store(id=f"shown-{page_key(h)}", data=0) for h in PAGES],
+            *[dcc.Store(id=f"shown-{rq}", data=0) for rq in RQS],
             dcc.Interval(id="scan-poll", interval=1000, n_intervals=0,
                          disabled=not running),
             _sidebar(),
@@ -147,10 +150,14 @@ def build_app() -> dash.Dash:
         [Output(f"page-{page_key(h)}", "style") for h in PAGES]
         + [Output(f"nav-{page_key(h)}", "className") for h in PAGES]
         + [Output(vis_id(page_key(h)), "data") for h in PAGES]
-        + [Output(vis_id(rq), "data") for rq in RQS],
+        + [Output(vis_id(rq), "data") for rq in RQS]
+        + [Output(f"shown-{page_key(h)}", "data") for h in PAGES]
+        + [Output(f"shown-{rq}", "data") for rq in RQS],
         Input("url", "pathname"), Input("ins-active", "data"),
         [State(vis_id(page_key(h)), "data") for h in PAGES]
-        + [State(vis_id(rq), "data") for rq in RQS])
+        + [State(vis_id(rq), "data") for rq in RQS]
+        + [State(f"shown-{page_key(h)}", "data") for h in PAGES]
+        + [State(f"shown-{rq}", "data") for rq in RQS])
 
     # ---- page modules' own callbacks
     home.register(app)
@@ -170,8 +177,12 @@ def build_app() -> dash.Dash:
 def _install_build_route(app):
     @app.server.route("/kpviz-build")
     def _kpviz_build():
+        """Build id (a restarted server with a new layout reloads old tabs),
+        plus the catalog version and scan state, so a tab that did not start
+        a scan still learns that one ran (assets/buildcheck.js)."""
         from flask import jsonify
-        return jsonify({"build": BUILD_ID})
+        return jsonify({"build": BUILD_ID, "catalog": db.scan_version(),
+                        "scanning": bool(scanner.STATE.running)})
 
 
 def _install_stale_guard(app):
@@ -291,34 +302,7 @@ def _register_exports(app):
         *opts, caption = rest
         if not spec:
             return "", "", ""
-        spec = _with_opts(spec, *opts)
-        caption = caption or spec.get("caption", "")
-        slug = slugify(spec.get("name", "figure"))
-        status, eng = tex_status()
-        use_pgf = status == "ready" and bool(eng)
-        fig_tex = latex_figure(f"figures/{slug}" + (".pgf" if use_pgf else ".pdf"),
-                               caption, slug, pgf=use_pgf,
-                               size=spec.get("size", "2col"),
-                               env=figure_env(spec), dims=geometry(spec))
-        tab = spec.get("table")
-        tab_tex = ""
-        if tab:
-            tab_tex = latex_table(tab["headers"], tab["rows"],
-                                  table_caption(spec, caption),
-                                  tab.get("label", slug),
-                                  cells=spec.get("export", {}).get("cells", "ci"),
-                                  notes=tab.get("notes"),
-                                  venue=spec.get("export", {}).get("venue"))
-        w, h, pt = geometry(spec)
-        size_txt = f"{w:.2f}×{h:.2f} in, {pt:g} pt"
-        if status == "probing":
-            hint = f"{size_txt} · checking TeX… (PDF/PNG are ready now)"
-        elif use_pgf:
-            hint = f"{size_txt} · PGF typeset with {eng}"
-        else:
-            hint = (f"{size_txt} · no working TeX — PDF exports use "
-                    "Matplotlib's vector backend")
-        return fig_tex, tab_tex, hint
+        return snippets(_with_opts(spec, *opts), caption)
 
     @app.callback(
         Output({"type": "exp-dl", "rq": MATCH}, "data"),
@@ -332,13 +316,16 @@ def _register_exports(app):
         if not spec or not ctx.triggered_id or not any(c for c in clicks if c):
             return no_update, no_update
         what = ctx.triggered_id.get("what")
+        from .pages.insights_common import catalog_unavailable
+        why = catalog_unavailable()
+        if why:
+            return no_update, ("export paused — " + (
+                "a scan is updating the catalog" if why == "scanning" else
+                "the last scan did not complete; rescan first"))
         spec = _with_opts(spec, *opts)
         if caption:
             spec["caption"] = caption
-        slug = slugify(spec.get("name", "figure"))
-        venue = (spec.get("export") or {}).get("venue")
-        if venue and venue != "generic":
-            slug = f"{slug}-{venue}"
+        slug, _ref = export_name(spec)
         try:
             if what == "png":
                 return dcc.send_bytes(fig_png(spec), f"{slug}.png"), no_update
@@ -352,8 +339,8 @@ def _register_exports(app):
                     return no_update, f".pgf unavailable — {err}; use PDF or PNG"
                 return dict(content=pgf, filename=f"{slug}.pgf"), no_update
             if what == "zip":
-                return (dcc.send_bytes(export_bundle(spec, spec.get("name", slug)),
-                                       f"{slug}.zip"), no_update)
+                return (dcc.send_bytes(export_bundle(spec), f"{slug}.zip"),
+                        no_update)
         except Exception as e:           # say what failed, never a dead button
             return no_update, f"{what} export failed: {type(e).__name__}: {e}"[:200]
         return no_update, no_update

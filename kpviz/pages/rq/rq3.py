@@ -1,11 +1,12 @@
 """RQ3 — To what extent is a keyphrase extractable?
 
 Only *present* gold keyphrases (class P) are meaningful here: the question
-is whether the model could ever have seen them. Two conditions per run —
-all gold present keyphrases, vs. gold present keyphrases whose first
-occurrence survives truncation to the run's context window (measured with
-the model's own tokenizer). The paired difference is tested per run with a
-two-sided Wilcoxon signed-rank on per-document scores (dagger marks).
+is whether the model could ever have seen them. The same predictions are
+scored against every present keyphrase and against those whose first
+occurrence ends inside the run's usable context window (its own tokenizer,
+minus reserved tokens) — gold eligibility, over one matched cohort of
+documents, tested with the paired test of the Statistics bar. Panel (b) is
+an observational length curve, binned independently of the scores.
 """
 from __future__ import annotations
 
@@ -24,13 +25,13 @@ from ..insights_common import (ann_options, datasets_with_runs,
                                metric_caption, metric_controls, models_control,
                                p_cells, p_headers, resolve_ann, rq_header,
                                runs_control, selected_runs, stats_cfg,
-                               stats_inputs, stats_note, value_cell, vis)
+                               stats_inputs, stats_note, value_cell, vis, shown)
 
 RQ = "rq3"     # panel (a): truncation conditions
 RQB = "rq3b"   # panel (b): length bins
 
-COND_ALL = "full-document"
-COND_WIN = "document truncated to model's context window"
+COND_ALL = "all present gold"
+COND_WIN = "present gold inside the context window"
 
 
 def layout():
@@ -38,12 +39,14 @@ def layout():
     return html.Div([
         rq_header("To what extent is a keyphrase extractable?",
                   "Models with a bounded input window never see part of a "
-                  "long document. Both conditions evaluate against *present* "
-                  "gold only (class P): every present keyphrase, vs. only "
-                  "those whose first occurrence fits inside the run's context "
-                  "window under the model's own tokenizer. The gap is the "
-                  "truncation penalty; a dagger marks runs where the paired "
-                  "difference is significant."),
+                  "long document. The same predictions are scored twice, "
+                  "against *present* gold only (class P): every present "
+                  "keyphrase, and only those whose first occurrence ends "
+                  "inside the run's usable window (its model's own tokenizer, "
+                  "minus reserved tokens). Both bars are over the same "
+                  "documents, so the gap is the paired difference the dagger "
+                  "tests. This is gold-reference eligibility — the model is "
+                  "not re-run on truncated input."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds,
@@ -61,9 +64,36 @@ def layout():
     ])
 
 
+def _as_count(v) -> int | None:
+    """A positive token count, or None (never raises: ∞, NaN, "abc")."""
+    try:
+        n = int(v) if v is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if n is not None and n > 0 else None
+
+
+def _reserved(ps, resolved: dict) -> int:
+    """Tokens of the window the document cannot use: special tokens, the
+    prompt, few-shot examples, the output budget. The run's own
+    `reserved_tokens` parameter wins over the card's `reserved_tokens` on
+    the context-window parameter; neither means 0."""
+    for v in ((resolved.get("reserved_tokens") or {}).get("value"),
+              (ps.raw or {}).get("reserved_tokens")):
+        try:
+            n = int(v)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if n >= 0:
+            return n
+    return 0
+
+
 def _run_limits(ds: str) -> dict[tuple, tuple | None]:
-    """{(model, arch, run_id): (tokenizer, input limit, from_default) | None}
-    for every run *of this dataset* — one query per catalog version.
+    """{(model, arch, run_id): (tokenizer, usable input limit, from_default,
+    reserved) | None} for every run *of this dataset* — one query per
+    catalog version. The usable limit is the window minus what the run
+    reserves in it (N14).
 
     Run ids are reused across datasets, so the window must come from this
     dataset's run (the old per-run lookup had no dataset filter and could
@@ -82,14 +112,13 @@ def _run_limits(ds: str) -> dict[tuple, tuple | None]:
                     continue
                 info = resolved.get(ps.name) or {}
                 given = info.get("value")
-                v = given if given is not None else ps.default
-                try:
-                    v = int(v) if v is not None else None
-                except (TypeError, ValueError):
-                    v = None
-                if v and v > 0 and ps.tokenizer:
-                    lim = (ps.tokenizer, v,
-                           given is None or info.get("source") == "default")
+                v = _as_count(given if given is not None else ps.default)
+                if v and ps.tokenizer:
+                    res = _reserved(ps, resolved)
+                    if v - res > 0:
+                        lim = (ps.tokenizer, v - res,
+                               given is None or info.get("source") == "default",
+                               res)
                     break
             out[(model, arch, run_id)] = lim
         return out
@@ -107,9 +136,9 @@ def register(app):
                              prefer=["semeval2010"])
     register_model_run_chain(app, RQ, multi_ds=False)
 
-    @app.callback(Output(f"{RQ}-ann", "options"), Input(vis(RQ), "data"),
+    @app.callback(Output(f"{RQ}-ann", "options"), State(vis(RQ), "data"), Input(shown(RQ), "data"),
                   Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
-    def opts(visible, ds):
+    def opts(visible, _shown, ds):
         if not visible:
             raise PreventUpdate
         return ann_options([ds] if ds else [])
@@ -124,15 +153,18 @@ def register(app):
         Output({"type": "caption", "rq": RQB}, "value"),
         Output({"type": "rq-table", "rq": RQB}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
-        Input(vis(RQ), "data"),
+        State(vis(RQ), "data"), Input(shown(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-ann", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
         *stats_inputs(),
+        Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
-    def update(visible, *args):
-        *inputs, last_sig = args
+    def update(visible, _shown, *args):
+        # the catalog version is an input so exactly the visible workbench
+        # re-renders once when a scan publishes; gate() signs it itself
+        *inputs, _catalog, last_sig = args
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
@@ -171,7 +203,7 @@ def register(app):
                           measure=measure, k=k, per_doc=True),
         }
         for li, (lim, lim_keys) in enumerate(limits.items()):
-            tokz, L, _dflt = lim
+            tokz, L = lim[:2]
             have = _tok_coverage(ds, tokz)
             tok_ok[lim] = have
             if have[0]:
@@ -202,16 +234,24 @@ def register(app):
             runs_a.append((key, lim, present, trunc))
 
         def _stats_a(item):
+            """Both conditions over the *same* documents — those with present
+            gold inside the window — so the bars, their gap and the paired
+            test describe one cohort. A run without a usable window keeps
+            its all-present mean over its own documents."""
             _key, _lim, present, trunc = item
             pa = present.get("per_doc")
             pb = (trunc or {}).get("per_doc")
-            out = {"ci_all": cfg.mean_ci(pa.vals) if pa is not None else (None, None),
-                   "ci_win": (cfg.mean_ci(pb.vals) if pb is not None and len(pb)
-                              else (None, None)),
-                   "test": None}
-            if pa is not None and pb is not None:
+            out = {"ci_all": (None, None), "ci_win": (None, None), "test": None,
+                   "m_all": present["mean"], "n_all": present["n"],
+                   "m_win": None, "n_win": 0}
+            if pa is not None and pb is not None and len(pb):
                 vb, va = paired(pb, pa)
-                out["test"] = cfg.paired(vb, va)
+                out.update(m_all=float(va.mean()), n_all=len(va),
+                           m_win=float(vb.mean()), n_win=len(vb),
+                           ci_all=cfg.mean_ci(va), ci_win=cfg.mean_ci(vb),
+                           test=cfg.paired(vb, va), n_own=present["n"])
+            elif pa is not None:
+                out["ci_all"] = cfg.mean_ci(pa.vals)
             return out
         st_a = _pmap(_stats_a, runs_a)
         p_raw = [(s["test"] or {}).get("p") for s in st_a]
@@ -228,18 +268,23 @@ def register(app):
             win_txt = window_str(*lim) if lim else "—"
             t = st["test"] or {}
             mark = sig_mark(pj, alpha)
-            tm = None if (trunc is None or trunc["mean"] is None) else trunc["mean"]
+            tm = st["m_win"]
+            ma = st["m_all"]
             xs.append(lab)
-            ys_all.append(round(present["mean"], 4))
+            ys_all.append(round(ma, 4))
             ys_win.append(None if tm is None else round(tm, 4))
             err_all.append(st["ci_all"])
             err_win.append(st["ci_win"])
-            hv_all.append(f"{lab}<br>{COND_ALL}: {present['mean']:.3f} "
-                          + _ci_hover(st["ci_all"]) + f"(n={present['n']})")
+            own = st.get("n_own")
+            hv_all.append(f"{lab}<br>{COND_ALL}: {ma:.3f} "
+                          + _ci_hover(st["ci_all"]) + f"(n={st['n_all']}"
+                          + (f" matched; {present['mean']:.3f} over all {own} "
+                             "documents with present gold" if own and own != st["n_all"]
+                             else "") + ")")
             hv_win.append(f"{lab}<br>{COND_WIN}: "
                           + ("—" if tm is None else
                              f"{tm:.3f} " + _ci_hover(st["ci_win"])
-                             + f"(n={trunc['n']})")
+                             + f"(n={st['n_win']})")
                           + f"<br>context window {win_txt}"
                           + (f"<br>Δ = {t['diff']:+.3f} "
                              + _ci_hover((t.get('lo'), t.get('hi')))
@@ -248,13 +293,12 @@ def register(app):
                              + f" {mark}<br>{cfg.effect_name('paired')} = "
                              + fmt_effect(t.get("effect"))
                              if t.get("diff") is not None else ""))
-            n_all_seen.append(present["n"])
-            if trunc and trunc.get("n"):
-                n_win_seen.append(trunc["n"])
+            n_all_seen.append(st["n_all"])
+            if st["n_win"]:
+                n_win_seen.append(st["n_win"])
             marks.append(mark)
-            cells = [value_cell(present["mean"], present["n"], ci=st["ci_all"]),
-                     value_cell(tm, trunc["n"] if trunc else None,
-                                ci=st["ci_win"]),
+            cells = [value_cell(ma, st["n_all"], ci=st["ci_all"]),
+                     value_cell(tm, st["n_win"] or None, ci=st["ci_win"]),
                      value_cell(t.get("diff"), None, signed=True, mark=mark,
                                 ci=(t.get("lo"), t.get("hi")))]
             cells += (p_cells(p, pj, cfg, applicable=bool(t))
@@ -288,21 +332,26 @@ def register(app):
                else {"ylabel": mlab}),
             "series": ser,
             "name": f"extractability-{ds}",
-            "caption": (f"{mlab} on {ds} against present gold keyphrases "
-                        "(class P, in-order occurrence) under two conditions: "
-                        f"{COND_ALL} (every present keyphrase), vs. "
-                        f"{COND_WIN} (only those whose first occurrence ends "
-                        "inside the window, measured with the model's own "
-                        "tokenizer"
-                        + (", approximate token positions where the exact "
+            "caption": (f"{mlab} on {ds}: the same predictions scored against "
+                        "two gold references — every present gold keyphrase "
+                        "(class P, contiguous occurrence), and only those "
+                        "whose first occurrence ends inside the run's usable "
+                        "input window (the model's own tokenizer over the "
+                        "concatenated document, minus any reserved tokens"
+                        + ("; approximate token positions where the exact "
                            "tokenizer was unavailable" if approx_any else "")
-                        + "). "
+                        + "). Both bars are over the documents with present "
+                        "gold inside the window, so their gap is the paired "
+                        "difference tested; this measures gold eligibility, "
+                        "not a re-run of the model on truncated input"
+                        + (" (at @O the cutoff also shrinks with the eligible "
+                           "gold)" if k == "O" else "") + ". "
                         + (f"Error bars: {ci_txt}. " if ci_txt else "")
                         + f"Paired per-document comparison: {methods_a}. "
                         + metric_caption(measure, k, None, ann_choice, [ds])),
         }
-        headers = (["Run", "Context window", "full document", "truncated",
-                    "Δ (trunc − full)"]
+        headers = (["Run", "Usable window", "all present gold", "gold in window",
+                    "Δ (window − all)"]
                    + p_headers(cfg) + [cfg.effect_name("paired")])
         specA["table"] = {"headers": headers, "rows": tex_rows,
                           "label": f"extract-{ds}",
@@ -332,14 +381,16 @@ def register(app):
             if tokz not in lens_cache:
                 lens_cache[tokz] = _doc_lengths(ds, tokz, per_doc)
             lens = lens_cache[tokz]
-            # (length, score) per document, sorted by length then score
+            # (length, score) per document, sorted by length only (stable,
+            # in document order): the score never decides which bin a
+            # document falls in
             PL = np.zeros(0, dtype=np.int64)
             PS = np.zeros(0, dtype=np.float64)
             if per_doc is not None and len(per_doc) and len(lens):
                 L = lens[per_doc.ords]
                 ok = L >= 0
                 PL, PS = L[ok], per_doc.vals[ok]
-                order = np.lexsort((PS, PL))
+                order = np.argsort(PL, kind="stable")
                 PL, PS = PL[order], PS[order]
             runs_b.append((key, gk, lim, PL, PS))
 
@@ -398,6 +449,7 @@ def register(app):
                             "color": e.get("color", "#2a78d6"),
                             "mpl_marker": e.get("mpl_marker", "o"),
                             "shape": e.get("shape", "circle"), "width": 2,
+                            "dash": e.get("dash", "solid"),
                             "band": eb if cfg.ci != "none" and len(runs_b) <= 4
                             else None,
                             "legendgroup": model})
@@ -413,7 +465,7 @@ def register(app):
         methods_b = cfg.method_text("indep", n_tests_b)
         specB = {
             "kind": "line", "size": "2col", "xlabel": "document length "
-            "(model tokens, equal-count bins)"
+            "(each run's own tokenizer, equal-count bins)"
             # the axis label only names the window sizes; which run has which
             # window is spelled out in the caption (a list of run labels
             # overflowed the figure width)
@@ -425,10 +477,15 @@ def register(app):
             "legend": "right" if len(seriesB) > 6 else "top",
             "name": f"length-curve-{ds}",
             "caption": (f"{mlab} on {ds} across document-length bins "
-                        "(equal-count bins over the run's own tokenizer "
-                        "counts), against all gold keyphrases. Dashed "
-                        "verticals mark each run's input window; the drop past "
-                        "the line is the truncation penalty. "
+                        "(about equal-count bins over each run's own "
+                        "tokenizer counts — runs with different tokenizers "
+                        "are on different length scales; tied lengths share "
+                        "a bin and the longest documents are kept), against "
+                        "all gold keyphrases. Dashed verticals mark each "
+                        "run's usable input window. This is an observational "
+                        "association: longer documents also differ in domain, "
+                        "annotation density and difficulty, so the change "
+                        "past a window is not by itself a truncation effect. "
                         + ("Windows beyond the plotted lengths: "
                            + "; ".join(v["label"] for v in beyond) + ". "
                            if beyond else "")
@@ -436,7 +493,7 @@ def register(app):
                            if ci_txt and len(runs_b) <= 4 else "")
                         + metric_caption(measure, k, None, ann_choice, [ds])),
         }
-        headersB = (["Run", "Context window",
+        headersB = (["Run", "Usable window",
                      "docs within window", "docs beyond window",
                      "Δ (within − beyond)"]
                     + p_headers(cfg) + [cfg.effect_name("indep")])
@@ -510,16 +567,35 @@ def _doc_lengths(ds: str, tokz: str, per_doc) -> "np.ndarray":
 
 
 def _length_bins(PL, PS, cfg):
-    """Equal-count length bins → (x = mean length, y = mean score, n per
-    bin, interval per bin)."""
+    """About-equal-count length bins → (x = mean length, y = mean score,
+    n per bin, interval per bin). PL must be sorted.
+
+    Bin edges are length values, not positions: documents of the same
+    length always share a bin (the score never decides the split), and
+    every document is kept — a short last bin is merged into the one
+    before it instead of being dropped (it holds the longest documents,
+    the ones a truncation analysis is about)."""
     n_pairs = len(PL)
+    if not n_pairs:
+        return [], [], [], []
     nb = min(8, max(3, n_pairs // 12))
-    per_bin = max(1, n_pairs // nb)
+    target = n_pairs / nb
+    # cut after position i only where the length changes
+    cuts = [0]
+    for b in range(1, nb):
+        i = int(round(b * target))
+        i = int(np.searchsorted(PL, PL[min(i, n_pairs - 1)], side="left"))
+        if cuts[-1] < i < n_pairs:
+            cuts.append(i)
+    cuts.append(n_pairs)
+    bounds = list(zip(cuts[:-1], cuts[1:]))
+    min_n = max(2, int(target // 2))
+    if len(bounds) > 1 and bounds[-1][1] - bounds[-1][0] < min_n:
+        a, _b = bounds[-2]
+        bounds = bounds[:-2] + [(a, n_pairs)]
     xs, ys, ns, eb = [], [], [], []
-    for i in range(0, n_pairs, per_bin):
-        cl, cs = PL[i:i + per_bin], PS[i:i + per_bin]
-        if len(cl) < max(2, per_bin // 2) and xs:
-            break
+    for a, b in bounds:
+        cl, cs = PL[a:b], PS[a:b]
         xs.append(float(cl.mean()))
         ys.append(round(float(cs.mean(dtype=float)), 4))
         ns.append(len(cl))

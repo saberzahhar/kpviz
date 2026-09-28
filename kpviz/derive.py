@@ -2,7 +2,8 @@
 
 Per chunk of a document collection, one pass does everything except POS:
 spaCy-blank tokens (C path), PyStemmer stems (one C call per document),
-in-order PRMU via position indices, tokenizer counts and positions from one
+contiguous PRMU anchored on position indices, gold de-duplicated per
+annotation set, tokenizer counts and positions from one
 encoding per document, and a worker-local phrase cache so each unique
 (language, keyphrase) is analysed once per process. POS tagging happens in
 its own scan phase over globally unique untagged gold phrases.
@@ -13,6 +14,7 @@ Everything stays importable at module level (spawn/forkserver-safe).
 """
 from __future__ import annotations
 
+import bisect
 import io
 import os
 import sys
@@ -142,9 +144,18 @@ def _tokenizers(args: dict) -> list:
     """Model tokenizers exactly as the parent resolved them (local-only)."""
     cache_dir = Path(args["tok_cache"]) if args.get("tok_cache") else None
     expect = args.get("tok_expect") or {}
-    return [tp.get_tokenizer(s, cache_dir, allow_network=False,
-                             expect=expect.get(s))
-            for s in args.get("tokenizers", [])]
+    out = []
+    for s in args.get("tokenizers", []):
+        tk = tp.get_tokenizer(s, cache_dir, allow_network=False,
+                              expect=expect.get(s))
+        if expect.get(s) == "exact" and not tk.exact:
+            # the parent certified this asset: a worker that cannot load it
+            # would silently write approximate counts under an exact
+            # signature — fail the scan with the reason instead
+            raise RuntimeError(f"tokenizer {s} was resolved exactly by the scan "
+                               f"but a worker cannot load it: {tk.why}")
+        out.append(tk)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +192,7 @@ def derive_doc_chunk(args: dict) -> dict:
     ds = args["dataset"]
     card_sections: dict = args["card"].get("sections", {})
     card_anns: dict = args["card"].get("anns", {})
+    optional = set(args["card"].get("optional") or ())
     emit_combined = args["card"].get("combined", False)
     token_scope = args.get("token_scope", "eval")
     gold_scope = args.get("gold_scope", "eval")
@@ -190,10 +202,10 @@ def derive_doc_chunk(args: dict) -> dict:
     gold_rows: list[dict] = []
     tok_rows: list[dict] = []
     tokpos_rows: list[dict] = []
-    pending: list[tuple[str, str, list]] = []   # (doc_id, text, P-gold refs)
+    pending: list[tuple] = []   # (doc_id, text, P-gold refs, byte offset)
     agg: dict[tuple, list] = {}
     bad: list[int] = []
-    n_docs = n_noid = 0
+    n_docs = n_noid = n_gold_empty = n_gold_dup = 0
 
     def flush_tokens():
         """Tokenizer counts + gold token positions for the pending documents,
@@ -219,12 +231,12 @@ def derive_doc_chunk(args: dict) -> dict:
         for tk in toks:
             exact = tk.exact
             ratio = None if exact else tk._resolve()[1]
-            plain = [i for i, (_d, _t, g) in enumerate(pending) if not g or not exact]
+            plain = [i for i, (_d, _t, g, _o) in enumerate(pending) if not g or not exact]
             counts: dict[int, int] = {}
             if exact and plain:
                 got, _ap = tk.count_batch([pending[i][1] for i in plain])
                 counts.update(zip(plain, got))
-            for i, (doc_id, text, gold_p) in enumerate(pending):
+            for i, (doc_id, text, gold_p, src_off) in enumerate(pending):
                 enc = None
                 if not exact:
                     ws = word_starts(i, text)
@@ -235,11 +247,13 @@ def derive_doc_chunk(args: dict) -> dict:
                     enc = tk.encode_cached(text)
                     counts[i] = enc.get("n", 0)
                 tok_rows.append({"dataset": ds, "doc_id": doc_id,
+                                 "src_off": src_off,
                                  "tokenizer": tk.spec, "n_tokens": counts[i],
                                  "approx": not exact})
                 for g in gold_p:
                     te, ap = tk.char_to_token(text, g["end_char"], enc)
                     tokpos_rows.append({"dataset": ds, "doc_id": doc_id,
+                                        "src_off": src_off,
                                         "ann_key": g["ann_key"],
                                         "kp_idx": g["kp_idx"],
                                         "tokenizer": tk.spec,
@@ -287,25 +301,32 @@ def derive_doc_chunk(args: dict) -> dict:
                     declared_union.append(l)
         present_fields = {s[0] for s in sections}
         for fieldname in card_sections:
-            if fieldname not in present_fields:
+            if fieldname not in present_fields and fieldname not in optional:
                 flags.append(f"missing_section:{fieldname}")
 
         # one normalisation per document, shared by every language stream;
         # token ends are mapped back to original-text offsets when NFKC or
         # lowercasing changed the length
-        lowered = tp.norm_text(full_text)
-        offmap = tp.norm_offsets(full_text, lowered)
+        lowered, offmap = tp.norm_with_offsets(full_text)
+        # where each section starts in the normalised text: a contiguous
+        # (P) occurrence never spans two sections
+        sec_starts, at = [], 0
+        for _f, _l, c in sections:
+            sec_starts.append(at if offmap is None
+                              else bisect.bisect_left(offmap, at))
+            at += len(c) + len(SECTION_JOIN)
         streams: dict[str, tuple] = {}
 
         def stream(lang: str | None):
             lang2 = (lang or "en")[:2]
             got = streams.get(lang2)
             if got is None:
-                words, ends = tp.spacy_doc_tokens(full_text, lang2, lowered)
+                words, ends, seg = tp.spacy_doc_stream(full_text, lang2, lowered,
+                                                       sec_starts)
                 if offmap is not None:
                     ends = [offmap[e] for e in ends]
                 stems = tp.get_stemmer(lang2).stemWords(words)
-                got = (tp.position_index(stems), ends)
+                got = (tp.StemmedDoc(stems, seg), ends)
                 streams[lang2] = got
             return got
 
@@ -323,7 +344,7 @@ def derive_doc_chunk(args: dict) -> dict:
             kps = a.get("keyphrases") or []
             ann_counts[key] = len(kps)
             if kps:
-                joined = " ".join(str(k).split("+")[0] for k in kps)
+                joined = " ".join(tp.split_variants(str(k))[0] for k in kps)
                 det, _ = tp.detect_language(joined, min_tokens=6)
                 if det and langs and det not in [l[:2] for l in langs]:
                     flags.append(f"lang_mismatch:ann:{key}")
@@ -334,33 +355,49 @@ def derive_doc_chunk(args: dict) -> dict:
             langs = declared_langs(a) or card_anns.get(key) or declared_union
             lang = (langs[0] if langs else None)
             kps = a.get("keyphrases") or []
-            index, char_ends = stream(lang)
+            sdoc, char_ends = stream(lang)
 
-            for i, kp in enumerate(kps):
+            # one gold keyphrase per stemmed identity: a keyphrase with no
+            # word token is dropped (it can never be matched), and one whose
+            # stemmed forms repeat an earlier one of the same annotation set
+            # is a duplicate (a prediction can match only one of the two, so
+            # keeping both would inflate |gold|). kp_idx is the kept order.
+            seen_sig: set = set()
+            kept = 0
+            for kp in kps:
                 variants = tp.split_variants(str(kp))
                 entries = [_PHRASES.analyze(v, lang, persist=keep_gold)
                            for v in variants]
                 entries = [e for e in entries if e["tokens"]]
+                stems_repr = list(dict.fromkeys(e["sstr"] for e in entries))
+                sig = frozenset(stems_repr)
+                if not sig:
+                    n_gold_empty += 1
+                    continue
+                if sig in seen_sig:
+                    n_gold_dup += 1
+                    continue
+                seen_sig.add(sig)
                 var_stems = [e["stems"] for e in entries]
-                cat, end_word = tp.prmu_classify(var_stems, index)
+                cat, end_word = tp.prmu_classify(var_stems, sdoc)
                 end_char = char_ends[end_word] if end_word >= 0 else -1
-                nw = entries[0]["n_tokens"] if entries else 0
+                nw = entries[0]["n_tokens"]
                 agg_add(split, key, cat, nw)
-                stems_repr = [e["sstr"] for e in entries]
                 row = None
                 if keep_gold:
                     row = {"dataset": ds, "doc_id": doc_id, "ann_key": key,
-                           "kp_idx": i,
-                           "display": entries[0]["kp"] if entries else "",
+                           "kp_idx": kept, "src_off": off,
+                           "display": entries[0]["kp"],
+                           "surface": entries[0]["raw"],
                            "stems": stems_repr,
                            "lang": lang, "n_words": nw, "prmu": cat,
                            "end_char": end_char, "end_word": end_word}
                     gold_rows.append(row)
                     if cat == "P":
                         doc_gold_p.append(row)
+                kept += 1
                 if emit_combined:
-                    sig = frozenset(stems_repr)
-                    if sig and sig not in combined_seen:
+                    if sig not in combined_seen:
                         combined_seen.add(sig)
                         agg_add(split, "@combined", cat, nw)
                         if keep_gold and row is not None:
@@ -372,7 +409,7 @@ def derive_doc_chunk(args: dict) -> dict:
         gold_rows.extend(combined)
 
         if toks and (token_scope == "all" or eval_doc):
-            pending.append((doc_id, full_text, doc_gold_p))
+            pending.append((doc_id, full_text, doc_gold_p, off))
             if len(pending) >= _TOK_SUBBATCH:
                 flush_tokens()
 
@@ -406,7 +443,8 @@ def derive_doc_chunk(args: dict) -> dict:
         "kp_stage": _write_ndjson(out / f"kp_{tag}.ndjson", _PHRASES.drain()),
         "n_docs": n_docs, "n_gold": len(gold_rows),
         "n_bad": len(bad), "first_bad": bad[0] if bad else None,
-        "n_noid": n_noid,
+        "n_noid": n_noid, "n_gold_empty": n_gold_empty,
+        "n_gold_dup": n_gold_dup,
         "bytes": args["end"] - args["start"],
         "secs": round(time.perf_counter() - _t0, 4),
         "cache": _PHRASES.stats(),
@@ -495,22 +533,47 @@ def _uniq_stems(analyses: list[dict]) -> tuple[list[str], list[int]]:
 
 
 def _match(pstems: list[str], gold_variants: list[list[str]]):
-    """Greedy rank-order matching: each prediction takes the first untaken
-    gold keyphrase it equals (any '+'-variant)."""
-    taken = [False] * len(gold_variants)
+    """One-to-one matching of (unique) predictions to gold keyphrases, in
+    rank order, maximum in size.
+
+    When no stem belongs to two gold keyphrases — the normal case — each
+    prediction simply takes the gold it equals (greedy is then optimal).
+    When '+'-alternatives overlap ({a, b} and {a}), a greedy first pick can
+    strand a later prediction (a takes {a, b}, b finds nothing although a →
+    {a}, b → {a, b} matches both); predictions are then placed with
+    augmenting paths, in rank order, which yields a maximum matching whose
+    matched ranks are the earliest possible. The assignment is frozen here;
+    gold-side filters later score against it."""
     stem_to_golds: dict[str, list[int]] = {}
     for gi, variants in enumerate(gold_variants):
         for v in variants:
             stem_to_golds.setdefault(v, []).append(gi)
-    pr, gi_hit = [], []
-    for rank, s in enumerate(pstems):
-        for gi in stem_to_golds.get(s, ()):
-            if not taken[gi]:
-                taken[gi] = True
+    if all(len(g) == 1 for g in stem_to_golds.values()):
+        taken = [False] * len(gold_variants)
+        pr, gi_hit = [], []
+        for rank, s in enumerate(pstems):
+            g = stem_to_golds.get(s)
+            if g and not taken[g[0]]:
+                taken[g[0]] = True
                 pr.append(rank)
-                gi_hit.append(gi)
-                break
-    return pr, gi_hit
+                gi_hit.append(g[0])
+        return pr, gi_hit
+    owner = [-1] * len(gold_variants)          # gold -> prediction rank
+
+    def augment(rank: int, seen: set) -> bool:
+        for gi in stem_to_golds.get(pstems[rank], ()):
+            if gi in seen:
+                continue
+            seen.add(gi)
+            if owner[gi] < 0 or augment(owner[gi], seen):
+                owner[gi] = rank
+                return True
+        return False
+    for rank, s in enumerate(pstems):
+        if s in stem_to_golds:
+            augment(rank, set())
+    pairs = sorted((r, gi) for gi, r in enumerate(owner) if r >= 0)
+    return [r for r, _g in pairs], [g for _r, g in pairs]
 
 
 @_profiled
@@ -602,6 +665,7 @@ def derive_preds_chunk(args: dict) -> dict:
                     "dataset": args["dataset"], "model": args["model"],
                     "arch": args["arch"], "run_id": args["run_id"],
                     "doc_id": doc_id, "ann_key": ann_key,
+                    "batch_idx": seg["batch_idx"], "byte_off": off,
                     "n_uniq": n_uniq, "n_gold": len(gold_variants),
                     "pred_ranks": pr, "gold_idxs": gi_hit,
                 })
@@ -641,7 +705,7 @@ def pos_chunk(args: dict) -> dict:
     if tp._spacy_tagger(args["lang"]) is not None:
         raws = [r for _kp, r in args["phrases"]]
         pats = tp.pos_patterns(raws, args["lang"])
-        rows = [{"kp": kp, "pos": p or ""}
+        rows = [{"kp": kp, "lang": args["lang"], "pos": p or ""}
                 for (kp, _r), p in zip(args["phrases"], pats)]
     out = Path(args["out_dir"])
     return {"pos": _write_ndjson(out / f"pos_{args['tag']}.ndjson", rows),

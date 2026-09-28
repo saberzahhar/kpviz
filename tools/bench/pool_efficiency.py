@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pool efficiency from the archived scan stats — the number to cite.
 
-    python tools/pool_efficiency.py [.kpviz/scan_stats]
+    python tools/bench/pool_efficiency.py [.kpviz/scan_stats]
 
 efficiency = Σ worker seconds / (wall seconds × workers). Below ~0.5 the scan
 thread is doing work the pool is waiting on; near 1.0 the phase is genuinely

@@ -146,10 +146,51 @@ def test_approx_positions_equal_prefix_rescan():
 def test_norm_offsets_map_back_to_source():
     from kpviz import textproc as tp
     text = "ﬃ cat Straße"
-    low = tp.norm_text(text)
-    m = tp.norm_offsets(text, low)
+    low, m = tp.norm_with_offsets(text)
     toks, ends = tp.spacy_doc_tokens(text, "en", low)
     assert [text[:m[e]].split()[-1] for e in ends][-1] == "Straße"
+
+
+def test_normalisation_alignment_is_exact():
+    """R05: composition, expansion and changes that cancel in total length
+    all map exactly (the old map guessed proportionally, or not at all)."""
+    from kpviz import textproc as tp
+    for text, word, want_end in [
+            ("e\u0301 alpha", "é", 2),                 # composition
+            ("e\u0301 cat \ufb01", "cat", 6),         # net length unchanged
+            ("\ufb01ne tuning", "fine", 3),            # expansion
+    ]:
+        low, m = tp.norm_with_offsets(text)
+        assert m is not None and len(m) == len(low) + 1
+        toks, ends = tp.spacy_doc_tokens(text, "en", low)
+        i = toks.index(word)
+        assert m[ends[i]] == want_end, (text, word, m[ends[i]])
+    assert tp.norm_with_offsets("plain ascii")[1] is None
+
+
+def test_special_tokens_never_give_impossible_positions(tmp_path):
+    """R05: a tokenizer with BOS/EOS gives (0, 0) offsets for them; the
+    position of a content character counts BOS and never exceeds the
+    encoding's length."""
+    pytest = __import__("pytest")
+    pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    vocab = {"[UNK]": 0, "<s>": 1, "</s>": 2, "a": 3, "b": 4, "c": 5}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.post_processor = processors.TemplateProcessing(
+        single="<s> $A </s>", special_tokens=[("<s>", 1), ("</s>", 2)])
+    path = tmp_path / "tokenizer.json"
+    tok.save(str(path))
+    from kpviz import textproc as tp
+    mt = tp.ModelTokenizer(f"transformers[file:{path}]", allow_network=False,
+                           expect="exact")
+    text = "a b c"
+    enc = mt.encode_cached(text)
+    assert enc["n"] == 5                      # <s> a b c </s>
+    got = [mt.char_to_token(text, e, enc)[0] for e in (1, 3, 5)]
+    assert got == [2, 3, 4]                   # a, b, c after <s>
+    assert all(0 <= g <= enc["n"] for g in got)
 
 
 def test_offline_tokenizer_never_downloads(tmp_path, monkeypatch):
@@ -182,3 +223,91 @@ def test_training_split_names():
     got = [con.execute(f"SELECT {TRAIN_SPLIT_SQL.format(col='?')}", [n]).fetchone()[0]
            for n in names]
     assert got == want
+
+
+def test_offline_tiktoken_reads_a_cached_encoding(monkeypatch, tmp_path):
+    """R09: offline, a locally cached encoding is used (the old code gave up
+    before asking tiktoken), while a download is refused."""
+    pytest = __import__("pytest")
+    tiktoken = pytest.importorskip("tiktoken")
+    import tiktoken.load as tl
+    from kpviz import textproc as tp
+
+    class Enc:
+        name, n_vocab, _special_tokens, _pat_str = "fake_base", 3, {}, "x"
+
+    def cached(name):          # what a warm cache does: no read_file call
+        return Enc()
+
+    def uncached(name):        # what a cold cache does: a download
+        return tl.read_file("https://example.invalid/" + name)
+    monkeypatch.setattr(tiktoken, "list_encoding_names", lambda: ["fake_base"])
+    monkeypatch.setattr(tiktoken, "get_encoding", cached)
+    tk = tp.ModelTokenizer("tiktoken[fake_base]", cache_dir=tmp_path,
+                           allow_network=False)
+    assert tk.exact
+    monkeypatch.setattr(tiktoken, "get_encoding", uncached)
+    tk = tp.ModelTokenizer("tiktoken[fake_base]", cache_dir=tmp_path,
+                           allow_network=False)
+    assert not tk.exact and "not cached locally" in tk.why
+
+
+def test_tokenizer_fingerprint_follows_the_asset_bytes(tmp_path):
+    """R09: a tokenizer.json replaced at the same path changes the identity
+    the derivation signatures use."""
+    pytest = __import__("pytest")
+    pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from kpviz import textproc as tp
+    path = tmp_path / "tokenizer.json"
+
+    def save(vocab):
+        t = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        t.pre_tokenizer = pre_tokenizers.Whitespace()
+        t.save(str(path))
+    save({"[UNK]": 0, "a": 1})
+    fp1 = tp.ModelTokenizer(f"transformers[file:{path}]", allow_network=False).fingerprint
+    save({"[UNK]": 0, "a": 1, "b": 2})
+    fp2 = tp.ModelTokenizer(f"transformers[file:{path}]", allow_network=False).fingerprint
+    assert fp1.startswith("exact:") and fp1 != fp2
+
+
+def test_card_validation_fails_closed():
+    """RV-E10: defaults are checked, numeric value sets hold, an unknown type
+    is flagged; KPViz's own run parameter needs no card declaration."""
+    from kpviz.cards import ModelCard
+    card = ModelCard("m", None, {"inference": {
+        "num_beams": {"type": "int", "min": 1, "default": -1},
+        "k": {"type": "int", "values": [1, 4, 8]},
+        "mystery": {"type": "tensor"}}})
+    _res, bad = card.validate_params({"k": 5, "mystery": 1, "reserved_tokens": 12})
+    probs = {v["param"]: v["problem"] for v in bad}
+    assert "card default" in probs["num_beams"]
+    assert "not in allowed set" in probs["k"]
+    assert "not one KPViz can check" in probs["mystery"]
+    assert "reserved_tokens" not in probs
+
+
+def test_cost_prefers_a_complete_level():
+    """RV-R06: one document of ten reporting 2 s must not win over a complete
+    batch total of 20 s."""
+    from kpviz.cards import ArchCard
+    from kpviz.costs import resolve_var_totals
+    arch = ArchCard("a", None, {"variables": {"time": {"unit": "s",
+                                                       "level": "document"}},
+                                "rates": {"time": {"time": 1.0}}})
+    got = resolve_var_totals(arch, {"time": (2.0, 1)}, {"time": (20.0, 3)},
+                             n_docs=10, n_batches=3, wall_from_timestamps=None)
+    assert got["time"]["total"] == 20.0 and got["time"]["level"] == "batch"
+    assert "partial_coverage" not in got["time"]["flags"]
+
+
+def test_window_minus_reserved_tokens():
+    """R2-N14: the usable window is the declared one minus the reservation."""
+    from kpviz.cards import ParamSpec
+    from kpviz.pages.rq.rq3 import _as_count, _reserved
+    ps = ParamSpec(name="input_max_size", type="context_window",
+                   raw={"reserved_tokens": 2})
+    assert _reserved(ps, {}) == 2
+    assert _reserved(ps, {"reserved_tokens": {"value": 300}}) == 300
+    assert _as_count(float("inf")) is None and _as_count("x") is None

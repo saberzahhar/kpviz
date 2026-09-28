@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Screenshot every KPViz page with Playwright (dev/verification helper)."""
+"""Screenshot every KPViz page with Playwright (dev/verification helper).
+
+    python tools/screenshot.py [BASE_URL] [OUT_DIR]
+"""
 import asyncio
 import sys
 
 from playwright.async_api import async_playwright
 
-BASE = "http://127.0.0.1:8085"
-OUT = "/tmp/shots"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8050"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "shots"
 
 PAGES = [
     ("home", "/", 3.0, None),

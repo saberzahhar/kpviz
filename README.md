@@ -118,6 +118,11 @@ exist and who produced them, and any extra metadata fields.
 }
 ```
 
+A document that lacks a declared section is flagged `missing_section:…`,
+unless the card marks that section `"optional": true`. There is exactly one
+collection file per dataset (`documents/document.{dataset}.jsonl`, no
+sharding); a document id repeated inside it keeps its first line.
+
 ### Model card — `models/model.{model}.json`
 
 Identity, lineage and capabilities, plus the **`inference` schema** every
@@ -147,6 +152,13 @@ context windows — the tokenizer that measures them.
   }
 }
 ```
+
+Card defaults are validated like given values, a numeric parameter may
+restrict itself to `values`, and a parameter type KPViz cannot check is
+flagged rather than trusted. A context-window parameter may declare
+`"reserved_tokens"` (special tokens, a prompt, few-shot examples) — or a run
+may set a `reserved_tokens` parameter — and RQ3 then measures what fits in
+the window *minus* that reservation.
 
 ### Architecture card — `architectures/architecture.{arch}.json`
 
@@ -240,25 +252,48 @@ hyperparameters) with statistical inference built in and one-click export.
   (pdflatex, xelatex, lualatex) with nothing allowed into the margin.
 
 Evaluation conventions are stated in every caption: predictions lowercased,
-tokenised, stemmed and deduplicated keeping rank order; P/R/F1 at k ∈
-{5, 10, O, M}; documents with no gold after filtering excluded with n
-reported; scores macro-averaged. PRMU follows the in-order definition on
-stemmed tokens (P — all tokens appear in order; R — all appear, never in
-order; M — some; U — none).
+tokenised, stemmed and deduplicated keeping rank order; gold deduplicated
+per annotation set after stemming (token-less keyphrases dropped, both
+counted as collection issues); P/R/F1 at k ∈ {5, 10, O, M}; documents with
+no gold after filtering excluded with n reported; scores macro-averaged.
+PRMU follows Boudin & Gallina (2021) on stemmed tokens:
+
+* **P** — the keyphrase's stemmed tokens occur in the stemmed document as a
+  contiguous sequence, in order;
+* **R** — all of its stemmed tokens occur in the document, but not as that
+  sequence;
+* **M** — some of them occur; **U** — none do.
+
+A contiguous occurrence stays inside one section and does not cross a
+separating punctuation mark (one with whitespace beside it, such as a comma
+or a full stop); word-internal marks ("e-commerce", "and/or") are
+transparent, as they are inside the keyphrase. For a '+'-separated gold
+entry the best class over its variants counts; a lone '+' between two
+characters separates variants, so "C++" stays whole. A filter on PRMU
+restricts the *gold* side only: every prediction still counts in P@k, and
+the caption says so.
+
+One evaluation unit per document: a collection that repeats a document id
+keeps its first line, and a run that predicts a document twice keeps its
+first line (lowest batch, then byte offset). Both are counted and shown as
+issue tags (`duplicate_doc_ids`, `duplicate_docs`), with `unscored` for
+predictions that no gold can score (training splits).
 
 ## Reproducibility
 
 The derived store holds indices and statistics only — deleting `.kpviz/`
 and rescanning rebuilds everything from your files, deterministically.
 Every scan archives its exact per-step timings to `.kpviz/scan_stats/`.
-The `tools/` folder contains the verification harnesses used to check the
-platform itself (metric parity between the SQL and Python paths, LaTeX
-compilation of exports, headless scans); each takes `--data`/`--state` and
-runs against any tree.
+Every export bundle carries `provenance.json`: the KPViz code and schema
+versions, the catalog version and a fingerprint of the input files' content
+hashes. The automated checks live in `tests/` (run by CI on every push, with
+TeX and the publishers' classes installed); `tools/` holds the data
+generators and `tools/bench/` the measurement scripts, each taking
+`--data`/`--state` and running against any tree.
 
 ```bash
-pip install pytest psutil playwright && playwright install chromium
-python -m pytest tests                  # contract, parity, statistics vs SciPy, LaTeX in venue classes, UI (~2 min)
+pip install -r requirements-dev.txt -c constraints.txt   # the tested versions
+python -m pytest tests -rs              # contract, raw-JSON oracle, parity, statistics vs SciPy, LaTeX in venue classes, UI
 python tools/bench/scan_profile.py --data sample_data --state /tmp/st --full
 python tools/bench/probe_ui.py http://127.0.0.1:8050   # against a running app
 python tools/bench/fingerprint.py --state .kpviz   # per-table content hashes
@@ -272,10 +307,14 @@ The test suite generates its own data tree, checks every SQL score against
 an independent reference implementation, verifies that the worker count
 and incremental re-scans never change a derived number, and renders and
 exports every workbench. `docs/PERFORMANCE_PLAN.md` records the
-performance work and its measured results. `tools/kpviz_scaling_benchmark.py` is the self-contained
-scaling benchmark behind Table 2 of the paper (`pip install nltk PyStemmer`,
-then `python tools/kpviz_scaling_benchmark.py`); its original output is in
-`docs/benchmark_results_jcdl26.txt`.
+performance work, its measured results, and the status of every review
+finding (Section 6.7). `tools/kpviz_scaling_benchmark.py` is the
+self-contained scaling benchmark behind Table 2 of the paper (`pip install
+nltk PyStemmer`, then `python tools/kpviz_scaling_benchmark.py`); besides
+the field's baselines and KPViz's algorithm it times the code path KPViz
+actually ships (`kpviz.textproc`: spaCy tokeniser, contiguous PRMU). Its
+original output is in `docs/benchmark_results_jcdl26.txt`, the current one
+in `docs/scaling_benchmark_quick.txt`.
 
 ## Status
 

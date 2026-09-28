@@ -62,9 +62,14 @@ class ParamSpec:
     def numeric(self) -> bool:
         return self.type in ("int", "float", "context_window")
 
+    KNOWN_TYPES = ("int", "float", "context_window", "bool", "str", "set")
+
     def check(self, value) -> str | None:
-        """Return a human-readable violation, or None if the value is legal."""
+        """Return a human-readable violation, or None if the value is legal.
+        An undeclared type fails closed: nothing can be checked against it."""
         t = self.type
+        if t not in self.KNOWN_TYPES:
+            return f"parameter type {t!r} is not one KPViz can check"
         if t in ("int", "context_window"):
             if not isinstance(value, int) or isinstance(value, bool):
                 return f"expected int, got {type(value).__name__}"
@@ -89,6 +94,8 @@ class ParamSpec:
         if self.numeric and isinstance(value, (int, float)) and not isinstance(value, bool):
             if value != value or value in (float("inf"), float("-inf")):
                 return f"{value} is not a finite number"
+            if self.values and value not in self.values:
+                return f"value {value!r} not in allowed set"
             if self.min is not None and value < self.min:
                 return f"{value} < min {self.min}"
             if self.max is not None and value > self.max:
@@ -235,15 +242,35 @@ class ModelCard:
                                        "problem": problem})
                 resolved[name] = {"value": v, "source": "given"}
             elif spec.default is not None:
+                # a card default is a value like any other: an illegal one
+                # is flagged, never silently fed into analysis
+                problem = spec.check(spec.default)
+                if problem:
+                    violations.append({"param": name, "value": spec.default,
+                                       "problem": f"card default: {problem}"})
                 resolved[name] = {"value": spec.default, "source": "default"}
             else:
                 resolved[name] = {"value": None, "source": "missing"}
         for name, v in params.items():
             if name not in specs:
                 resolved[name] = {"value": v, "source": "given"}
+                if name in KPVIZ_RUN_PARAMS:
+                    problem = KPVIZ_RUN_PARAMS[name].check(v)
+                    if problem:
+                        violations.append({"param": name, "value": v,
+                                           "problem": problem})
+                    continue
                 violations.append({"param": name, "value": v,
                                    "problem": "not declared in model card"})
         return resolved, violations
+
+
+# run parameters KPViz itself understands, whatever the model card declares
+KPVIZ_RUN_PARAMS = {
+    # tokens of the input window the document cannot use (prompt, few-shot
+    # examples, special tokens) — subtracted from the window in RQ3
+    "reserved_tokens": ParamSpec(name="reserved_tokens", type="int", min=0),
+}
 
 
 @dataclass

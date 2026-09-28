@@ -31,26 +31,28 @@ def test_hidden_workbench_does_nothing(app):
     from dash.exceptions import PreventUpdate
     rq4 = _cb(app, '"rq":"rq4","type":"rq-graph"')
     with pytest.raises(PreventUpdate):
-        rq4(False, ["kp20k"], "f1", "O", ["P", "R", "M", "U"], "auto", "usd",
+        rq4(False, 1, ["kp20k"], "f1", "O", ["P", "R", "M", "U"], "auto", "usd",
             "per_doc", "log", None, None, ["y"], 2, "rank", "holm", "t", 1000,
-            None)
+            1, None)
 
 
 ALLS = ["P", "R", "M", "U"]
 THREE = ["kp20k", "kpbiomed", "kptimes"]
 
 
-def _calls(stats):
+def _calls(stats, v=1):
+    # the last two arguments: the catalog version (an input) and the
+    # workbench's last signature (a state)
     return {
-        "rq1": (True, THREE, "f1", "O", ALLS, "auto", "kendall", None, None,
-                *stats, None),
-        "rq2": (True, "kpbiomed", "f1", "O", ALLS, "auto", None, None,
-                ["lang", "sup_leak"], 0.8, "(any)", *stats, None),
-        "rq3": (True, "semeval2010", "f1", "O", "auto", None, None, *stats, None),
-        "rq4": (True, THREE, "r", "M", ["R", "M", "U"], "auto", "usd",
-                "per_doc", "log", None, None, ["y"], *stats, None),
-        "rq5": (True, "num_beams", None, THREE, "f1", "O", ALLS, "auto",
-                *stats, None),
+        "rq1": (True, 1, THREE, "f1", "O", ALLS, "auto", "kendall", None, None,
+                "model", *stats, v, None),
+        "rq2": (True, 1, "kpbiomed", "f1", "O", ALLS, "auto", None, None,
+                ["lang", "sup_leak"], 0.8, "(any)", *stats, v, None),
+        "rq3": (True, 1, "semeval2010", "f1", "O", "auto", None, None, *stats, v, None),
+        "rq4": (True, 1, THREE, "r", "M", ["R", "M", "U"], "auto", "usd",
+                "per_doc", "log", None, None, ["y"], *stats, v, None),
+        "rq5": (True, 1, "num_beams", None, THREE, "controlled", "f1", "O", ALLS,
+                "auto", *stats, v, None),
     }
 
 
@@ -103,3 +105,47 @@ def test_identical_conditions_are_not_untestable():
     from kpviz.stats import StatsCfg
     r = StatsCfg().paired([0.5] * 50, [0.5] * 50)
     assert r["p"] == 1.0 and r["effect"] == 0.0
+
+
+def test_rq5_controlled_sweep_and_envelope(app):
+    """Controlled: one series per fixed configuration, labelled with what is
+    fixed; envelope: one series per model, and the caption says it is the
+    best observed run per value."""
+    cb = _cb(app, '"rq":"rq5","type":"rq-graph"')
+    args = list(_calls((2, "rank", "holm", "t", 1000))["rq5"])
+    ctrl = cb(*args)[1]
+    assert "configuration that varies it alone" in ctrl["caption"]
+    args[5] = "envelope"
+    env = cb(*args)[1]
+    assert "best observed run at each value" in env["caption"]
+    heads = env["table"]["headers"]
+    # the test columns come right after the row label (N11)
+    assert heads[2] == "p" and "Effect size" in heads[:6]
+
+
+def test_scan_in_progress_pauses_workbenches(app, monkeypatch):
+    """N1: while a scan writes the store, no workbench computes (or caches)
+    anything from the half-written tables."""
+    from dash.exceptions import PreventUpdate
+    from kpviz import scanner
+    snap = scanner.STATE.snapshot()
+    fake = dict(snap, running=True,
+                steps=[{"key": "inferences", "status": "running"}])
+    monkeypatch.setattr(scanner.STATE, "snapshot", lambda: fake)
+    with pytest.raises(PreventUpdate):
+        _cb(app, '"rq":"rq4","type":"rq-graph"')(
+            *_calls((2, "rank", "holm", "t", 1000), v=2)["rq4"])
+
+
+def test_inspector_explains_a_runs_score(app_ctx):
+    """U9: the ranked predictions of a run on one document, with what each
+    matched, agree with the stored match primitives."""
+    from kpviz import db
+    from kpviz.pages.datasets import _explain
+    m, a, r, d, ranks = db.q1("""SELECT model, arch, run_id, doc_id, pred_ranks
+                                 FROM matches WHERE dataset='kp20k'
+                                   AND ann_key='author' AND len(pred_ranks) > 0
+                                 LIMIT 1""")
+    out = str(_explain("kp20k", d, (m, a, r), "author").to_plotly_json())
+    assert out.count("'✓'") == len(ranks)
+    assert f"{len(ranks)} of" in out and "Missed gold" in out

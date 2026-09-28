@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KPVIZ_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: TeX (venue classes and fonts the export tests compile against)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-base texlive-latex-recommended texlive-latex-extra \
+            texlive-fonts-recommended texlive-publishers texlive-xetex \
+            texlive-luatex lmodern poppler-utils
+      - name: Python dependencies (the tested versions)
+        run: pip install -r requirements-dev.txt -c constraints.txt
+      - name: Static check
+        run: python -m pyflakes kpviz tests tools app.py
+      - name: Tests (no skips allowed for TeX or SciPy on this runner)
+        run: python -m pytest tests -q -rs

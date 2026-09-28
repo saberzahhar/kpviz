@@ -21,7 +21,8 @@ import plotly.graph_objects as go
 # half-initialised module ("partially initialized module 'PIL.Image'").
 # Importing it here, at single-threaded app-build time, removes the race.
 try:  # pragma: no cover - optional dependency of plotly
-    import PIL.Image  # noqa: F401
+    import importlib as _il
+    _il.import_module("PIL.Image")
 except Exception:
     pass
 
@@ -37,7 +38,6 @@ SEQ_RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
             "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281",
             "#0d366b"]
 DIV_LOW, DIV_MID, DIV_HIGH = "#2a78d6", "#f0efec", "#e34948"
-from .naming import PALETTE  # categorical slots (fixed order)  # noqa: E402
 STATUS = {"good": "#0ca30c", "warning": "#fab219",
           "serious": "#ec835a", "critical": "#d03b3b"}
 
@@ -537,7 +537,7 @@ def to_plotly(spec: dict) -> go.Figure:
                       line=dict(color=SURFACE, width=2))
         line = dict(color=s.get("color", "#2a78d6"),
                     width=s.get("width", 2),
-                    dash="dash" if s.get("dash") else "solid")
+                    dash=_plotly_dash(s.get("dash")))
         pos = [anchors.get((si, pi), "middle right")
                for pi in range(len(s.get("text") or []))] or "middle right"
         band = s.get("band")
@@ -639,9 +639,16 @@ _TEX_TABLE = str.maketrans(_TEX_CHARS)
 # "bart-base-kp20k (num_beams=4)" writes a raw underscore into the .pgf and the
 # figure fails to compile the moment it is \input into a real paper. Escape the
 # rest ourselves — in text-bearing fields only, because "#2a78d6" is a colour.
-_TEX_ASCII = {"_": r"\_", "&": r"\&", "#": r"\#", "{": r"\{", "}": r"\}",
-              "~": r"\textasciitilde{}"}
-_TEX_ASCII_RE = re.compile(r"[_&#{}~]")
+# every TeX special Matplotlib's PGF backend does not handle itself (it
+# escapes % and ^): a literal backslash (a prompt "\\d+", a Windows path) or
+# a lone "$" (a price) used to fail the render — and take TeX down for the
+# session. Each is escaped exactly once, before the non-ASCII translation
+# (whose output is itself TeX).
+# ("$" becomes \textdollar, not \$: Matplotlib turns "\$" back into a bare
+# "$" in non-math text before the PGF backend writes it)
+_TEX_ASCII = {"\\": r"\textbackslash{}", "$": r"\textdollar{}", "_": r"\_", "&": r"\&",
+              "#": r"\#", "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}"}
+_TEX_ASCII_RE = re.compile(r"[\\$_&#{}~]")
 _TEXT_KEYS = frozenset((
     "text", "xlabel", "ylabel", "title", "name", "label", "labels", "ylabels",
     "x0_name", "x1_name", "legend_title", "annot", "caption",
@@ -654,6 +661,21 @@ _TEXT_KEYS = frozenset((
 def _tex_str(s: str) -> str:
     s = _TEX_ASCII_RE.sub(lambda m: _TEX_ASCII[m.group(0)], s)
     return s if s.isascii() else s.translate(_TEX_TABLE)
+
+
+# a series' "dash": True / False (legacy) or a Plotly dash name
+_MPL_DASH = {"solid": "-", "dash": "--", "dot": ":", "dashdot": "-.",
+             "longdash": (0, (8, 3)), "longdashdot": (0, (8, 3, 1, 3))}
+
+
+def _plotly_dash(d) -> str:
+    if isinstance(d, str) and d in _MPL_DASH:
+        return d
+    return "dash" if d else "solid"
+
+
+def _mpl_dash(d):
+    return _MPL_DASH.get(_plotly_dash(d), "-")
 
 
 def tex_sanitize(obj, key: str | None = None):
@@ -966,7 +988,7 @@ def to_mpl(spec: dict, pgf: bool = False):
                 if "lines" in mode:
                     ax.plot(s["x"], s["y"], color=s.get("color", "#2a78d6"),
                             lw=s.get("width", 1.6),
-                            ls="--" if s.get("dash") else "-",
+                            ls=_mpl_dash(s.get("dash")),
                             marker=(s.get("mpl_marker", "o")
                                     if "markers" in mode else None),
                             ms=4.5, markeredgecolor="white",

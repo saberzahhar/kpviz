@@ -9,7 +9,7 @@ from dash.exceptions import PreventUpdate
 from .. import db, scanner, ui
 from ..figures import to_plotly
 from ..metrics import run_scores
-from ..naming import natural_key, slot_color, window_str
+from ..naming import natural_key, shade, slot_color, window_str
 from ..util import fmt_num, human_cost, human_count
 
 
@@ -136,18 +136,25 @@ def _quality_glance(model):
     if not series_by_run:
         return None
     series = []
-    # colour follows the run (a stable slot), never its rank in this chart
-    slots = db.color_seq("run", sorted(series_by_run))
-    for i, (lab, per_ds) in enumerate(
-            sorted(series_by_run.items(), key=lambda kv: natural_key(kv[0]))):
+    # one model's runs, in label order: up to 8 get the categorical slots,
+    # more get one hue in steps of lightness (a wrapped palette gave two
+    # runs the same colour)
+    ordered = sorted(series_by_run.items(), key=lambda kv: natural_key(kv[0]))
+    n = len(ordered)
+    for i, (lab, per_ds) in enumerate(ordered):
+        color = (slot_color(i) if n <= 8
+                 else shade(slot_color(0), 0.75 * i / max(1, n - 1)))
         series.append({"name": lab, "x": datasets,
-                       "y": [per_ds.get(d) for d in datasets],
-                       "color": slot_color(slots.get(lab, i) % 8)})
+                       "y": [per_ds.get(d) for d in datasets], "color": color})
     spec = {"kind": "bar", "xlabel": "dataset",
             "ylabel": "F1@O (all annotation sets, or the only one)",
-            "series": series}
-    return ui.card([ui.graph("md-quality", to_plotly(spec), 300)],
-                   title="Quality glance — F1@O per dataset and run")
+            "series": series, "size": "2col", "name": f"quality-{model}",
+            "caption": (f"F1@O of every run of {name} per dataset, against the "
+                        "union of the dataset's annotation sets (or its only "
+                        "one), macro-averaged over documents.")}
+    return ui.exportable("md-quality", spec,
+                         ui.graph("md-quality", to_plotly(spec), 300),
+                         title="Quality glance — F1@O per dataset and run")
 
 
 def _body(model):
@@ -211,11 +218,11 @@ def _body(model):
 
 def register(app):
     @app.callback(Output("md-pick", "options"), Output("md-pick", "value"),
-                  Input("vis-models", "data"),
+                  State("vis-models", "data"), Input("shown-models", "data"),
                   Input("catalog-version", "data"),
                   State("md-pick", "options"), State("md-pick", "value"),
                   prevent_initial_call=True)
-    def refresh_models(visible, _v, cur_opts, current):
+    def refresh_models(visible, _shown, _v, cur_opts, current):
         if not visible:
             raise PreventUpdate
         opts = _model_options()

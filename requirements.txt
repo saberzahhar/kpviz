@@ -18,7 +18,5 @@ spacy>=3.8,<3.9
 en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 fr_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl
 
-# Development / benchmarks (not needed to run the app)
-#   pytest>=8            python -m pytest tests
-#   psutil>=5.9          tools/bench/scan_profile.py (RSS/PSS/USS per phase)
-#   playwright>=1.45     tools/bench/probe_ui.py (then: playwright install chromium)
+# Development, tests and benchmarks: requirements-dev.txt
+# The versions the suite was last run with: constraints.txt

@@ -38,6 +38,28 @@ _TAG_KINDS = [("illegal parameter", "t-illegal"), ("missing", "t-missing"),
               ("lang_mismatch", "t-lang")]
 
 
+# what each issue tag means and what KPViz did about it (chip tooltip)
+TAG_HELP = {
+    "duplicate_docs": "the run predicts some documents more than once; the "
+                      "first line (lowest batch, then byte offset) is scored, "
+                      "the others ignored",
+    "duplicate_doc_ids": "the collection repeats document ids; the first "
+                         "line is kept, the others ignored",
+    "gold_duplicates": "gold keyphrases identical to an earlier one of the "
+                       "same annotation set after stemming; counted once",
+    "gold_empty": "gold keyphrases with no word token; dropped (they can "
+                  "never be matched)",
+    "unscored": "predicted documents with no stored gold (a training split, "
+                "or no annotation); they enter no score",
+    "unresolved_ids": "predicted document ids absent from the collection",
+    "incomplete": "share of the evaluation split this run predicts; its "
+                  "means are over the predicted documents only",
+    "multi_split": "the run predicts documents of several splits",
+    "malformed_lines": "lines that are not valid JSON (skipped)",
+    "missing_id": "lines without an _id",
+}
+
+
 def tag_chip(tag: str):
     key, _, value = str(tag).partition(":")
     kind = next((cls for prefix, cls in _TAG_KINDS
@@ -45,7 +67,9 @@ def tag_chip(tag: str):
     parts = [html.Span(key, className="tag-k")]
     if value:
         parts.append(html.Span(value, className="tag-v"))
-    return html.Span(parts, className=f"tag {kind}", title=tag)
+    help_ = TAG_HELP.get(key)
+    return html.Span(parts, className=f"tag {kind}",
+                     title=f"{tag} — {help_}" if help_ else tag)
 
 
 # ---- metadata chips ------------------------------------------------------
@@ -96,8 +120,11 @@ def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
                for ci, c in enumerate(row)]
         kw = {}
         if row_ids is not None and table_id is not None:
+            # focusable and announced as a button; Enter/Space click it
+            # (assets/keys.js), so the keyboard reaches what the mouse does
             kw = {"id": {"type": f"{table_id}-row", "key": str(row_ids[ri])},
-                  "className": "row-click", "n_clicks": 0}
+                  "className": "row-click", "n_clicks": 0, "tabIndex": 0,
+                  "role": "button"}
         body_rows.append(html.Tr(tds, **kw))
     # headers never wrap (they read as one phrase), so a wide table scrolls
     # inside its card instead of stretching the page
@@ -106,9 +133,14 @@ def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
 
 
 def control(label: str, component, width: int | None = None):
+    """A labelled control. The label is a real <label> bound to the input
+    when the component has a plain id (screen readers announce it)."""
     style = {"minWidth": f"{width}px"} if width else {}
-    return html.Div([html.Div(label, className="control-label"), component],
-                    className="control", style=style)
+    cid = getattr(component, "id", None)
+    lab = (html.Label(label, htmlFor=cid, className="control-label")
+           if isinstance(cid, str) else
+           html.Div(label, className="control-label"))
+    return html.Div([lab, component], className="control", style=style)
 
 
 def filter_row(controls: list):
@@ -141,11 +173,16 @@ def graph(id, figure=None, height: int = 420, config: dict | None = None,
                             else {"height": f"{height}px"}))
 
 
-def export_bar(rq: str):
-    """One export bar per insight: stores + buttons + clipboards.
+def export_bar(rq: str, spec: dict | None = None):
+    """One export bar per figure: stores + buttons + clipboards.
 
     The figure/table spec is written to {'type':'fig-spec','rq':rq} by the
-    RQ callback; global callbacks in appfactory handle rendering/downloads."""
+    RQ callback — or given here for a figure drawn once (Datasets, Models);
+    global callbacks in appfactory handle rendering/downloads."""
+    clip_fig = clip_tab = hint = ""
+    if spec:
+        from .export import snippets
+        clip_fig, clip_tab, hint = snippets(spec)
     def b(what, label, primary=False):
         return html.Button(label, id={"type": "exp-btn", "rq": rq, "what": what},
                            className="btn small" + (" primary" if primary else ""),
@@ -161,7 +198,10 @@ def export_bar(rq: str):
             className="exp-opt", style={"minWidth": f"{width}px"})
     from .figures import VENUES
     return html.Div([
-        dcc.Store(id={"type": "fig-spec", "rq": rq}),
+        # data only when there is a spec: an explicit data=None makes Dash
+        # fire the export callbacks of every workbench at page load
+        dcc.Store(id={"type": "fig-spec", "rq": rq},
+                  **({"data": spec} if spec else {})),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
         html.Div([
             opt("venue", "Paper", [{"label": v["label"], "value": k}
@@ -187,13 +227,13 @@ def export_bar(rq: str):
         html.Div([
             dcc.Clipboard(title="copy LaTeX (figure environment)",
                           id={"type": "exp-clip-fig", "rq": rq},
-                          content="", className="btn small",
+                          content=clip_fig, className="btn small",
                           style={"display": "inline-flex"}),
             html.Span("LaTeX figure", className="small muted",
                       style={"marginRight": "10px", "marginLeft": "-2px"}),
             dcc.Clipboard(title="copy LaTeX (booktabs table)",
                           id={"type": "exp-clip-tab", "rq": rq},
-                          content="", className="btn small",
+                          content=clip_tab, className="btn small",
                           style={"display": "inline-flex"}),
             html.Span("LaTeX table", className="small muted",
                       style={"marginRight": "10px", "marginLeft": "-2px"}),
@@ -202,11 +242,19 @@ def export_bar(rq: str):
             html.Button("Preview", id={"type": "exp-prev", "rq": rq},
                         className="btn small ghost", n_clicks=0,
                         title="Show the exported figure at its printed size"),
-            html.Span(id={"type": "exp-hint", "rq": rq}, className="hint"),
+            html.Span(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
         ], className="export-bar"),
         loading(html.Div(id={"type": "exp-preview", "rq": rq},
                          className="exp-preview")),
     ])
+
+
+def exportable(key: str, spec: dict, graph_component, title: str | None = None,
+               **card_kw):
+    """A card holding a figure drawn once (not by a workbench callback) with
+    the full export bar: caption, LaTeX snippets, PDF/PNG/PGF, bundle."""
+    return card([graph_component, caption_editor(key, spec.get("caption", "")),
+                 export_bar(key, spec)], title=title, **card_kw)
 
 
 def caption_editor(rq: str, initial: str = ""):

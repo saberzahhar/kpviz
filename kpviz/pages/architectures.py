@@ -164,10 +164,10 @@ def _body(token):
 
 def register(app):
     @app.callback(Output("ar-pick", "options"), Output("ar-pick", "value"),
-                  Input("vis-architectures", "data"),
+                  State("vis-architectures", "data"), Input("shown-architectures", "data"),
                   Input("catalog-version", "data"), State("ar-pick", "value"),
                   prevent_initial_call=True)
-    def refresh_archs(visible, _v, current):
+    def refresh_archs(visible, _shown, _v, current):
         if not visible:
             raise PreventUpdate
         opts = _arch_options()

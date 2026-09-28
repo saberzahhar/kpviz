@@ -2,12 +2,14 @@
 
 Tokens come from spaCy (blank pipelines — pure tokenizers, no models
 needed); stems from PyStemmer (C); every keyphrase is analysed once and
-cached (worker-local dict + the global `keyphrases` table). PRMU is the
-in-order definition computed on stemmed spaCy tokens:
+cached (worker-local dict + the global `keyphrases` table). PRMU follows
+Boudin & Gallina (2021), computed on stemmed spaCy tokens:
 
-    P — every keyphrase token appears in the document *in order*
-    R — every token appears, but never in a single in-order chain
-    M — some tokens appear
+    P — the keyphrase's stemmed tokens occur in the stemmed document as a
+        contiguous sequence, in order (within one section, not across a
+        separating punctuation mark)
+    R — every stemmed token occurs in the document, but never as that sequence
+    M — some do
     U — none do
 
 Model tokenizers (`transformers[...]`, `tiktoken[...]`) resolve exactly
@@ -38,6 +40,11 @@ _SNOWBALL_LANG = {
 
 
 def norm_text(text: str) -> str:
+    """NFKC, then str.lower() — deliberately not casefold(): casefold maps
+    German "ß" to "ss" and so would match "Strasse" against "Straße" in
+    German but also change stems the Snowball stemmers expect; lower() keeps
+    each language's own orthography (Turkish dotted/dotless i are left to
+    NFKC + lower, which is not locale-aware). Stated in the conventions."""
     return unicodedata.normalize("NFKC", text or "").lower()
 
 
@@ -50,9 +57,17 @@ def norm_phrase(text: str) -> str:
     return " ".join(norm_text(text).split())
 
 
+_VARIANT_SEP = re.compile(r"(?<=[^+\s])\+(?=[^+\s])")
+
+
 def split_variants(raw: str) -> list[str]:
-    """Gold keyphrases may carry alternate forms joined by '+'."""
-    parts = [p.strip() for p in (raw or "").split("+")]
+    """Gold keyphrases may carry alternate forms joined by '+' (the SemEval
+    convention). Only a lone '+' between two other characters separates:
+    "C++" and "A+ grading" stay whole."""
+    raw = raw or ""
+    if "+" not in raw:
+        return [raw]
+    parts = [p.strip() for p in _VARIANT_SEP.split(raw)]
     return [p for p in parts if p] or [raw]
 
 
@@ -143,22 +158,87 @@ def spacy_doc_tokens(text: str, lang: str | None,
         return toks, ends
 
 
-def norm_offsets(text: str, lowered: str) -> list[int] | None:
-    """Map offsets in `norm_text(text)` back to offsets in `text`.
+def spacy_doc_stream(text: str, lang: str | None, lowered: str | None = None,
+                     section_starts: list[int] | None = None
+                     ) -> tuple[list[str], list[int], list[int]]:
+    """`spacy_doc_tokens` plus a segment id per kept token (see StemmedDoc):
+    the segment changes at every section start (offsets into the normalised
+    text) and at every *separating* punctuation mark — one with whitespace
+    before or after it. Word-internal marks (e-commerce, and/or) do not
+    separate. Stays in NumPy, like spacy_doc_tokens."""
+    import numpy as np
+    lowered = norm_text(text) if lowered is None else lowered
+    doc = _blank(lang).tokenizer(lowered)
+    try:
+        from spacy.attrs import IDX, IS_PUNCT, IS_SPACE, LENGTH, SPACY
+        arr = doc.to_array([IDX, LENGTH, IS_PUNCT, IS_SPACE, SPACY])
+    except Exception:
+        arr = np.array([[t.idx, len(t.text), t.is_punct, t.is_space,
+                         bool(t.whitespace_)] for t in doc], dtype=np.int64)
+    if not len(arr):
+        return [], [], []
+    arr = np.asarray(arr, dtype=np.int64)
+    punct, space, ws_after = arr[:, 2] == 1, arr[:, 3] == 1, arr[:, 4] == 1
+    # whitespace right after a token: its own trailing space, or a space token
+    ws_after = ws_after | np.concatenate((space[1:], [True]))
+    ws_before = np.concatenate(([True], ws_after[:-1]))
+    sep = punct & (ws_after | ws_before)
+    seg = np.cumsum(sep)
+    if section_starts and len(section_starts) > 1:
+        sec = np.searchsorted(np.asarray(section_starts), arr[:, 0], side="right")
+        seg = seg + sec * (len(arr) + 1)
+    keep = ~(punct | space)
+    starts = arr[keep, 0]
+    ends = (starts + arr[keep, 1]).tolist()
+    starts = starts.tolist()
+    return ([lowered[a:b] for a, b in zip(starts, ends)], ends,
+            seg[keep].tolist())
 
-    None when the two have the same length (the common case: offsets are
-    already shared). NFKC and lowercasing can change length ("ﬃ" -> "ffi",
-    "İ" -> "i̇"); token ends found in the normalised text must then be mapped
-    before they index the original document (token positions, highlighting).
-    Returns a list m with m[j] = original offset of normalised offset j."""
-    if len(text) == len(lowered):
+
+def _offsets_shared(text: str) -> bool:
+    """True when normalising cannot move any offset: ASCII, or already NFKC
+    with a length-preserving lowercase (both checks run in C)."""
+    return text.isascii() or (unicodedata.is_normalized("NFKC", text)
+                              and len(text.lower()) == len(text))
+
+
+def norm_with_offsets(text: str) -> tuple[str, list[int] | None]:
+    """(normalised text, offset map) with an *exact* alignment.
+
+    The map m has m[j] = offset in `text` of normalised offset j (None when
+    offsets are shared — the common case, decided in C). Otherwise the text
+    is normalised cluster by cluster — a base character with the combining
+    marks that follow it — and the pieces concatenated, so every boundary
+    is known: composition ("e" + U+0301 -> "é"), compatibility expansion
+    ("ﬁ" -> "fi") and changes that cancel out in total length all map
+    exactly, instead of the proportional guess this replaced. A document
+    normalised this way differs from whole-string NFKC only where a
+    composition would span two clusters (not a case in scripts KPViz stems)."""
+    if _offsets_shared(text):
+        return norm_text(text), None
+    out, m = [], [0]
+    i, n = 0, len(text)
+    while i < n:
+        j = i + 1
+        while j < n and unicodedata.combining(text[j]):
+            j += 1
+        piece = norm_text(text[i:j])
+        out.append(piece)
+        # every normalised char of the cluster maps to the cluster's end
+        m.extend([j] * len(piece))
+        i = j
+    return "".join(out), m
+
+
+def norm_offsets(text: str, lowered: str) -> list[int] | None:
+    """Map offsets in `lowered` back to `text` (see norm_with_offsets, which
+    derives both together; kept for callers that already normalised)."""
+    low2, m = norm_with_offsets(text)
+    if m is None:
         return None
-    m = [0]
-    for i, ch in enumerate(text):
-        m.extend([i + 1] * len(norm_text(ch)))
-    if len(m) != len(lowered) + 1:        # normalisation not per-character:
-        n, L = len(text), max(1, len(lowered))   # fall back to proportional
-        return [round(j * n / L) for j in range(len(lowered) + 1)]
+    if low2 != lowered:
+        raise ValueError("norm_offsets: text was normalised differently; "
+                         "use norm_with_offsets")
     return m
 
 
@@ -245,8 +325,26 @@ class PhraseCache:
 
 
 # --------------------------------------------------------------------------
-# In-order PRMU on stemmed tokens
+# PRMU on stemmed tokens (Boudin & Gallina, 2021)
 # --------------------------------------------------------------------------
+
+class StemmedDoc:
+    """A document as the PRMU classifier sees it: its stemmed word tokens, a
+    position index per stem, and a segment id per token.
+
+    Segments are what a contiguous match may not cross: a new section, or a
+    separating punctuation mark (one with whitespace on either side — a
+    comma, a full stop, a bracket). Word-internal punctuation (the hyphen of
+    "e-commerce", the slash of "and/or") is transparent, as it is inside the
+    keyphrase, whose own punctuation tokens are dropped the same way."""
+
+    __slots__ = ("stems", "index", "seg")
+
+    def __init__(self, stems: list[str], seg: list[int] | None = None):
+        self.stems = stems
+        self.index = position_index(stems)
+        self.seg = seg if seg is not None else [0] * len(stems)
+
 
 def position_index(stems: list[str]) -> dict[str, list[int]]:
     idx: dict[str, list[int]] = {}
@@ -255,40 +353,53 @@ def position_index(stems: list[str]) -> dict[str, list[int]]:
     return idx
 
 
-def inorder_chain_end(kp_stems: list[str], index: dict[str, list[int]]) -> int:
-    """Earliest end position of an in-order chain of kp_stems, else -1.
+def contiguous_end(kp_stems: list[str], doc: StemmedDoc) -> int:
+    """Token position where the earliest contiguous, in-order occurrence of
+    kp_stems ends inside one segment of the document, else -1.
 
-    Greedy earliest-next is optimal for minimising the end position."""
-    pos = -1
-    for s in kp_stems:
+    Anchored on the keyphrase's rarest stem: the candidate starts are that
+    stem's positions shifted back by its offset in the keyphrase, so a
+    common first word ("model", "system") costs nothing extra."""
+    n = len(kp_stems)
+    index = doc.index
+    anchor, best_len = 0, None
+    for j, s in enumerate(kp_stems):
         lst = index.get(s)
         if not lst:
             return -1
-        j = bisect.bisect_right(lst, pos)
-        if j >= len(lst):
-            return -1
-        pos = lst[j]
-    return pos
+        if best_len is None or len(lst) < best_len:
+            anchor, best_len = j, len(lst)
+    stems, seg, total = doc.stems, doc.seg, len(doc.stems)
+    for q in index[kp_stems[anchor]]:
+        p = q - anchor
+        if p < 0 or p + n > total:
+            continue
+        if stems[p:p + n] == kp_stems and seg[p] == seg[p + n - 1]:
+            return p + n - 1
+    return -1
 
 
 _PRMU_RANK = {"P": 3, "R": 2, "M": 1, "U": 0}
 
 
 def prmu_classify(variant_stems: list[list[str]],
-                  index: dict[str, list[int]]) -> tuple[str, int]:
-    """Best PRMU class over the '+'-variants and the earliest chain end.
+                  doc: StemmedDoc) -> tuple[str, int]:
+    """Best PRMU class over the '+'-variants, and where the earliest present
+    occurrence ends (token position; -1 unless P).
 
-    P: all tokens appear in order · R: all appear, never in order ·
-    M: some appear · U: none."""
+    P: the stemmed tokens occur contiguously, in order, in the stemmed
+       document · R: every stemmed token occurs somewhere, never as that
+       sequence · M: some do · U: none do."""
     best, best_end = "U", -1
     rank = _PRMU_RANK
+    index = doc.index
     for stems in variant_stems:
         if not stems:
             continue
-        end = inorder_chain_end(stems, index)
+        end = contiguous_end(stems, doc)
         if end >= 0:
-            if best != "P" or best_end < 0 or end < best_end:
-                best, best_end = "P", (end if best_end < 0 else min(best_end, end))
+            if best != "P" or end < best_end:
+                best, best_end = "P", end
             continue
         distinct = set(stems)
         present = sum(1 for s in distinct if s in index)
@@ -308,6 +419,10 @@ _STOPWORDS: dict[str, frozenset[str]] = {
     "es": frozenset("de la que el en y a los del se las por un para con no una su al lo como más pero sus le ya o este sí porque esta entre cuando".split()),
     "it": frozenset("di che e la il un a per in una sono mi si lo ma le ci con non del più questo al come da dei nel alla".split()),
     "pt": frozenset("de a o que e do da em um para é com não uma os no se na por mais as dos como mas foi ao ele das tem à seu sua".split()),
+    # Dutch and Russian: every language KPViz stems and tokenises also votes
+    # (a declared nl/ru collection used to get stems but no detection)
+    "nl": frozenset("de en van het een in is dat op te zijn voor met die niet aan er om ook als bij door wordt worden maar dan of uit naar deze kan zij tot".split()),
+    "ru": frozenset("и в не на что с по как это из за от для к о но же его а то все так было он мы она они при бы также или".split()),
 }
 # token -> languages whose stop-word list contains it, built once: one pass
 # over the tokens instead of one generator per candidate language
@@ -393,6 +508,7 @@ class ModelTokenizer:
         self.expect = expect
         self.why = ""
         self._impl = None
+        self._fp = None
 
     # -- asset locations -----------------------------------------------------
     def _dir(self) -> Path | None:
@@ -506,16 +622,29 @@ class ModelTokenizer:
                         f"{', '.join(sorted(known))}); declare "
                         "transformers[<hub id>] or file:<path/tokenizer.json>")
             return None
-        if not self.allow_network and self.expect != "exact":
-            self.why = "not cached locally"
-            return None
         if self.allow_network and self._known_unavailable():
             self.why = "unavailable at the last attempt (retried daily)"
             return None
+        # local availability is separate from download permission: offline,
+        # a cached encoding is read (tiktoken checks its cache before it
+        # downloads) and the download itself is refused
         try:
-            return ("tiktoken", tiktoken.get_encoding(self.name))
+            if self.allow_network:
+                return ("tiktoken", tiktoken.get_encoding(self.name))
+            import tiktoken.load as _tl
+            real = _tl.read_file
+
+            def no_download(blobpath):
+                raise OSError(f"offline: {self.name} is not cached locally")
+            _tl.read_file = no_download
+            try:
+                return ("tiktoken", tiktoken.get_encoding(self.name))
+            finally:
+                _tl.read_file = real
         except Exception as e:
-            self.why = f"{type(e).__name__}: {str(e)[:160]}"
+            self.why = (f"not cached locally ({'offline' if offline() else 'no network in workers'})"
+                        if isinstance(e, OSError) and "offline:" in str(e)
+                        else f"{type(e).__name__}: {str(e)[:160]}")
             if self.allow_network:
                 self._mark_unavailable(self.why)
             return None
@@ -531,12 +660,33 @@ class ModelTokenizer:
 
     @property
     def fingerprint(self) -> str:
-        """Identity of what counts tokens, for derivation signatures: a newly
-        available exact asset must re-derive the approximate counts."""
+        """Identity of what counts tokens, for derivation signatures: the
+        asset's *content* and the backend's version. A newly available exact
+        asset, a tokenizer.json replaced at the same path, or a tokenizer
+        library upgrade all re-derive the counts and positions."""
         kind, obj = self._resolve()
         if kind == "approx":
             return f"approx:{obj}"
-        return f"exact:{kind}:{self.name}"
+        if self._fp is None:
+            import hashlib
+            h = hashlib.blake2b(digest_size=10)
+            try:
+                from importlib import metadata
+                lib = "tokenizers" if kind == "hf" else "tiktoken"
+                h.update(f"{lib}={metadata.version(lib)}".encode())
+            except Exception:
+                pass
+            try:
+                if kind == "hf":
+                    h.update(obj.to_str().encode("utf-8"))
+                else:
+                    h.update(f"{obj.name}:{obj.n_vocab}".encode())
+                    h.update(repr(sorted(obj._special_tokens.items())).encode())
+                    h.update(str(obj._pat_str).encode())
+            except Exception:
+                h.update(self.name.encode())
+            self._fp = f"exact:{kind}:{self.name}:{h.hexdigest()}"
+        return self._fp
 
     # -- counting ------------------------------------------------------------
     def count_batch(self, texts: list[str]) -> tuple[list[int], bool]:
@@ -563,14 +713,25 @@ class ModelTokenizer:
         kind, obj = self._resolve()
         if kind == "hf":
             enc = obj.encode(text)
-            return {"kind": "hf", "ends": [o[1] for o in enc.offsets],
-                    "n": len(enc.ids)}
+            # special tokens (BOS/EOS, separators) carry empty (0, 0)
+            # offsets: they are counted in the position but never searched —
+            # searching them made the ends unsorted and positions impossible
+            ends, pos, top = [], [], 0
+            for i, (a, b) in enumerate(enc.offsets):
+                if b > a:
+                    top = max(top, b)
+                    ends.append(top)
+                    pos.append(i + 1)
+            return {"kind": "hf", "ends": ends, "pos": pos, "n": len(enc.ids)}
         if kind == "tiktoken":
             ids = obj.encode_ordinary(text)
             try:
                 from itertools import accumulate
                 ends = list(accumulate(map(len, obj.decode_tokens_bytes(ids))))
-                return {"kind": "tiktoken_bytes", "ends": ends, "n": len(ids)}
+                # ASCII text: a char offset is a byte offset (no re-encode
+                # of the prefix per keyphrase)
+                return {"kind": "tiktoken_bytes", "ends": ends, "n": len(ids),
+                        "ascii": text.isascii()}
             except Exception:
                 return {"kind": "tiktoken_slow", "n": len(ids)}
         starts = (word_starts if word_starts is not None
@@ -579,15 +740,30 @@ class ModelTokenizer:
 
     def char_to_token(self, text: str, char_end: int,
                       encoding=None) -> tuple[int, bool]:
-        """Tokens covering text[:char_end] (1-based count)."""
+        """Position (1-based, counting leading special tokens) of the token
+        that contains the character just before `char_end` — i.e. how many
+        tokens the model must read to have seen text[:char_end]. Boundary
+        rule: a token ending exactly at char_end is that token (bisect_left
+        on token ends); a token that straddles char_end counts, since the
+        phrase is not complete before it."""
         kind, obj = self._resolve()
         enc = encoding if encoding is not None else self.encode_cached(text)
         if kind in ("hf", "tiktoken"):
             if enc and enc.get("kind") == "hf":
-                return bisect.bisect_left(enc["ends"], char_end) + 1, False
+                ends, pos = enc["ends"], enc.get("pos")
+                if not ends:
+                    return enc.get("n", 0), False
+                i = min(bisect.bisect_left(ends, char_end), len(ends) - 1)
+                # 1-based position of that content token in the full encoding
+                # (a leading BOS counts, as it does in the model's window)
+                return (pos[i] if pos else i + 1), False
             if enc and enc.get("kind") == "tiktoken_bytes":
-                byte_end = len(text[:char_end].encode("utf-8"))
-                return bisect.bisect_left(enc["ends"], byte_end) + 1, False
+                byte_end = (char_end if enc.get("ascii")
+                            else len(text[:char_end].encode("utf-8")))
+                ends = enc["ends"]
+                if not ends:
+                    return 0, False
+                return min(bisect.bisect_left(ends, byte_end), len(ends) - 1) + 1, False
             # exact but slow fallback (unknown tiktoken internals)
             return len(obj.encode_ordinary(text[:char_end])), False
         # regex words of text[:char_end] == words starting before char_end
@@ -602,7 +778,7 @@ _TOKENIZERS: dict[tuple, ModelTokenizer] = {}
 def get_tokenizer(spec: str, cache_dir: Path | None = None,
                   allow_network: bool = True,
                   expect: str | None = None) -> ModelTokenizer:
-    key = (spec or "", allow_network, expect)
+    key = (spec or "", str(cache_dir or ""), allow_network, expect)
     tk = _TOKENIZERS.get(key)
     if tk is None:
         tk = _TOKENIZERS[key] = ModelTokenizer(spec, cache_dir=cache_dir,
@@ -627,7 +803,8 @@ def forget_tokenizers(cache_dir: Path | None = None) -> None:
 # --------------------------------------------------------------------------
 _SPACY_MODELS = {"en": "en_core_web_sm", "fr": "fr_core_news_sm",
                  "de": "de_core_news_sm", "es": "es_core_news_sm",
-                 "it": "it_core_news_sm", "pt": "pt_core_news_sm"}
+                 "it": "it_core_news_sm", "pt": "pt_core_news_sm",
+                 "nl": "nl_core_news_sm", "ru": "ru_core_news_sm"}
 
 
 def pos_available(lang: str | None) -> bool:

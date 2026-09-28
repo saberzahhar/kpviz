@@ -11,8 +11,10 @@ Two design notes that matter for throughput:
 * **UI callbacks never write here.** Result caches live in process memory
   (metrics.py) and colour assignments in a small JSON file next to the store,
   so a click can never queue behind the scan's writer lock.
-* **The high-volume derived tables carry no primary key.** They are always
-  purge-then-insert, so uniqueness holds by construction, and dropping the
+* **The high-volume derived tables carry no primary key.** They are
+  purge-then-insert, and a repeated document id inside the new input is
+  resolved right after ingest (first line wins, the count becomes an issue
+  tag) — `scanner._dedup_*`. Dropping the
   ART index turns `INSERT OR REPLACE` into a plain `INSERT` (~6× cheaper)
   and stops `DELETE` from paying index maintenance (measured: the dominant
   cost of re-deriving a run). `keyphrases` keeps its key — that key *is* the
@@ -30,14 +32,22 @@ import duckdb
 
 from .config import settings
 
-def _mark_missing_optional_modules() -> None:
+MARKED_MISSING: list[str] = []
+
+
+def mark_missing_optional_modules() -> list[str]:
     """DuckDB's Python client tries `import pandas` for every bound
     parameter (2–8 times per query). When pandas is not installed each
     attempt walks all of sys.path again — failed imports are not cached —
     which cost 0.21 s of a 0.24 s workbench callback. Recording the
     module as absent (sys.modules[name] = None, the import system's own
     "known missing" marker) makes that check free. Only modules that
-    genuinely cannot be found are marked; an installed pandas is untouched."""
+    genuinely cannot be found are marked; an installed pandas is untouched.
+
+    A process-wide side effect, so it is opt-in: the server and the scan
+    call it at start-up (and the start-up banner says so) — importing
+    kpviz.db from a notebook or a tool changes nothing. Installing pandas
+    later in such a process needs a restart."""
     import importlib.util
     import sys
     for name in ("pandas", "polars", "pyarrow"):
@@ -49,11 +59,11 @@ def _mark_missing_optional_modules() -> None:
             missing = True
         if missing:
             sys.modules[name] = None
+            if name not in MARKED_MISSING:
+                MARKED_MISSING.append(name)
+    return MARKED_MISSING
 
-
-_mark_missing_optional_modules()
-
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Rebuilt on a schema change. `keyphrases` is deliberately absent: its shape
 # is tracked separately (KP_SCHEMA_VERSION) so a schema bump elsewhere never
@@ -65,7 +75,8 @@ _DERIVED_TABLES = [
 ]
 # v2: keyed per normalised phrase with the POS tag only (the token/stem
 # columns were never read); '' marks "tagged, no pattern"
-KP_SCHEMA_VERSION = 2
+# v3: keyed per (language, phrase)
+KP_SCHEMA_VERSION = 3
 
 _DDL = """
 CREATE SEQUENCE IF NOT EXISTS seq_file_id START 1;
@@ -81,13 +92,16 @@ CREATE TABLE IF NOT EXISTS files(
     scanned_at TIMESTAMP DEFAULT now()
 );
 
--- gold keyphrases for POS tagging: one row per normalised phrase; the
--- language (and surface form) is picked deterministically at merge time
+-- gold keyphrases for POS tagging: one row per (language, normalised
+-- phrase) — French "chat" and English "chat" are two phrases, tagged by two
+-- models, whatever order they were ingested in; the surface form is picked
+-- deterministically at merge time
 CREATE TABLE IF NOT EXISTS keyphrases(
-    kp       VARCHAR PRIMARY KEY,
+    lang     VARCHAR NOT NULL,
+    kp       VARCHAR NOT NULL,
     raw      VARCHAR,
-    lang     VARCHAR,
-    pos      VARCHAR
+    pos      VARCHAR,
+    PRIMARY KEY (lang, kp)
 );
 -- worker spills land here first, then one anti-join merges them
 CREATE TABLE IF NOT EXISTS kp_stage(
@@ -110,22 +124,29 @@ CREATE TABLE IF NOT EXISTS documents(
     flags      VARCHAR[]
 );
 
+-- src_off (gold, doc_tokens, gold_tokpos) is the byte offset of the source
+-- document line: when a collection repeats a document id, the first line is
+-- kept and the rows of the others are removed by it after ingest
 CREATE TABLE IF NOT EXISTS doc_tokens(
-    dataset VARCHAR NOT NULL, doc_id VARCHAR NOT NULL,
+    dataset VARCHAR NOT NULL, doc_id VARCHAR NOT NULL, src_off BIGINT,
     tokenizer VARCHAR NOT NULL,
     n_tokens INTEGER, approx BOOLEAN
 );
 
--- gold *instances*: eval-scope splits plus every quality-flagged document
+-- gold *instances*: eval-scope splits plus every quality-flagged document;
+-- one row per distinct stemmed keyphrase of an annotation set (duplicates
+-- and token-less keyphrases are counted per collection, not stored)
 CREATE TABLE IF NOT EXISTS gold(
     dataset VARCHAR NOT NULL, doc_id VARCHAR NOT NULL,
     ann_key VARCHAR NOT NULL, kp_idx INTEGER NOT NULL,
-    display VARCHAR,
+    src_off BIGINT,
+    display VARCHAR,         -- normal form (joins keyphrases.kp)
+    surface VARCHAR,         -- as annotated (first variant, spacing collapsed)
     stems   VARCHAR[],
     lang    VARCHAR,
     n_words INTEGER,
     prmu    VARCHAR,
-    -- where the earliest in-order occurrence ENDS: character offset in the
+    -- where the earliest contiguous occurrence ENDS: character offset in the
     -- original document text, and stemmed-token index (-1 when not present)
     end_char INTEGER,
     end_word INTEGER
@@ -139,7 +160,7 @@ CREATE TABLE IF NOT EXISTS gold_agg(
 );
 
 CREATE TABLE IF NOT EXISTS gold_tokpos(
-    dataset VARCHAR NOT NULL, doc_id VARCHAR NOT NULL,
+    dataset VARCHAR NOT NULL, doc_id VARCHAR NOT NULL, src_off BIGINT,
     ann_key VARCHAR NOT NULL, kp_idx INTEGER NOT NULL,
     tokenizer VARCHAR NOT NULL,
     tok_end INTEGER, approx BOOLEAN
@@ -182,6 +203,7 @@ CREATE TABLE IF NOT EXISTS matches(
     dataset VARCHAR NOT NULL, model VARCHAR NOT NULL,
     arch VARCHAR NOT NULL, run_id VARCHAR NOT NULL,
     doc_id VARCHAR NOT NULL, ann_key VARCHAR NOT NULL,
+    batch_idx INTEGER, byte_off BIGINT,   -- source line (duplicate policy)
     n_uniq INTEGER, n_gold INTEGER,
     pred_ranks INTEGER[],
     gold_idxs  INTEGER[]
@@ -455,8 +477,10 @@ def _colors_path() -> Path:
 def color_seq(scope: str, entities: list[str]) -> dict[str, int]:
     """Stable slot per entity: colour follows the entity, never its rank.
 
-    New entities take the next free slots *in sorted order*, so a fresh store
-    assigns the same slots whatever order the pages are opened in."""
+    Every scan assigns the whole catalog's models, groups and runs at once,
+    in sorted order (`naming.assign_all_slots`), so pages only read slots and
+    a fresh store gets the same colours whatever order pages are opened in.
+    An entity this has not seen yet takes the next free slot."""
     global _colors
     with _color_lock:
         if _colors is None:
@@ -488,27 +512,31 @@ _relpath_cache: dict[int, tuple] = {}
 
 def read_line(relpath_or_fileid, byte_off: int, byte_len: int) -> dict | None:
     """Read one JSON line in place. Returns None when the file is gone or has
-    changed since the scan (the offsets would then point into other data);
-    `line_status` says which."""
+    changed since the scan — by size *or* modification time, so a same-size
+    edit is caught too (the offsets would then point into other data).
+    Callers also compare the line's `_id` with the one they asked for."""
     st = settings()
-    size = None
+    size = mtime = None
     if isinstance(relpath_or_fileid, int):
         hit = _relpath_cache.get(relpath_or_fileid)
         if hit is None:
-            row = q1("SELECT relpath, size FROM files WHERE file_id=?",
+            row = q1("SELECT relpath, size, mtime FROM files WHERE file_id=?",
                      relpath_or_fileid)
             if not row:
                 return None
-            hit = (row[0], row[1])
+            hit = (row[0], row[1], row[2])
             if len(_relpath_cache) > 4096:
                 _relpath_cache.clear()
             _relpath_cache[relpath_or_fileid] = hit
-        rel, size = hit
+        rel, size, mtime = hit
     else:
         rel = relpath_or_fileid
     p = st.data_root / rel
     try:
-        if size is not None and p.stat().st_size != size:
+        stt = p.stat()
+        if size is not None and stt.st_size != size:
+            return None
+        if mtime is not None and abs(stt.st_mtime - float(mtime)) > 1e-3:
             return None
         with open(p, "rb") as f:
             f.seek(byte_off)

@@ -1,6 +1,8 @@
 # KPViz performance plan: memory, parallel workers, efficiency, latency
 
-Status: **revision 4**, 27 Sep 2026, 16 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements.
+Status: **revision 5**, 28 Sep 2026, 15 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements; Section 6.7 answers the second review round (evaluation semantics, statistics, export, state) finding by finding.
+
+**Identifiers.** This plan's own action IDs (A1, C13, E1 …) collide with the reviews' finding IDs (the review's E1 is present/absent scoring, this plan's E1 is the memory budget). From revision 5 on, cross-references say which is meant: **P-E1** for a plan action, **R2-N1** for `REVIEW-2.md`, **RV-R01** for the revised-review report, **RC1–RC4** for the four commit notes.
 
 This plan covers everything that affects how fast KPViz responds, how much memory it holds, and how well it uses the machine's cores, from the first scan to the last click of the demo. Each action names the code it touches, how to change it, the measured reason for it, and the check that closes it.
 
@@ -985,7 +987,7 @@ Status: **done** = implemented and verified on this branch; **partial** = the pa
 | D15 | Scan lock + cancel points | 1 | — | done | `test_concurrent_start_starts_one_scan` |
 | D16 | Compaction | after | D14 | open | — |
 | D17 | Scan DuckDB budget | 2 | A2 | done | `config.duckdb_memory_bytes` |
-| E1 | Memory budget | 2 | C4 | done | 391 MB after the full probe (Section 2.1 model) |
+| E1 | Memory budget | 2 | C4 | partial | 391 MB after the full probe without TeX; 439 MB with the TeX probe loaded (target 400 MB missed in that case, Section 0.1); the result cache now charges non-array values by estimated size (R2-N7) |
 | E2 | Export cache in bytes, caption-free key | 2 | — | done | `test_caption_edit_does_not_rerender` |
 | E3 | No large transients | 2 | C3 | partial | by construction; a `tracemalloc` check is open |
 | F1 | Export process | 4 | — | open | — |
@@ -1089,6 +1091,45 @@ Verified on the authors' own cards (7 models, 3 architectures, 51,825 similarity
 
 Measured on this machine (cold scan, fresh process): the authors' card tree 11.3 s (no-op re-scan 0.14 s), peak 783 MB; workbenches cold (result cache cleared) RQ1 0.27 s · RQ2 0.48 s (its 51 k-pair similarity join included, then memoised) · RQ3 0.14–0.21 s · RQ4 0.12 s · RQ5 0.10 s; warm ≤ 0.19 s. The 296 MB synthetic tree: 24.2 s cold (25.9 s in revision 3), no-op 0.21 s. Derived tables are byte-identical before and after every change in this pass (`fingerprint.py`).
 
+### 6.7 Revision 5: the second review round
+
+The second round (`REVIEW-2.md`, the revised-review report and four commit notes) moved the weak point from speed to the scientific contract. The authors also fixed the PRMU definition: **P** when a keyphrase's stemmed tokens occur contiguously, in order, in the stemmed document; **R** when all of them occur; **M** when some do; **U** when none do. Everything below is a *correctness fix* in the sense of this plan (numbers change on purpose); `_CODE_REV` is 13, the derivation hash also covers the spaCy/PyStemmer versions, and `SCHEMA_VERSION` is 6, so every store re-derives once.
+
+| Finding | Fix | Check |
+|---|---|---|
+| User definition; R2-E2, RV-R04: P was an in-order chain | `textproc.contiguous_end` (anchored on the keyphrase's rarest stem), `StemmedDoc` with segments: a P occurrence stays inside one section and does not cross a separating punctuation mark; infix marks (e-commerce) are transparent. Guide, README, captions and RQ3 now say "contiguous" | `test_evaluation.test_contiguous_prmu_unit_cases` (gap, reversed, separator, sections, repeats, variants) |
+| R2-N3/E5: captions claimed de-duplicated gold | gold de-duplicated per annotation set by stemmed identity, token-less gold dropped, `kp_idx` renumbered; counted as `gold_duplicates` / `gold_empty` collection issues | `test_evaluation` (hand-worked oracle from raw JSON to P/R) |
+| R2-N16, R2-E7, RV-R03: duplicate documents and prediction lines | one row per (dataset, document) and per (run, document) after ingest — first line wins (`_dedup_documents`, `_dedup_predictions`), counted as `duplicate_doc_ids` / `duplicate_docs`; the filtered gold CTE counts distinct gold; `PerDoc` arrays are unique and read-only; `paired` re-indexes results from different catalog versions | reviewer's `dup_fixture.py`: filtered = unfiltered on the duplicated document, RQ3 renders; `test_evaluation.test_run_tags_count_repeats_and_unscored` |
+| R2-E8: coverage measured over a training split; unscored predictions invisible | coverage over the majority *evaluation* split; `unscored:n` tag | oracle test |
+| RV-E08: `C++` split into "C"; greedy matching with overlapping alternatives | a lone `+` between two characters separates variants; augmenting-path matching (maximum, earliest ranks) when alternatives overlap, greedy otherwise | `test_overlapping_alternatives_get_a_maximum_matching`, `test_variant_separator_keeps_plus_signs_in_names` |
+| RV-R01: t-intervals clipped to the sample's min/max | intervals intersected only with the metric's [0, 1], stated in the caption | `test_intervals_are_not_clipped_to_the_sample` |
+| RV-R02: macro interval dropped singleton datasets; bootstrap streams coupled by values | unavailable (not re-targeted) when a dataset has < 2 documents; one RNG over a canonical dataset order | `test_macro_interval_keeps_its_estimand_and_independence` |
+| RV-R11, R2-W3: continuity correction past the null centre; asymptotic small-n rank tests; perfect ρ with 3 systems had p = 0; silent truncation of unequal pairs; no sphericity correction | continuity toward the centre only; exact Wilcoxon/Mann–Whitney without ties up to 50; exact permutation Spearman/Kendall up to 9 systems; `UnalignedError`; Greenhouse–Geisser ε for RM-ANOVA | `test_rank_tests_at_the_null_centre_and_small_n`, `test_paired_inputs_must_be_aligned`, ANOVA test vs orthonormal-contrast ε |
+| R2-N4: resampling p floored at 1/(R+1) under Holm | normal limit of the sign-flip / bootstrap statistic from 200 documents; floor stated in the methods sentence below that | `test_resampling_is_reproducible_and_calibrated` |
+| R2-N17: RQ5 two-value rows labelled with Friedman/Kendall's W | results carry the test and effect actually used; per-row effect symbol; methods clause from the paired test | `test_two_value_multi_names_the_paired_test` |
+| R2-W4, RV RQ5: best run per value, datasets changing along the curve | controlled sweeps (one series per fixed configuration, replicates averaged) by default, the best-run envelope as a labelled alternative; macro curve only at values present on every dataset of the series; means over the matched cohort the test uses; no dagger on the "winning" value | `test_rq5_controlled_sweep_and_envelope` |
+| R2-W5/W6, RV RQ3: rescoring called truncation; cohorts differed; score-dependent binning; tail dropped | "gold eligibility" wording; both bars over the matched documents; bins cut at length changes only, last short bin merged; observational wording for panel (b) | UI tests; `_length_bins` keeps all documents |
+| R2-N14: reserved tokens | `reserved_tokens` (run parameter, or on the card's context-window parameter) subtracted from the window, shown in the table | — |
+| RV-R05: special-token offsets; Unicode offsets | content-token ends with their full-encoding positions; cluster-by-cluster normalisation with an exact offset map | `test_special_tokens_never_give_impossible_positions`, `test_normalisation_alignment_is_exact` |
+| RV-R09: tokenizer identity and offline behaviour | fingerprint over the asset's content and the backend version; tokenizers re-resolved every scan; offline tiktoken reads its cache (downloads refused); a worker that cannot load a parent-certified exact asset fails the scan | `test_tokenizer_fingerprint_follows_the_asset_bytes`, `test_offline_tiktoken_reads_a_cached_encoding` |
+| RV-R10: phrase/POS cache keyed by phrase only | `keyphrases` keyed by (language, phrase); POS joins by both | — |
+| RV-R06, R2-W9: partial costs on the frontier | first *complete* observation level wins; partial costs and incomplete coverage drawn faded, excluded from the frontier; zero cost not placed on a log axis; one number format per column | UI tests |
+| R2-N1, RC1 §1, RV-R07: computing on a half-written catalog; stale tabs | `catalog_unavailable()` pauses workbenches and exports while a scan writes and after a failed/cancelled one (banner says why); every RQ listens to `catalog-version`; `buildcheck.js` pushes a newer catalog version or a running scan into every open tab | `test_scan_in_progress_pauses_workbenches` |
+| R2-N2/X8: `\` and lone `$` broke PGF and disabled TeX | escaped once (`\textdollar`, since Matplotlib unescapes `\$`); failures cached per figure; other engines tried; demotion only when the probe figure also fails | `test_tex_specials_in_labels_typeset`, `test_figure_failure_does_not_demote_the_engine`, reviewer's `tex_labels.py` |
+| R2-N15, RV-R08: PDF during the probe stalled 120 s | engine resolved before the render lock and part of the cache key; provisional fallbacks not cached | `test_pdf_during_probe_never_waits_on_the_render_lock`; reviewer's `probe_race.py`: 2.1 s |
+| R2-N5, RV-X7: names and README disagreed; no provenance | `export_name()` for snippet, buttons and bundle; README states the engine used and why a .pgf is missing; `provenance.json` (code/schema/catalog versions, input fingerprint) | `test_snippet_download_and_bundle_agree_on_names`; reviewer's `export_check.py` |
+| RC4 §4: export bars on Insights only | Datasets and Models figures carry the same export bar (`ui.exportable`) | Datasets specs render through PGF |
+| R2-N6: leaving a page woke its callbacks | visibility is a State; a `shown-*` counter bumped on show is the Input | UI tests (signatures) |
+| R2-N7/N8/N9/N10/N11/N12/N13, R2-U2/U3/U5, RV accessibility | memo charges estimated sizes; colour slots assigned at finalize; runs of one model shaded (lightness + dash); RQ4 labels frontier points, merges coincident ones; RQ5 tests first; natural sort + paging in SQL; wording/banners; Dash 4 CSS variables; single-hue PRMU; ordinal value order; muted text 5.9:1, primary button 6.6:1, keyboard rows, bound labels, focus rings | — |
+| R2-D9, R2-G9, RV-E10 validation, RV raw text | `optional` sections not flagged; a failing chunk names its file and byte range; card defaults, numeric value sets and unknown types validated; `read_line` checks size *and* mtime, the inspector checks the `_id` and says when a source changed | — |
+| RV U03/R2-U9: inspector did not explain a score | "Explain a run's score": ranked predictions ✓/✗ with the gold each matched, duplicates, missed gold, P/R/F1 at every k | `test_inspector_explains_a_runs_score` |
+| RC3 §3.2: nl/ru got stems but no language vote | stop-word sets for nl and ru; POS model names for both | — |
+| RC1 #6: pandas marked absent at import | opt-in `db.mark_missing_optional_modules()`, called by the server and the scan, reported in the banner | — |
+| R2-C1: Table 2 benchmarked copied code | `kpviz_scaling_benchmark.py` times the shipped `kpviz.textproc` path as a fourth column, and every PRMU column uses the contiguous definition; output in `docs/scaling_benchmark_quick.txt` | — |
+| R2-G5, RC2, RV M02: no CI, stale harnesses, loose pins | `.github/workflows/tests.yml` (TeX with publisher classes, pyflakes, pytest with skips reported); superseded `tools/test_*` removed, benches under `tools/bench/`; `constraints.txt` pins the tested environment; SciPy is a required test dependency | CI |
+
+Still open, deliberately: atomic scan generations (P-D14 full; the gate above is the honest interim), an export worker process (P-F1), a padded-P@k / Porter stemmer option (R2-E3/E4), a `missing_docs` policy (R2-E6), present/absent on the prediction side (R2-E1 — disclosed in every caption), JSON Schemas (R2-D6), and URL state (R2-U12).
+
 ---
 
 ## 7. How to reproduce
@@ -1096,9 +1137,8 @@ Measured on this machine (cold scan, fresh process): the authors' card tree 11.3
 Every script below is in the repository.
 
 ```bash
-pip install -r requirements.txt
-pip install pytest psutil playwright
-playwright install chromium        # or pass --chromium PATH to probe_ui.py
+pip install -r requirements-dev.txt -c constraints.txt
+pip install playwright && playwright install chromium   # or pass --chromium PATH to probe_ui.py
 
 python -m pytest tests             # contract, parity, determinism, UI
 

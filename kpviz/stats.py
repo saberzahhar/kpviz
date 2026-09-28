@@ -1,8 +1,11 @@
 """Dependency-free statistical tests for the insight workbenches.
 
-Both tests use the normal approximation with tie correction (and, for
-Wilcoxon, zero-difference exclusion). They are two-sided. Below the
-minimum sample size they return None rather than a misleading p-value.
+Rank tests are exact for small samples without ties (Wilcoxon signed-rank
+n ≤ 50, Mann–Whitney n1 + n2 ≤ 50, Spearman and Kendall n ≤ 9 systems) and
+use the normal approximation with tie correction and a continuity
+correction that never moves the statistic past the null centre otherwise.
+All are two-sided. Below the minimum sample size, or on unaligned or
+non-finite input, they return None rather than a misleading p-value.
 
 Marking convention: a single dagger † at the significance level the reader
 picks (Insights → significance level), written into every caption.
@@ -63,10 +66,79 @@ def _norm_sf(z: float) -> float:
     return 0.5 * math.erfc(z / math.sqrt(2.0))
 
 
+EXACT_MAX_N = 50        # exact rank distributions up to this many items
+
+
+class UnalignedError(ValueError):
+    """Paired samples of different lengths: pairing must be explicit."""
+
+
+def _pair(x, y):
+    """Aligned paired arrays; unequal lengths are a caller error, never a
+    silent truncation."""
+    a, b = _arr(x), _arr(y)
+    if len(a) != len(b):
+        raise UnalignedError(f"paired samples differ in length ({len(a)} vs {len(b)})")
+    return a, b
+
+
+def _finite(*arrays) -> bool:
+    return all(bool(_np.isfinite(a).all()) for a in arrays)
+
+
+@functools.lru_cache(maxsize=256)
+def _signed_rank_cdf(n: int) -> tuple:
+    """Exact null distribution of the Wilcoxon W+ for n untied, non-zero
+    differences, as cumulative probabilities (counts of subsets of 1..n by
+    sum, a knapsack over the ranks)."""
+    top = n * (n + 1) // 2
+    c = [0] * (top + 1)
+    c[0] = 1
+    for r in range(1, n + 1):
+        for s_ in range(top, r - 1, -1):
+            c[s_] += c[s_ - r]
+    tot = float(2 ** n)
+    out, acc = [], 0
+    for v in c:
+        acc += v
+        out.append(acc / tot)
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=512)
+def _mw_cdf(n1: int, n2: int) -> tuple:
+    """Exact null distribution of U for untied samples (Gaussian binomial
+    coefficients by the recurrence c(m, n, u) = c(m-1, n, u-n) + c(m, n-1, u))."""
+    prev = [[1]] + [[1] for _ in range(n2)]          # m = 0: U = 0 only
+    for m in range(1, n1 + 1):
+        cur = [[1]]                                   # n = 0: U = 0 only
+        for n in range(1, n2 + 1):
+            a, b = prev[n], cur[n - 1]
+            size = m * n + 1
+            row = [0] * size
+            for u, v in enumerate(b):
+                row[u] += v
+            for u, v in enumerate(a):
+                if u + n < size:
+                    row[u + n] += v
+            cur.append(row)
+        prev = cur
+    counts = prev[n2]
+    tot = float(sum(counts))
+    out, acc = [], 0
+    for v in counts:
+        acc += v
+        out.append(acc / tot)
+    return tuple(out)
+
+
 def mann_whitney_u(x: list[float], y: list[float]) -> tuple[float | None, float | None]:
-    """Two-sided Mann–Whitney U (independent samples). Returns (U, p)."""
+    """Two-sided Mann–Whitney U (independent samples). Returns (U, p);
+    exact without ties up to n1 + n2 = EXACT_MAX_N."""
     n1, n2 = len(x), len(y)
     if n1 < MIN_N or n2 < MIN_N:
+        return None, None
+    if _np is not None and not _finite(_arr(x), _arr(y)):
         return None, None
     if _np is not None:
         both = _np.concatenate((_np.asarray(x, dtype=float),
@@ -79,18 +151,28 @@ def mann_whitney_u(x: list[float], y: list[float]) -> tuple[float | None, float 
     u = min(u1, n1 * n2 - u1)
     mu = n1 * n2 / 2
     n = n1 + n2
+    if tie_term == 0 and n <= EXACT_MAX_N:
+        cdf = _mw_cdf(min(n1, n2), max(n1, n2))
+        return u, min(1.0, 2 * cdf[int(round(u))])
     sigma2 = n1 * n2 / 12 * ((n + 1) - tie_term / (n * (n - 1)))
     if sigma2 <= 0:
         return u, 1.0
-    z = (u - mu + 0.5) / math.sqrt(sigma2)      # continuity correction
-    p = 2 * _norm_sf(abs(z))
+    # continuity correction towards the centre, never past it
+    z = max(0.0, abs(u - mu) - 0.5) / math.sqrt(sigma2)
+    p = 2 * _norm_sf(z)
     return u, min(1.0, p)
 
 
 def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float | None, float | None]:
-    """Two-sided paired Wilcoxon signed-rank on aligned samples. (W, p)."""
+    """Two-sided paired Wilcoxon signed-rank on aligned samples. (W, p).
+    Zero differences are dropped (Wilcoxon's convention); exact without
+    ties up to EXACT_MAX_N differences."""
+    if len(x) != len(y):
+        raise UnalignedError(f"paired samples differ in length ({len(x)} vs {len(y)})")
+    if _np is not None and not _finite(_arr(x), _arr(y)):
+        return None, None
     if _np is not None and len(x) > 256:
-        d = _np.asarray(x, dtype=float)[:len(y)] - _np.asarray(y, dtype=float)[:len(x)]
+        d = _np.asarray(x, dtype=float) - _np.asarray(y, dtype=float)
         d = d[d != 0]
         n = len(d)
         if n < MIN_N:
@@ -109,11 +191,15 @@ def wilcoxon_signed_rank(x: list[float], y: list[float]) -> tuple[float | None, 
         w_neg = sum(r for r, d in zip(ranks, diffs) if d < 0)
     w = min(w_pos, w_neg)
     mu = n * (n + 1) / 4
+    if tie_term == 0 and n <= EXACT_MAX_N:
+        return w, min(1.0, 2 * _signed_rank_cdf(n)[int(round(w))])
     sigma2 = n * (n + 1) * (2 * n + 1) / 24 - tie_term / 48
     if sigma2 <= 0:
         return w, 1.0
-    z = (w - mu + 0.5) / math.sqrt(sigma2)
-    p = 2 * _norm_sf(abs(z))
+    # continuity correction towards the centre, never past it: balanced
+    # differences give z = 0 and p = 1 (as SciPy's corrected statistic)
+    z = max(0.0, abs(w - mu) - 0.5) / math.sqrt(sigma2)
+    p = 2 * _norm_sf(z)
     return w, min(1.0, p)
 
 
@@ -412,7 +498,8 @@ def norm_ppf(q: float) -> float:
 
 def paired_t(x, y):
     """Two-sided paired t-test on aligned samples. (t, p, Cohen's d_z)."""
-    d = _arr(x)[:len(y)] - _arr(y)[:len(x)]
+    a, b = _pair(x, y)
+    d = a - b
     n = len(d)
     if n < MIN_N:
         return None, None, None
@@ -444,7 +531,11 @@ def welch_t(x, y):
 
 def rm_anova(groups):
     """One-way repeated-measures ANOVA over k paired groups (rows = blocks).
-    (F, p, partial η²)."""
+    (F, p, partial η²). The p-value is Greenhouse–Geisser corrected: the
+    degrees of freedom are scaled by ε̂, estimated from the double-centred
+    covariance of the conditions, so a violation of sphericity (unequal
+    variances of the pairwise differences) does not inflate significance.
+    ε̂ = 1 under sphericity, and for k = 2 always."""
     k = len(groups)
     if k < 2 or any(len(g) != len(groups[0]) for g in groups):
         return None, None, None
@@ -462,26 +553,43 @@ def rm_anova(groups):
         return (math.inf if ss_cond > 0 else 0.0,
                 0.0 if ss_cond > 0 else 1.0, 1.0 if ss_cond > 0 else 0.0)
     F = (ss_cond / df1) / (ss_err / df2)
-    return F, f_sf(F, df1, df2), ss_cond / (ss_cond + ss_err)
+    eps = 1.0
+    if k > 2:
+        S = _np.cov(X, rowvar=False)
+        S = S - S.mean(axis=0) - S.mean(axis=1)[:, None] + S.mean()
+        tr2 = float(_np.trace(S @ S))
+        if tr2 > 0:
+            eps = min(1.0, max(1.0 / (k - 1), float(_np.trace(S)) ** 2 / ((k - 1) * tr2)))
+    return F, f_sf(F, df1 * eps, df2 * eps), ss_cond / (ss_cond + ss_err)
 
 
 # ---- resampling ------------------------------------------------------------
+
+ASYMPTOTIC_N = 200     # resampling tests switch to their normal limit here
+
 
 def paired_permutation(x, y, resamples: int = RESAMPLES, seed: int | None = None):
     """Two-sided paired permutation test (random sign flips of the per-item
     differences) on the mean difference — the approximate randomisation test
     of the NLP literature, at the document level. (mean diff, p).
 
-    p = (1 + #{|T*| ≥ |T|}) / (R + 1), so it is never 0 and its resolution
-    is 1/(R+1). Sign matrices are generated in bit-packed chunks and applied
-    with one matrix product per chunk."""
-    d = _arr(x)[:len(y)] - _arr(y)[:len(x)]
+    Below ASYMPTOTIC_N documents: Monte Carlo, p = (1 + #{|T*| ≥ |T|}) /
+    (R + 1), so it is never 0 and its resolution is 1/(R+1). From
+    ASYMPTOTIC_N on: the sign-flip statistic Σ±dᵢ is a sum of independent
+    terms with variance Σdᵢ², so p = 2Φ(−|Σdᵢ|/√Σdᵢ²) — what the Monte Carlo
+    estimate converges to, without its 1/(R+1) floor (which made Holm-
+    adjusted p unreachable below α = 0.01 with a dozen tests)."""
+    a, b = _pair(x, y)
+    d = a - b
     n = len(d)
-    if n < MIN_N:
+    if n < MIN_N or not _finite(d):
         return None, None
     obs = float(d.sum())
     if not d.any():
         return 0.0, 1.0
+    if n >= ASYMPTOTIC_N:
+        ss = float((d * d).sum())
+        return obs / n, min(1.0, 2 * _norm_sf(abs(obs) / math.sqrt(ss)))
     rng = _np.random.default_rng(data_seed(d) if seed is None else seed)
     d32 = d.astype(_np.float32)
     tot = float(d32.sum())
@@ -553,7 +661,8 @@ def paired_bootstrap(x, y, level: float = CI_LEVEL, resamples: int = RESAMPLES,
     """Paired bootstrap of the mean difference: documents are resampled
     together, so both systems see the same resample. Two-sided p from the
     centred bootstrap distribution. (diff, p, lo, hi)."""
-    d = _arr(x)[:len(y)] - _arr(y)[:len(x)]
+    a, b = _pair(x, y)
+    d = a - b
     n = len(d)
     if n < MIN_N:
         return None, None, None, None
@@ -568,17 +677,25 @@ def paired_bootstrap(x, y, level: float = CI_LEVEL, resamples: int = RESAMPLES,
 
 def two_sample_bootstrap(x, y, level: float = CI_LEVEL,
                          resamples: int = RESAMPLES, seed: int | None = None):
-    """Independent groups: each resampled on its own. (diff, p, lo, hi)."""
+    """Independent groups: each resampled on its own. (diff, p, lo, hi).
+    From ASYMPTOTIC_N documents per group the p-value is the bootstrap's
+    normal limit, 2Φ(−|Δ|/SE) with SE² = s₁²/n₁ + s₂²/n₂ (no 1/(R+1) floor);
+    the interval stays the percentile bootstrap."""
     a, b = _arr(x), _arr(y)
-    if len(a) < MIN_N or len(b) < MIN_N:
+    if len(a) < MIN_N or len(b) < MIN_N or not _finite(a, b):
         return None, None, None, None
     rng = _np.random.default_rng(data_seed(a, b) if seed is None else seed)
     m = _boot_means(a, resamples, rng) - _boot_means(b, resamples, rng)
     obs = float(a.mean() - b.mean())
-    hits = int((_np.abs(m - obs) >= abs(obs) - 1e-12).sum())
+    if min(len(a), len(b)) >= ASYMPTOTIC_N:
+        se = math.sqrt(float(a.var(ddof=1)) / len(a) + float(b.var(ddof=1)) / len(b))
+        p = 1.0 if se == 0 and obs == 0 else (
+            0.0 if se == 0 else min(1.0, 2 * _norm_sf(abs(obs) / se)))
+    else:
+        hits = int((_np.abs(m - obs) >= abs(obs) - 1e-12).sum())
+        p = (hits + 1) / (resamples + 1)
     al = (1 - level) / 2
-    return (obs, (hits + 1) / (resamples + 1),
-            float(_np.quantile(m, al)), float(_np.quantile(m, 1 - al)))
+    return (obs, p, float(_np.quantile(m, al)), float(_np.quantile(m, 1 - al)))
 
 
 # ---- effect sizes ----------------------------------------------------------
@@ -586,7 +703,8 @@ def two_sample_bootstrap(x, y, level: float = CI_LEVEL,
 def rank_biserial_paired(x, y) -> float | None:
     """Matched-pairs rank-biserial correlation: (W+ − W−)/(W+ + W−), in
     [−1, 1]; positive when x tends to exceed y."""
-    d = _arr(x)[:len(y)] - _arr(y)[:len(x)]
+    a, b = _pair(x, y)
+    d = a - b
     d = d[d != 0]
     if not len(d):
         return 0.0 if len(x) else None
@@ -651,15 +769,16 @@ def adjust_p(pvals: list, method: str = "holm") -> list:
 # ---- correlation -----------------------------------------------------------
 
 def pearson(a, b):
-    """(r, p, lo, hi): two-sided t-test p and a Fisher-z 95 % interval."""
+    """(r, p, lo, hi): two-sided t-test p (exact under bivariate normality)
+    and a Fisher-z 95 % interval; no interval when |r| = 1."""
     x, y = _arr(a), _arr(b)
     n = len(x)
-    if n < 3 or x.std() == 0 or y.std() == 0:
+    if n < 3 or len(y) != n or not _finite(x, y) or x.std() == 0 or y.std() == 0:
         return None, None, None, None
     r = float(_np.corrcoef(x, y)[0, 1])
     r = max(-1.0, min(1.0, r))
     if abs(r) >= 1.0:
-        return r, 0.0, r, r
+        return r, 0.0, None, None
     t = r * math.sqrt((n - 2) / (1 - r * r))
     p = min(1.0, 2 * t_sf(abs(t), n - 2))
     lo = hi = None
@@ -670,31 +789,76 @@ def pearson(a, b):
     return r, p, lo, hi
 
 
+EXACT_PERM_N = 9      # correlations over ≤ 9 systems: all n! orderings
+
+
+@functools.lru_cache(maxsize=16)
+def _perms(n: int):
+    import itertools
+    return _np.array(list(itertools.permutations(range(n))), dtype=_np.int8)
+
+
+def _exact_perm_p(x, y, stat) -> float:
+    """Two-sided exact permutation p of a correlation statistic: the share
+    of the n! pairings of y with x whose |statistic| reaches the observed
+    one (ties handled by the statistic itself)."""
+    obs = abs(stat(x, y))
+    P = _perms(len(x))
+    hits = 0
+    for perm in P:
+        v = stat(x, y[perm])
+        if abs(v) >= obs - 1e-12:
+            hits += 1
+    return hits / len(P)
+
+
+def _spearman_r(x, y) -> float:
+    rx = _np.asarray(_rankdata(x)[0], dtype=float)
+    ry = _np.asarray(_rankdata(y)[0], dtype=float)
+    sx, sy = rx.std(), ry.std()
+    if sx == 0 or sy == 0:
+        return 0.0
+    return float(((rx - rx.mean()) * (ry - ry.mean())).mean() / (sx * sy))
+
+
 def spearman(a, b):
-    """(ρ, p, lo, hi): Pearson on average ranks; t-approximation p and a
-    Fisher-z interval with the Bonett–Wright variance (1.06/(n−3))."""
+    """(ρ, p, lo, hi): Pearson on average ranks. Up to EXACT_PERM_N systems
+    the p-value is exact (all n! pairings — with 3 systems a perfect ρ has
+    p = 1/3, not 0); above it, the t-approximation. The interval is Fisher-z
+    with the Bonett–Wright variance (1.06/(n−3)), and absent when |ρ| = 1
+    or n ≤ 3 (it would be a point)."""
     x, y = _arr(a), _arr(b)
     n = len(x)
-    if n < 3:
+    if n < 3 or len(y) != n or not _finite(x, y) or x.std() == 0 or y.std() == 0:
         return None, None, None, None
     rx = _np.asarray(_rankdata(x)[0], dtype=float)
     ry = _np.asarray(_rankdata(y)[0], dtype=float)
     r, p, _lo, _hi = pearson(rx, ry)
-    if r is None or n <= 3 or abs(r) >= 1:
-        return r, p, r if r is not None and abs(r) >= 1 else None, \
-            r if r is not None and abs(r) >= 1 else None
+    if r is None:
+        return None, None, None, None
+    if n <= EXACT_PERM_N:
+        p = _exact_perm_p(x, y, _spearman_r)
+    if n <= 3 or abs(r) >= 1:
+        return r, p, None, None
     z, se = math.atanh(r), math.sqrt(1.06 / (n - 3))
     q = norm_ppf(1 - (1 - CI_LEVEL) / 2)
     return r, p, math.tanh(z - q * se), math.tanh(z + q * se)
 
 
 def kendall_tau_b(a, b):
-    """(τ_b, p): Kendall's τ-b with ties; normal-approximation p with the
-    tie-corrected variance. O(n²) — n is a number of systems here."""
+    """(τ_b, p): Kendall's τ-b with ties. Up to EXACT_PERM_N systems the
+    p-value is exact (all n! pairings); above, the normal approximation with
+    the tie-corrected variance. O(n²) — n is a number of systems here."""
     x, y = list(map(float, a)), list(map(float, b))
     n = len(x)
-    if n < 3:
+    if n < 3 or len(y) != n or not all(map(math.isfinite, x + y)):
         return None, None
+    if n <= EXACT_PERM_N:
+        tau = _tau_b(x, y)
+        if tau is None:
+            return None, None
+        xa, ya = _arr(x), _arr(y)
+        return tau, _exact_perm_p(xa, ya, lambda u, v: _tau_b(list(u), list(v)) or 0.0)
     conc = disc = tx = ty = 0
     for i in range(n):
         for j in range(i + 1, n):
@@ -734,6 +898,26 @@ def kendall_tau_b(a, b):
     return tau, min(1.0, 2 * _norm_sf(abs(z)))
 
 
+def _tau_b(x, y) -> float | None:
+    n = len(x)
+    conc = disc = tx = ty = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx, dy = x[i] - x[j], y[i] - y[j]
+            if dx == 0 and dy == 0:
+                continue
+            if dx == 0:
+                tx += 1
+            elif dy == 0:
+                ty += 1
+            elif (dx > 0) == (dy > 0):
+                conc += 1
+            else:
+                disc += 1
+    denom = math.sqrt((conc + disc + tx) * (conc + disc + ty))
+    return (conc - disc) / denom if denom else None
+
+
 def kendall_ci(tau, n):
     """Fisher-z interval for Kendall's τ with the Fieller–Hartley–Pearson
     variance 0.437/(n−4)."""
@@ -764,69 +948,106 @@ class StatsCfg:
     def key(self):
         return (self.alpha, self.family, self.adjust, self.ci, self.resamples)
 
-    def test_name(self, design: str) -> str:
-        return FAMILIES[self.family][("paired", "indep", "multi").index(design)]
+    def test_name(self, design: str, n: int | None = None) -> str:
+        """The test a design runs under this family; with the sample size,
+        the variant actually used (resampling tests switch to their normal
+        limit from ASYMPTOTIC_N documents)."""
+        name = FAMILIES[self.family][("paired", "indep", "multi").index(design)]
+        if (self.family == "resample" and design in ("paired", "indep")
+                and n is not None and n >= ASYMPTOTIC_N):
+            name += " (normal limit)"
+        if self.family == "mean" and design == "multi":
+            name += ", Greenhouse–Geisser corrected"
+        return name
 
     def effect_name(self, design: str) -> str:
         return EFFECTS[self.family][("paired", "indep", "multi").index(design)]
 
+    # P, R and F1 live in [0, 1]: that parameter space — known, not taken
+    # from the sample — is the only thing an interval is intersected with
+    BOUNDS = (0.0, 1.0)
+
+    def _bound(self, lo, hi):
+        if lo is None or hi is None:
+            return lo, hi
+        b0, b1 = self.BOUNDS
+        return max(lo, b0), min(hi, b1)
+
     def mean_ci(self, x):
-        """Interval for a mean score. A t-interval can leave the range the
-        scores live in (F1 below 0 for a handful of documents); it is
-        clipped to the observed range — a bootstrap never leaves it."""
+        """Interval for a mean score: the Student-t or percentile-bootstrap
+        interval as computed, intersected with the metric's range [0, 1]
+        (a t-interval for a handful of documents can reach below 0).
+        Never clipped to the observed sample's extremes."""
         if self.ci == "none" or x is None or len(x) < 2:
             return None, None
-        if self.ci == "bootstrap":
-            return bootstrap_ci(x, resamples=self.resamples)
-        lo, hi = t_ci(x)
         v = _arr(x)
-        return max(lo, float(v.min())), min(hi, float(v.max()))
+        if not _finite(v):
+            return None, None
+        if self.ci == "bootstrap":
+            return self._bound(*bootstrap_ci(v, resamples=self.resamples))
+        return self._bound(*t_ci(v))
 
     def macro_ci(self, arrays):
-        """Interval for the macro-average of per-dataset means (datasets are
-        independent samples of documents). t: Welch–Satterthwaite degrees
-        of freedom; bootstrap: each dataset resampled on its own, the macro
-        mean taken per resample. One array reduces to mean_ci."""
-        arrays = [_arr(a) for a in arrays if a is not None and len(a) > 1]
+        """Interval for the macro-average of per-dataset means — the same
+        estimand as the plotted point: every dataset given, equal weights.
+        Datasets are treated as fixed strata, documents as the sampled
+        units. If any dataset cannot support a variance estimate (fewer
+        than two documents) the interval is unavailable (None, None) rather
+        than an interval for a different average.
+
+        t: Welch–Satterthwaite degrees of freedom. Bootstrap: every dataset
+        resampled on its own from one random stream — datasets are put in a
+        canonical order first, so the result does not depend on the order
+        they were passed in, and two datasets with identical scores still
+        get independent resamples."""
+        arrays = [None if a is None else _arr(a) for a in arrays]
         if self.ci == "none" or not arrays:
+            return None, None
+        if any(a is None or len(a) < 2 or not _finite(a) for a in arrays):
             return None, None
         if len(arrays) == 1:
             return self.mean_ci(arrays[0])
         D = len(arrays)
         m = sum(float(a.mean()) for a in arrays) / D
         if self.ci == "bootstrap":
-            boots = [_boot_means(a, self.resamples,
-                                 _np.random.default_rng(data_seed(a)))
-                     for a in arrays]
-            mm = sum(boots) / D
+            keyed = sorted(arrays, key=lambda a: (data_seed(a), len(a)))
+            rng = _np.random.default_rng(data_seed(*keyed, D))
+            mm = sum(_boot_means(a, self.resamples, rng) for a in keyed) / D
             al = (1 - CI_LEVEL) / 2
-            return float(_np.quantile(mm, al)), float(_np.quantile(mm, 1 - al))
+            return self._bound(float(_np.quantile(mm, al)),
+                               float(_np.quantile(mm, 1 - al)))
         parts = [float(a.var(ddof=1)) / len(a) / D ** 2 for a in arrays]
         se2 = sum(parts)
         if se2 <= 0:
             return m, m
         df = se2 ** 2 / sum(p * p / (len(a) - 1) for p, a in zip(parts, arrays))
         half = t_ppf(1 - (1 - CI_LEVEL) / 2, df) * math.sqrt(se2)
-        lo_b = sum(float(a.min()) for a in arrays) / D
-        hi_b = sum(float(a.max()) for a in arrays) / D
-        return max(m - half, lo_b), min(m + half, hi_b)
+        return self._bound(m - half, m + half)
 
     def ci_text(self) -> str:
         if self.ci == "none":
             return ""
         if self.ci == "bootstrap":
             return (f"{int(CI_LEVEL * 100)} % percentile-bootstrap intervals "
-                    f"({self.resamples:,} resamples of documents)")
-        return f"{int(CI_LEVEL * 100)} % Student-t intervals"
+                    f"({self.resamples:,} resamples of documents), "
+                    "intersected with [0, 1]")
+        return (f"{int(CI_LEVEL * 100)} % Student-t intervals, intersected "
+                "with [0, 1]")
 
     def paired(self, x, y) -> dict:
-        """x vs y on the same documents: {'p', 'effect', 'diff', 'lo', 'hi'}."""
+        """x vs y on the same documents: {'p', 'effect', 'diff', 'lo', 'hi',
+        'n', 'test', 'effect_name'} — the test and effect actually used."""
         x, y = _arr(x), _arr(y)
         out = {"p": None, "effect": None, "diff": None, "lo": None, "hi": None,
-               "n": int(min(len(x), len(y)))}
-        if out["n"] < MIN_N:
+               "n": int(min(len(x), len(y))),
+               "test": self.test_name("paired", len(x)),
+               "effect_name": self.effect_name("paired")}
+        if len(x) != len(y):
+            out["why"] = "unaligned samples"
             return out
-        d = x[:out["n"]] - y[:out["n"]]
+        if out["n"] < MIN_N or not _finite(x, y):
+            return out
+        d = x - y
         out["diff"] = float(d.mean())
         if not d.any():
             # identical on every document: no evidence of a difference (the
@@ -852,8 +1073,10 @@ class StatsCfg:
     def indep(self, x, y) -> dict:
         x, y = _arr(x), _arr(y)
         out = {"p": None, "effect": None, "diff": None, "lo": None, "hi": None,
-               "n": (len(x), len(y))}
-        if not len(x) or not len(y):
+               "n": (len(x), len(y)),
+               "test": self.test_name("indep", min(len(x), len(y))),
+               "effect_name": self.effect_name("indep")}
+        if not len(x) or not len(y) or not _finite(x, y):
             return out
         out["diff"] = float(x.mean() - y.mean())
         if self.family == "rank":
@@ -882,12 +1105,16 @@ class StatsCfg:
         return out
 
     def multi(self, groups) -> dict:
-        out = {"p": None, "effect": None}
+        """k paired conditions. Two conditions are a paired comparison: the
+        result then names the paired test and effect it used."""
+        out = {"p": None, "effect": None, "test": self.test_name("multi"),
+               "effect_name": self.effect_name("multi")}
         if len(groups) < 2 or not len(groups[0]):
             return out
         if len(groups) == 2:
             r = self.paired(groups[0], groups[1])
-            return {"p": r["p"], "effect": r["effect"], "two": True}
+            return {"p": r["p"], "effect": r["effect"], "two": True,
+                    "test": r["test"], "effect_name": r["effect_name"]}
         if self.family == "mean":
             _f, out["p"], out["effect"] = rm_anova(groups)
         else:
@@ -901,18 +1128,24 @@ class StatsCfg:
     def method_text(self, design: str, n_tests: int | None = None) -> str:
         """One sentence a methods section can quote."""
         test = self.test_name(design)
-        if design == "multi" and self.family != "mean":
-            test += " (Wilcoxon signed-rank for two values)"
-        elif design == "multi":
-            test += " (paired t-test for two values)"
+        effect = self.effect_name(design)
+        if design == "multi":
+            test += (f" ({self.test_name('paired')} with "
+                     f"{self.effect_name('paired')} for two values)")
         bits = [f"two-sided {test}"]
+        if self.family == "rank":
+            bits.append(f"exact null distribution without ties up to "
+                        f"{EXACT_MAX_N} documents, normal approximation otherwise")
         if self.family == "resample":
-            bits.append(f"{self.resamples:,} resamples, seeded from the data")
+            bits.append(f"{self.resamples:,} resamples seeded from the data "
+                        f"(smallest attainable p = 1/{self.resamples + 1:,}) "
+                        f"below {ASYMPTOTIC_N} documents, the tests' normal "
+                        "limit from there on")
         adj = ""
         if n_tests and n_tests > 1 and self.adjust != "none":
             adj = f"; p-values {ADJUST[self.adjust]}-adjusted over {n_tests} tests"
         return (", ".join(bits) + adj
-                + f"; effect size: {self.effect_name(design)}"
+                + f"; effect size: {effect}"
                 + f"; {DAGGER} marks p<{alpha_str(self.alpha)}"
                 + ("" if self.adjust == "none" or not n_tests or n_tests < 2
                    else " after adjustment"))

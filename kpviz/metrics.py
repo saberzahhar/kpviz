@@ -197,8 +197,25 @@ class PerDoc(Mapping):
         return int(self.ords.nbytes + self.vals.nbytes)
 
 
+def _on_index(r: PerDoc, index: DocIndex) -> PerDoc:
+    """`r` re-expressed on `index` (two results computed on either side of
+    a catalog change carry different indices; ordinals must never be
+    compared across them)."""
+    if r.index is index:
+        return r
+    ids = r.index.ids
+    pos = index.pos
+    pairs = sorted((pos[ids[o]], v) for o, v in zip(r.ords.tolist(), r.vals.tolist())
+                   if ids[o] in pos)
+    return PerDoc(np.fromiter((p for p, _ in pairs), dtype=np.int32, count=len(pairs)),
+                  np.fromiter((v for _, v in pairs), dtype=np.float64, count=len(pairs)),
+                  index)
+
+
 def paired(a: PerDoc, b: PerDoc) -> tuple[np.ndarray, np.ndarray]:
-    """Scores of the documents both results share, aligned (sorted by id)."""
+    """Scores of the documents both results share, aligned (sorted by id).
+    Ordinals are unique per result by construction (see `_compute`)."""
+    b = _on_index(b, a.index)
     common, ia, ib = np.intersect1d(a.ords, b.ords, assume_unique=True,
                                     return_indices=True)
     return a.vals[ia], b.vals[ib]
@@ -206,7 +223,9 @@ def paired(a: PerDoc, b: PerDoc) -> tuple[np.ndarray, np.ndarray]:
 
 def common_ords(results: list[PerDoc]) -> np.ndarray:
     out = None
+    index = results[0].index if results else None
     for r in results:
+        r = _on_index(r, index)
         out = r.ords if out is None else np.intersect1d(out, r.ords,
                                                         assume_unique=True)
     return out if out is not None else np.zeros(0, dtype=np.int32)
@@ -256,7 +275,8 @@ def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
             conds.append("t.tok_end IS NOT NULL AND t.tok_end <= $tok_limit")
         gold_cte = f"""
     ok AS (
-      SELECT g.doc_id, list(g.kp_idx) AS allowed, count(*)::INTEGER AS n_ok
+      SELECT g.doc_id, list(DISTINCT g.kp_idx) AS allowed,
+             count(DISTINCT g.kp_idx)::INTEGER AS n_ok
       FROM gold g {tok_join}
       WHERE {" AND ".join(conds)}
       GROUP BY 1),"""
@@ -365,8 +385,21 @@ def _compute(dataset: str, run_keys: list[tuple], ann_key: str, k: str,
         name = ri
         a, b = bounds.get(name, (0, 0))
         o = ords[a:b].copy()
-        out[tuple(key)] = {m: PerDoc(o, vals[m][a:b].copy(), index)
-                           for m in ("p", "r", "f1")}
+        sl = slice(a, b)
+        # one score per document, whatever the store holds: ingest removes
+        # repeated lines, and this keeps a PerDoc's mapping semantics even
+        # for a store written before that (first row of an ordinal wins)
+        if len(o) > 1 and not np.all(o[1:] != o[:-1]):
+            first = np.concatenate(([True], o[1:] != o[:-1]))
+            o = o[first]
+            sl = np.flatnonzero(first) + a
+        o.setflags(write=False)
+        res = {}
+        for m in ("p", "r", "f1"):
+            v = vals[m][sl].copy()
+            v.setflags(write=False)
+            res[m] = PerDoc(o, v, index)
+        out[tuple(key)] = res
         out[tuple(key)]["n_skipped"] = skipped.get(name, 0)
     return out
 
@@ -671,9 +704,44 @@ def cache_stats() -> dict:
     return _CACHE.stats()
 
 
-def memo(key, fn, size: int = 4096, sized: bool = False):
+def approx_size(v, _depth: int = 0) -> int:
+    """Rough retained bytes of a value: containers are charged for their
+    slots plus their elements (estimated from a sample of up to 64), NumPy
+    arrays for their buffer. Good to a small factor — what a byte budget
+    needs — at a cost independent of the value's size."""
+    import sys
+    if isinstance(v, np.ndarray):
+        return int(v.nbytes) + 112
+    if isinstance(v, PerDoc):
+        return v.nbytes + 64
+    size = sys.getsizeof(v)
+    if _depth > 3:
+        return size
+    if isinstance(v, dict):
+        items = list(v.items())
+        n = len(items)
+        if n:
+            sample = items[:64]
+            per = sum(approx_size(a, _depth + 1) + approx_size(b, _depth + 1)
+                      for a, b in sample) / len(sample)
+            size += int(per * n)
+    elif isinstance(v, (list, tuple, set, frozenset)):
+        n = len(v)
+        if n:
+            sample = list(v)[:64] if not isinstance(v, (list, tuple)) else v[:64]
+            size += int(sum(approx_size(x, _depth + 1) for x in sample)
+                        / len(sample) * n)
+    return size
+
+
+def memo(key, fn, size: int | None = None, sized: bool = False):
     """Cache a derived value for the current catalog (UI helpers). With
-    sized=True, fn returns (value, nbytes) and the cache charges that."""
+    sized=True, fn returns (value, nbytes) and the cache charges that;
+    otherwise the value is charged `size` bytes, or its estimated size."""
     if sized:
         return _CACHE.get_or_compute((key, db.scan_version()), fn)
-    return _CACHE.get_or_compute((key, db.scan_version()), lambda: (fn(), size))
+
+    def build():
+        v = fn()
+        return v, (size if size is not None else approx_size(v))
+    return _CACHE.get_or_compute((key, db.scan_version()), build)

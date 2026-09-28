@@ -19,7 +19,7 @@ from ..insights_common import (ann_options, datasets_with_runs,
                                metric_caption, metric_controls, models_control,
                                p_cells, p_headers, prmu_arg, resolve_ann,
                                rq_header, runs_control, selected_runs,
-                               stats_cfg, stats_inputs, value_cell, vis)
+                               stats_cfg, stats_inputs, value_cell, vis, shown)
 
 METHODS = {"pearson": "Pearson r", "spearman": "Spearman ρ",
            "kendall": "Kendall τ-b"}
@@ -47,6 +47,15 @@ def layout():
                 id=f"{RQ}-method",
                 options=[{"label": v, "value": k} for k, v in METHODS.items()],
                 value="pearson", clearable=False, className="dash-dropdown"), 140),
+            ui.control("Systems", dcc.RadioItems(
+                id=f"{RQ}-unit", value="model", className="kp-check kp-inline",
+                options=[{"label": " one per model", "value": "model",
+                          "title": "each model's runs averaged into one point: "
+                                   "beam settings or seeds of one model are "
+                                   "not independent systems"},
+                         {"label": " every run", "value": "run",
+                          "title": "descriptive; many runs of one model "
+                                   "dominate the test"}]), 230),
         ]),
         ui.filter_row([
             models_control(RQ),
@@ -74,9 +83,9 @@ def register(app):
     register_dataset_refresh(app, f"{RQ}-ds", multi=True)
     register_model_run_chain(app, RQ, multi_ds=True, require_all=True)
 
-    @app.callback(Output(f"{RQ}-ann", "options"), Input(vis(RQ), "data"),
+    @app.callback(Output(f"{RQ}-ann", "options"), State(vis(RQ), "data"), Input(shown(RQ), "data"),
                   Input(f"{RQ}-ds", "value"), prevent_initial_call=True)
-    def opts(visible, ds_sel):
+    def opts(visible, _shown, ds_sel):
         if not visible:
             raise PreventUpdate
         return ann_options(ds_sel or [])
@@ -87,21 +96,25 @@ def register(app):
         Output({"type": "caption", "rq": RQ}, "value"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
-        Input(vis(RQ), "data"),
+        State(vis(RQ), "data"), Input(shown(RQ), "data"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
         Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-method", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
+        Input(f"{RQ}-unit", "value"),
         *stats_inputs(),
+        Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
-    def update(visible, *args):
-        *inputs, last_sig = args
+    def update(visible, _shown, *args):
+        # the catalog version is an input so exactly the visible workbench
+        # re-renders once when a scan publishes; gate() signs it itself
+        *inputs, _catalog, last_sig = args
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
     def _update(ds_sel, measure, k, prmu_sel, ann_choice, method, models_sel,
-                runs_sel, *stat_vals):
+                runs_sel, unit, *stat_vals):
         from ...figures import to_plotly
         ds_sel = [d for d in (ds_sel or [])]
         if len(ds_sel) < 2:
@@ -122,7 +135,23 @@ def register(app):
         # drop runs with a missing score anywhere
         keep = [i for i in range(len(keys))
                 if all(vectors[ds][i] is not None for ds in ds_sel)]
+        idx = scanner.cards()
+        labels = run_labels(idx, run_rows(ds_sel))
+        per_model = unit != "run"
+        if per_model:
+            # one system = one model: its (shared) runs averaged per dataset
+            groups: dict[str, list[int]] = {}
+            for i in keep:
+                groups.setdefault(keys[i][0], []).append(i)
+            unit_names = [idx.model(m).name + (f" ({len(ix)} runs)" if len(ix) > 1 else "")
+                          for m, ix in groups.items()]
+            vectors = {ds: [sum(vectors[ds][i] for i in ix) / len(ix)
+                            for ix in groups.values()] for ds in ds_sel}
+            keep = list(range(len(groups)))
+        else:
+            unit_names = [labels.get(chosen[i], chosen[i]) for i in range(len(keys))]
         n = len(keep)
+        unit_txt = "models (each model's runs averaged)" if per_model else "(model, run) pairs"
         # one test per unordered dataset pair; the family is corrected once
         pairs = [(i, j) for i in range(len(ds_sel))
                  for j in range(i + 1, len(ds_sel))]
@@ -155,7 +184,7 @@ def register(app):
                             + f"<br>p = {p_str(p)}"
                             + (f", {ADJUST[cfg.adjust]} {p_str(p_adj[pq])}"
                                if cfg.adjust != "none" else "")
-                            + f" {mark}<br>n = {n} (model, run) pairs")
+                            + f" {mark}<br>n = {n} {unit_txt}")
             z.append(row)
             ztext.append(trow)
             zhover.append(hrow)
@@ -170,10 +199,14 @@ def register(app):
                      "customdata": zhover,
                      "hover": "%{customdata}<extra></extra>"},
             "name": f"dataset-correlation-{method}",
-            "caption": (f"{mname} between datasets of per-run "
-                        f"{metric_label(measure, k, prmu)} scores, over the "
-                        f"n={n} (model, run) pairs evaluated on all "
-                        f"{len(ds_sel)} datasets. † marks a coefficient "
+            "caption": (f"{mname} between datasets of "
+                        f"{metric_label(measure, k, prmu)} scores, over "
+                        f"n={n} {unit_txt} evaluated on all "
+                        f"{len(ds_sel)} datasets"
+                        + ("" if per_model else
+                           " (runs of one model are related, not independent "
+                           "systems: read the test as descriptive)")
+                        + ". † marks a coefficient "
                         f"significantly different from 0 (two-sided, "
                         f"p<{alpha_str(cfg.alpha)}{adj_txt}); intervals are "
                         "95 % Fisher-z. "
@@ -195,18 +228,19 @@ def register(app):
             rows_h.append([a_, b_] + [c[0] for c in cells])
         spec["table"] = {"headers": headers, "rows": rows,
                          "label": f"corr-{method}",
-                         "notes": f"{mname} over n={n} shared (model, run) "
-                                  f"pairs; two-sided test of no association"
-                                  f"{adj_txt}; 95 % Fisher-z intervals."}
-        idx = scanner.cards()
-        labels = run_labels(idx, run_rows(ds_sel))
+                         "notes": f"{mname} over n={n} shared {unit_txt}; "
+                                  f"two-sided test of no association"
+                                  + (" (exact permutation p up to 9 systems)"
+                                     if method != "pearson" else "")
+                                  + f"{adj_txt}; 95 % Fisher-z intervals."}
         detail = ui.table(
-            ["(model, run) pairs in the vectors"] + ds_sel,
-            [[labels.get(chosen[i], chosen[i])]
-             + [f"{vectors[ds][i]:.3f}" for ds in ds_sel] for i in keep],
+            [("models" if per_model else "(model, run) pairs") + " in the vectors"]
+            + ds_sel,
+            [[unit_names[i]] + [f"{vectors[ds][i]:.3f}" for ds in ds_sel]
+             for i in keep],
             num_cols=set(range(1, 1 + len(ds_sel))))
-        note = html.Div(f"n = {n} shared (model, run) pairs — pairs missing on "
-                        "any dataset are excluded (consistent representation)."
+        note = html.Div(f"n = {n} shared {unit_txt} — runs missing on any "
+                        "dataset are excluded (consistent representation)."
                         + (" With fewer than 10 systems every coefficient is "
                            "fragile; read the intervals." if n < 10 else ""),
                         className="muted small", style={"margin": "6px 0"})

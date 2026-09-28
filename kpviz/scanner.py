@@ -48,16 +48,27 @@ from .util import (RateEMA, declared_langs, file_hash, human_count,
 # The manual revision still marks deliberate semantic changes; the source
 # hash of the derivation modules makes a forgotten bump impossible — any edit
 # to them re-derives instead of silently serving stale numbers.
-_CODE_REV = 12
+_CODE_REV = 13      # 13: contiguous PRMU, gold de-duplicated, ingest dedup
 
 
 def _code_version() -> str:
+    """What derived rows depend on: the worker source (derive, textproc) and
+    the libraries that tokenise and stem (spaCy's tokenizer rules and the
+    Snowball stemmers change results without any KPViz file changing).
+    Orchestration changes in scanner.py bump _CODE_REV deliberately — hashing
+    it would re-derive the whole corpus for every UI-irrelevant edit."""
+    from importlib import metadata
     h = hashlib.blake2b(digest_size=6)
     here = Path(__file__).resolve().parent
     for name in ("derive.py", "textproc.py"):
         try:
             h.update((here / name).read_bytes())
         except OSError:
+            pass
+    for dist in ("spacy", "PyStemmer", "snowballstemmer"):
+        try:
+            h.update(f"{dist}={metadata.version(dist)}".encode())
+        except Exception:
             pass
     return f"{_CODE_REV}-{h.hexdigest()}"
 
@@ -393,6 +404,7 @@ def _check_cancel():
 
 def _scan_main(full_rehash: bool):
     error, cancelled = None, False
+    db.mark_missing_optional_modules()
     db.set_scan_mode(True)
     try:
         _do_scan(full_rehash)
@@ -491,17 +503,18 @@ _DOC_TABLES = {
                    "sections": "VARCHAR", "metadata": "VARCHAR",
                    "ann_counts": "VARCHAR", "flags": "VARCHAR[]"}, "insert"),
     "gold": ({"dataset": "VARCHAR", "doc_id": "VARCHAR", "ann_key": "VARCHAR",
-              "kp_idx": "INTEGER", "display": "VARCHAR", "stems": "VARCHAR[]",
+              "kp_idx": "INTEGER", "src_off": "BIGINT", "display": "VARCHAR",
+              "surface": "VARCHAR", "stems": "VARCHAR[]",
               "lang": "VARCHAR", "n_words": "INTEGER", "prmu": "VARCHAR",
               "end_char": "INTEGER", "end_word": "INTEGER"}, "insert"),
     "gold_agg": ({"dataset": "VARCHAR", "split": "VARCHAR", "ann_key": "VARCHAR",
                   "prmu": "VARCHAR", "n_words_b": "INTEGER", "n": "BIGINT",
                   "words_sum": "BIGINT"}, "insert"),
     "doc_tokens": ({"dataset": "VARCHAR", "doc_id": "VARCHAR",
-                    "tokenizer": "VARCHAR", "n_tokens": "INTEGER",
+                    "src_off": "BIGINT", "tokenizer": "VARCHAR", "n_tokens": "INTEGER",
                     "approx": "BOOLEAN"}, "insert"),
     "gold_tokpos": ({"dataset": "VARCHAR", "doc_id": "VARCHAR",
-                     "ann_key": "VARCHAR", "kp_idx": "INTEGER",
+                     "src_off": "BIGINT", "ann_key": "VARCHAR", "kp_idx": "INTEGER",
                      "tokenizer": "VARCHAR", "tok_end": "INTEGER",
                      "approx": "BOOLEAN"}, "insert"),
     "kp_stage": ({"kp": "VARCHAR", "raw": "VARCHAR", "lang": "VARCHAR"},
@@ -515,6 +528,7 @@ _PRED_TABLES = {
                "costs": "VARCHAR"}, "insert"),
     "matches": ({"dataset": "VARCHAR", "model": "VARCHAR", "arch": "VARCHAR",
                  "run_id": "VARCHAR", "doc_id": "VARCHAR", "ann_key": "VARCHAR",
+                 "batch_idx": "INTEGER", "byte_off": "BIGINT",
                  "n_uniq": "INTEGER", "n_gold": "INTEGER",
                  "pred_ranks": "INTEGER[]", "gold_idxs": "INTEGER[]"}, "insert"),
 }
@@ -638,6 +652,8 @@ def _do_scan(full_rehash: bool):
     from .metrics import rebuild_run_metrics
     n_metrics = rebuild_run_metrics(con)
     STATE.add_timing("run_metrics_s", time.perf_counter() - t0)
+    from .naming import assign_all_slots
+    assign_all_slots(idx)
     db.kv_set("last_scan_ok", True)
     db.bump_scan_version()
     db.clear_read_cache()
@@ -847,11 +863,15 @@ def _resolve_tokenizers(needed: dict[str, list[str]]) -> dict[str, dict]:
     marker so later scans (and every worker) skip the network instead of
     re-trying the download each time. Workers are told the verdict and only
     read local files."""
-    from .textproc import get_tokenizer
+    from .textproc import forget_tokenizers, get_tokenizer
     st = settings()
     specs = sorted({s for v in needed.values() for s in v})
     out: dict[str, dict] = {}
     t0 = time.perf_counter()
+    # resolved afresh for every scan (markers on disk survive): an asset
+    # installed since the last scan, a replaced tokenizer.json or an expired
+    # "unavailable" marker is seen now, not after a server restart
+    forget_tokenizers(None)
     for spec in specs:
         tk = get_tokenizer(spec, st.tokenizer_cache)
         out[spec] = {"status": tk.status, "fingerprint": tk.fingerprint,
@@ -942,16 +962,32 @@ def _run_pool(pool, fn, args_iter, step_key, ingestor: Ingestor | None,
     max_inflight = max_inflight or max(4, st.workers * 3)
     it = iter(args_iter)
     pending = set()
+    where: dict = {}          # future -> what it was working on (for errors)
     agg = {"n_docs": 0, "secs": 0.0, "items": 0, "wait_s": 0.0}
     exhausted = False
+
+    def _label(a: dict) -> str:
+        if a.get("segments"):
+            seg = a["segments"][0]
+            return (f"run {'/'.join(a.get('run_key') or [])}, "
+                    f"{Path(seg['path']).name} bytes {seg['start']}–{seg['end']}"
+                    + (f" (+{len(a['segments']) - 1} more)"
+                       if len(a["segments"]) > 1 else ""))
+        if a.get("path"):
+            return f"{a.get('rel') or Path(a['path']).name} bytes {a['start']}–{a['end']}"
+        return a.get("tag") or "task"
 
     def _fill():
         nonlocal exhausted
         while not exhausted and len(pending) < max_inflight:
             try:
-                pending.add(pool.submit(fn, next(it)))
+                a = next(it)
             except StopIteration:
                 exhausted = True
+                break
+            fut = pool.submit(fn, a)
+            where[fut] = _label(a)
+            pending.add(fut)
 
     _fill()
     while pending:
@@ -963,7 +999,15 @@ def _run_pool(pool, fn, args_iter, step_key, ingestor: Ingestor | None,
         done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
         agg["wait_s"] += time.perf_counter() - t0
         for fut in done:
-            res = fut.result()
+            try:
+                res = fut.result()
+            except ScanCancelled:
+                raise
+            except Exception as e:
+                # say which file and byte range failed, not only why
+                raise RuntimeError(f"{step_key}: {where.get(fut, 'task')}: "
+                                   f"{type(e).__name__}: {e}") from e
+            where.pop(fut, None)
             if ingestor is not None:
                 ingestor.submit(res)
                 ingestor.check()
@@ -999,6 +1043,7 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
     per_rel = {j["rel"]: {"remaining": 0, "ds": j["ds"], "sig": j["sig"],
                           "bytes": j["f"]["size"], "n_docs": 0, "n_bad": 0,
                           "first_bad": None, "n_noid": 0,
+                          "n_gold_empty": 0, "n_gold_dup": 0,
                           "worker_s": 0.0, "t0": time.perf_counter()}
                for j in doc_jobs}
     expect = {s_: v["status"] for s_, v in (tok_info or {}).items()}
@@ -1027,6 +1072,11 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
                                       for k, v in card.sections.items()},
                          "anns": {k: declared_langs(v if isinstance(v, dict) else None)
                                   for k, v in card.annotations.items()},
+                         # sections a document may lack without a flag
+                         "optional": sorted(
+                             k for k, v in card.sections.items()
+                             if isinstance(v, dict) and (v.get("optional")
+                                                         or v.get("required") is False)),
                          "combined": combined},
                 "tokenizers": sorted(needed_tokenizers.get(ds, [])),
                 "tok_expect": expect,
@@ -1040,6 +1090,8 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
         info["n_docs"] += res.get("n_docs", 0)
         info["worker_s"] += res.get("secs", 0.0)
         info["n_noid"] += res.get("n_noid", 0)
+        info["n_gold_empty"] += res.get("n_gold_empty", 0)
+        info["n_gold_dup"] += res.get("n_gold_dup", 0)
         if res.get("n_bad"):
             info["n_bad"] += res["n_bad"]
             if info["first_bad"] is None or res["first_bad"] < info["first_bad"]:
@@ -1059,16 +1111,16 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
     # data-integrity counts per collection, shown on the Overview: nothing
     # that changes scores is allowed to disappear silently
     issues = db.kv_get("collection_issues", {}) or {}
-    dup = {r[0]: r[1] for r in db.q(
-        """SELECT dataset, count(*) - count(DISTINCT doc_id) FROM documents
-           GROUP BY 1""")}
+    dup = _dedup_documents(con, sorted({j["ds"] for j in doc_jobs}))
     for rel, info in per_rel.items():
         ds = info["ds"]
         issues[ds] = {k: v for k, v in {
             "malformed_lines": info["n_bad"],
             "first_malformed_byte": info["first_bad"],
             "missing_id": info["n_noid"],
-            "duplicate_doc_ids": int(dup.get(ds) or 0)}.items() if v}
+            "duplicate_doc_ids": int(dup.get(ds) or 0),
+            "gold_duplicates": info["n_gold_dup"],
+            "gold_empty": info["n_gold_empty"]}.items() if v}
         if info["n_bad"]:
             STATE.log_line(f"“{ds}”: {info['n_bad']} malformed line(s), first "
                            f"at byte {info['first_bad']}")
@@ -1086,6 +1138,82 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
                       duration_s=round(time.perf_counter() - info["t0"], 3))
         STATE.log_line(f"“{info['ds']}” derived — "
                        f"{human_count(info['n_docs'])} documents")
+
+
+def _dedup_documents(con, datasets: list[str]) -> dict[str, int]:
+    """One evaluation unit per (dataset, document id).
+
+    A collection that repeats an id keeps its *first* line (lowest byte
+    offset); the later lines' documents, gold, token counts and gold token
+    positions are removed, so every table — and every per-document array
+    built from them — holds one row per document. Returns the number of
+    removed lines per dataset (the `duplicate_doc_ids` issue)."""
+    if not datasets:
+        return {}
+    ph = ",".join("?" * len(datasets))
+    dups = db.q(f"""SELECT dataset, doc_id, min(byte_off), count(*) - 1
+                    FROM documents WHERE dataset IN ({ph})
+                    GROUP BY 1, 2 HAVING count(*) > 1""", *datasets)
+    if not dups:
+        return {}
+    out: dict[str, int] = {}
+    for ds, _d, _o, n in dups:
+        out[ds] = out.get(ds, 0) + int(n)
+    with db._wlock:
+        con.execute("CREATE OR REPLACE TEMP TABLE kp_keep_doc"
+                    "(dataset VARCHAR, doc_id VARCHAR, off BIGINT)")
+        con.execute("INSERT INTO kp_keep_doc SELECT unnest(?), unnest(?), unnest(?)",
+                    [[r[0] for r in dups], [r[1] for r in dups],
+                     [int(r[2]) for r in dups]])
+        for t, col in (("documents", "byte_off"), ("gold", "src_off"),
+                       ("doc_tokens", "src_off"), ("gold_tokpos", "src_off")):
+            con.execute(f"""DELETE FROM {t} USING kp_keep_doc k
+                            WHERE {t}.dataset = k.dataset AND {t}.doc_id = k.doc_id
+                              AND coalesce({t}.{col}, -1) <> k.off""")
+        con.execute("DROP TABLE IF EXISTS kp_keep_doc")
+    for ds, n in out.items():
+        STATE.log_line(f"“{ds}”: {n} repeated document id line(s) — first "
+                       "occurrence kept")
+    return out
+
+
+def _dedup_predictions(con, keys: list[tuple]) -> dict[tuple, int]:
+    """One prediction line per (run, document): a run that predicts a
+    document twice keeps its first line (lowest batch, then byte offset) in
+    `preds` and `matches`. Returns the removed line count per run (the
+    `duplicate_docs` issue)."""
+    if not keys:
+        return {}
+    vals = ",".join("(?,?,?,?)" for _ in keys)
+    args = [x for k in keys for x in k]
+    dups = db.q(f"""
+        WITH sel(dataset, model, arch, run_id) AS (VALUES {vals})
+        SELECT p.dataset, p.model, p.arch, p.run_id, p.doc_id,
+               min(p.batch_idx::BIGINT * 1099511627776 + p.byte_off), count(*) - 1
+        FROM preds p JOIN sel USING (dataset, model, arch, run_id)
+        GROUP BY 1, 2, 3, 4, 5 HAVING count(*) > 1""", *args)
+    if not dups:
+        return {}
+    out: dict[tuple, int] = {}
+    for r in dups:
+        out[tuple(r[:4])] = out.get(tuple(r[:4]), 0) + int(r[6])
+    cols = list(zip(*[r[:6] for r in dups]))
+    with db._wlock:
+        con.execute("CREATE OR REPLACE TEMP TABLE kp_keep_pred(dataset VARCHAR, "
+                    "model VARCHAR, arch VARCHAR, run_id VARCHAR, doc_id VARCHAR, "
+                    "pos BIGINT)")
+        con.execute("INSERT INTO kp_keep_pred SELECT unnest(?), unnest(?), "
+                    "unnest(?), unnest(?), unnest(?), unnest(?)",
+                    [list(c) for c in cols])
+        for t in ("preds", "matches"):
+            con.execute(f"""DELETE FROM {t} USING kp_keep_pred k
+                WHERE {t}.dataset = k.dataset AND {t}.model = k.model
+                  AND {t}.arch = k.arch AND {t}.run_id = k.run_id
+                  AND {t}.doc_id = k.doc_id
+                  AND coalesce({t}.batch_idx::BIGINT * 1099511627776
+                               + {t}.byte_off, -1) <> k.pos""")
+        con.execute("DROP TABLE IF EXISTS kp_keep_pred")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1262,10 +1390,12 @@ def _derive_all_runs(con, pool, idx: CardIndex, pred_jobs: list[dict]):
     STATE.count("inferences_spill_files", ing.files)
 
     # per-run integrity counts become issue tags at finalize
+    dup = _dedup_predictions(con, list(per_run))
     issues = db.kv_get("run_issues", {}) or {}
     for k, info in per_run.items():
         issues["/".join(k)] = {kk: vv for kk, vv in (
-            ("malformed_lines", info["n_bad"]), ("missing_id", info["n_noid"]))
+            ("malformed_lines", info["n_bad"]), ("missing_id", info["n_noid"]),
+            ("duplicate_docs", dup.get(k, 0)))
             if vv}
     db.kv_set("run_issues", issues)
 
@@ -1287,6 +1417,10 @@ def _derive_all_runs(con, pool, idx: CardIndex, pred_jobs: list[dict]):
 # ---------------------------------------------------------------------------
 
 def _purge_dataset_docs(con, datasets: list[str]):
+    """Delete a collection's derived rows before it is re-derived. Purging by
+    dataset is right because the data contract has exactly one collection
+    file per dataset (documents/document.<ds>.jsonl, no sharding): a sharded
+    collection would need a purge by file_id instead."""
     if not datasets:
         return
     ph = ",".join("?" * len(datasets))
@@ -1344,16 +1478,17 @@ def _merge_keyphrases(con):
         return
     t0 = time.perf_counter()
     STATE.log_line(f"merging {human_count(n[0])} staged phrase analyses…")
-    # deterministic pick when one phrase arrives in several languages or
-    # spellings (any_value depended on worker scheduling, and decided which
-    # spaCy model POS-tags the phrase): smallest (language, surface form)
+    # keyed by (language, phrase): the same string in two languages is two
+    # phrases, so incremental and clean builds agree whatever the order;
+    # the surface form is the smallest one seen (deterministic)
     with db._wlock:
         con.execute("""
-            INSERT INTO keyphrases (kp, raw, lang)
-            SELECT s.kp, arg_min(s.raw, s.lang || chr(1) || s.raw), min(s.lang)
+            INSERT INTO keyphrases (lang, kp, raw)
+            SELECT coalesce(s.lang, 'en'), s.kp, min(s.raw)
             FROM kp_stage s
-            WHERE NOT EXISTS (SELECT 1 FROM keyphrases k WHERE k.kp = s.kp)
-            GROUP BY s.kp""")
+            WHERE NOT EXISTS (SELECT 1 FROM keyphrases k
+                              WHERE k.kp = s.kp AND k.lang = coalesce(s.lang, 'en'))
+            GROUP BY 1, 2""")
         con.execute("DELETE FROM kp_stage")
     STATE.add_timing("merge_keyphrases_s", time.perf_counter() - t0)
 
@@ -1412,8 +1547,10 @@ def _aggregate_runs_sql(con, idx: CardIndex, run_dirs: dict, found: dict):
            FROM preds p LEFT JOIN ids i
              ON i.dataset = p.dataset AND i.doc_id = p.doc_id
            GROUP BY 1,2,3,4""")}
-    # coverage within the run's majority split: predicted documents *of that
-    # split* over the split's size — a run spanning several splits can no
+    # coverage within the run's majority *evaluation* split: predicted
+    # documents of that split over the split's size. Training-split
+    # predictions never define it (they have no stored gold and are counted
+    # as `unscored` instead), and a run spanning several splits can no
     # longer read "150 %"
     coverage = {tuple(r[:4]): (r[4], r[5], r[6], r[7]) for r in db.q(f"""
         WITH ids AS (SELECT dataset, doc_id, any_value(split) AS split
@@ -1424,6 +1561,7 @@ def _aggregate_runs_sql(con, idx: CardIndex, run_dirs: dict, found: dict):
                  count(DISTINCT p.doc_id) AS c
           FROM preds p JOIN ids d
             ON d.dataset = p.dataset AND d.doc_id = p.doc_id
+          WHERE {_EVAL_SPLIT_SQL}
           GROUP BY 1,2,3,4,5),
         maj AS (SELECT dataset, model, arch, run_id,
                        arg_max(split, c) AS split, max(c) AS c,
@@ -1434,6 +1572,12 @@ def _aggregate_runs_sql(con, idx: CardIndex, run_dirs: dict, found: dict):
                maj.c, maj.n_splits
         FROM maj LEFT JOIN dsz
           ON dsz.dataset = maj.dataset AND dsz.split = maj.split""")}
+    # predicted documents that enter no score: no stored gold for them
+    # (a training split, no annotation) — resolved ids only; unresolved ones
+    # have their own tag
+    scored = {tuple(r[:4]): int(r[4]) for r in db.q(
+        """SELECT dataset, model, arch, run_id, count(DISTINCT doc_id)
+           FROM matches GROUP BY 1,2,3,4""")}
     run_issues = db.kv_get("run_issues", {}) or {}
     doc_sums_all = _cost_var_sums("preds")
     batch_sums_all = _cost_var_sums("batches")
@@ -1490,11 +1634,13 @@ def _aggregate_runs_sql(con, idx: CardIndex, run_dirs: dict, found: dict):
             tags.append(f"incomplete:{100 * cov:.0f}%")
         if n_unknown:
             tags.append(f"unresolved_ids:{n_unknown}")
+        n_unscored = (n_docs or 0) - n_unknown - scored.get(key, 0)
+        if n_unscored > 0:
+            tags.append(f"unscored:{n_unscored}")
         if (n_splits or 0) > 1:
             tags.append(f"multi_split:{n_splits}")
-        if (n_rows or 0) > (n_docs or 0):
-            tags.append(f"duplicate_docs:{(n_rows or 0) - (n_docs or 0)}")
-        for issue, n in (run_issues.get("/".join(key)) or {}).items():
+        r_issues = run_issues.get("/".join(key)) or {}
+        for issue, n in r_issues.items():
             tags.append(f"{issue}:{n}")
 
         rows.append({
@@ -1505,7 +1651,7 @@ def _aggregate_runs_sql(con, idx: CardIndex, run_dirs: dict, found: dict):
             "tags": json.dumps(tags, ensure_ascii=False),
             "arch_known": acard.known,
             "n_batches": n_batches or 0, "n_docs": n_docs or 0,
-            "n_dup_docs": (n_rows or 0) - (n_docs or 0),
+            "n_dup_docs": int(r_issues.get("duplicate_docs", 0)),
             "expected_docs": expected, "coverage": cov,
             "var_totals": json.dumps(var_totals), "costs": json.dumps(costs),
             "t_start": t_start.isoformat() if t_start else None,
@@ -1551,7 +1697,7 @@ def _pos_phase(con, get_pool):
     every scan."""
     st = settings()
     per_lang = {r[0]: r[1] for r in db.q(
-        """SELECT coalesce(lang,'en'), count(*) FROM keyphrases
+        """SELECT lang, count(*) FROM keyphrases
            WHERE pos IS NULL GROUP BY 1""")}
     langs_ok = {l for l in per_lang if pos_available(l)}
     total = sum(per_lang[l] for l in langs_ok)
@@ -1574,7 +1720,7 @@ def _pos_phase(con, get_pool):
             cur = db.connect().cursor()
             try:
                 cur.execute("""SELECT kp, coalesce(raw, kp) FROM keyphrases
-                               WHERE pos IS NULL AND coalesce(lang,'en')=?
+                               WHERE pos IS NULL AND lang=?
                                ORDER BY kp""", [lang])
                 i = 0
                 while True:
@@ -1598,9 +1744,11 @@ def _pos_phase(con, get_pool):
         with db._wlock:
             con.execute("CREATE OR REPLACE TEMP TABLE tmp_pos AS "
                         "SELECT * FROM read_json(?, format='newline_delimited',"
-                        " columns={'kp':'VARCHAR','pos':'VARCHAR'})", [paths])
+                        " columns={'kp':'VARCHAR','lang':'VARCHAR',"
+                        "'pos':'VARCHAR'})", [paths])
             con.execute("UPDATE keyphrases SET pos = coalesce(tmp_pos.pos, '') "
-                        "FROM tmp_pos WHERE keyphrases.kp = tmp_pos.kp")
+                        "FROM tmp_pos WHERE keyphrases.kp = tmp_pos.kp "
+                        "AND keyphrases.lang = tmp_pos.lang")
             con.execute("DROP TABLE IF EXISTS tmp_pos")
         t_ing[0] += time.perf_counter() - t0
         for p in paths:

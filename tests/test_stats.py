@@ -9,7 +9,9 @@ import pytest
 
 from kpviz import stats
 
-sp = pytest.importorskip("scipy.stats")
+# a required test dependency (requirements-dev.txt): a missing SciPy must fail
+# the suite, never skip the statistics silently
+import scipy.stats as sp  # noqa: E402
 
 
 def _data(n, seed=0, shift=0.03):
@@ -73,7 +75,13 @@ def test_rm_anova_matches_textbook():
     sse = ((A - gm) ** 2).sum() - ssc - sss
     F_ref = (ssc / 2) / (sse / 10)
     assert math.isclose(F, F_ref, rel_tol=1e-12)
-    assert math.isclose(p, sp.f.sf(F_ref, 2, 10), rel_tol=1e-8)
+    # Greenhouse–Geisser ε from orthonormal contrasts (independent of the
+    # double-centring used in the code)
+    C = np.array([[1, -1, 0], [1, 1, -2]], float)
+    C /= np.linalg.norm(C, axis=1, keepdims=True)
+    M = C @ np.cov(A, rowvar=False) @ C.T
+    eps = np.trace(M) ** 2 / (2 * np.trace(M @ M))
+    assert math.isclose(p, sp.f.sf(F_ref, 2 * eps, 10 * eps), rel_tol=1e-8)
     assert math.isclose(eta, ssc / (ssc + sse), rel_tol=1e-12)
 
 
@@ -129,8 +137,12 @@ def test_resampling_is_reproducible_and_calibrated():
     _t, pt, _dz = stats.paired_t(x, y)
     assert abs(p1 - pt) < 0.05
     xs, ys = _data(3000, shift=0.05)
+    # from ASYMPTOTIC_N documents: the normal limit, no 1/(R+1) floor
     _d, p = stats.paired_permutation(xs, ys, 1000)
-    assert p == pytest.approx(1 / 1001)               # floor at resolution
+    assert p < 1 / 1001
+    # below it: Monte Carlo, floored at its resolution
+    _d, p = stats.paired_permutation(xs[:150] + 0.2, ys[:150], 1000)
+    assert p == pytest.approx(1 / 1001)
     diff, p, lo, hi = stats.paired_bootstrap(xs, ys, resamples=2000)
     assert lo < diff < hi and p < 0.01
     lo, hi = stats.bootstrap_ci(x, resamples=4000)
@@ -163,3 +175,68 @@ def test_cfg_routes_by_family():
         m = cfg.multi([x[:100], y[:100], x[100:200]])
         assert m["p"] is not None and m["effect"] is not None
         assert "two-sided" in cfg.method_text("paired", 22)
+
+
+# ---- counterexamples from the second review round ----------------------------
+def test_intervals_are_not_clipped_to_the_sample():
+    """R01: the displayed interval is the stated t-interval (only the
+    metric's own [0, 1] may cut it), never the observed min/max."""
+    cfg = stats.StatsCfg(ci="t")
+    lo, hi = cfg.mean_ci([0.49, 0.51])
+    ref = sp.t.interval(0.95, 1, loc=0.5, scale=sp.sem([0.49, 0.51]))
+    assert (lo, hi) == pytest.approx(ref)
+    assert cfg.mean_ci([0.0, 0.1, 0.0])[0] == 0.0      # [0, 1] bound only
+
+
+def test_macro_interval_keeps_its_estimand_and_independence():
+    """R02: a dataset that cannot support a variance makes the macro
+    interval unavailable (never an interval for another average); identical
+    arrays of independent datasets get independent resamples; order of the
+    datasets does not matter."""
+    t = stats.StatsCfg(ci="t")
+    assert t.macro_ci([[1.0], [0.0, 0.0]]) == (None, None)
+    b = stats.StatsCfg(ci="bootstrap", resamples=10000)
+    lo, hi = b.macro_ci([[0, 0, 1, 1], [0, 0, 1, 1]])
+    assert 0.05 < lo < 0.25 and 0.75 < hi < 0.95        # ≈ [0.125, 0.875]
+    a1, a2 = [0, 1, 1, 0.5, 0.2], [0.3, 0.3, 0.9]
+    assert b.macro_ci([a1, a2]) == b.macro_ci([a2, a1])
+
+
+def test_rank_tests_at_the_null_centre_and_small_n():
+    """R11 / W3: balanced differences give p = 1; small untied samples use
+    the exact distribution; small-n correlations are exact permutations."""
+    _w, p = stats.wilcoxon_signed_rank([1, -1, 1, -1, 1, -1], [0] * 6)
+    assert p == 1.0
+    rng = np.random.default_rng(3)
+    for n in (7, 15):
+        a, b = rng.normal(size=n), rng.normal(size=n) + 0.6
+        assert stats.wilcoxon_signed_rank(a, b)[1] == pytest.approx(
+            sp.wilcoxon(a, b, method="exact").pvalue)
+        assert stats.mann_whitney_u(a, b)[1] == pytest.approx(
+            sp.mannwhitneyu(a, b, method="exact").pvalue)
+    r, p, lo, hi = stats.spearman([1, 2, 3], [1, 2, 3])
+    assert r == 1.0 and p == pytest.approx(1 / 3) and lo is None and hi is None
+    a = rng.normal(size=7)
+    b = a + rng.normal(size=7)
+    ref = sp.permutation_test((b,), lambda y: sp.spearmanr(a, y).statistic,
+                              permutation_type="pairings", n_resamples=np.inf)
+    assert stats.spearman(a, b)[1] == pytest.approx(ref.pvalue)
+    assert stats.kendall_tau_b(a, b)[1] == pytest.approx(
+        sp.kendalltau(a, b, method="exact").pvalue)
+
+
+def test_paired_inputs_must_be_aligned():
+    with pytest.raises(stats.UnalignedError):
+        stats.paired_t(list(range(7)), list(range(6)))
+    out = stats.StatsCfg().paired(list(range(7)), list(range(6)))
+    assert out["p"] is None and out["why"] == "unaligned samples"
+
+
+def test_two_value_multi_names_the_paired_test():
+    """N17: two conditions run the paired test; the result says so."""
+    cfg = stats.StatsCfg(family="mean")
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=40)
+    r = cfg.multi([a, a + 0.3])
+    assert r["two"] and r["test"] == "paired t-test" and r["effect_name"] == "Cohen's d_z"
+    assert "paired t-test with Cohen's d_z for two values" in cfg.method_text("multi", 3)

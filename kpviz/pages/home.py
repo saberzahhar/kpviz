@@ -138,7 +138,8 @@ def _inventory():
     n_gold = db.q1("SELECT sum(n) FROM gold_agg WHERE ann_key <> '@combined'")
     n_kp = db.q1("SELECT count(*), count(nullif(pos, '')) FROM keyphrases")
     n_runs = db.q1("SELECT count(*) FROM runs")
-    n_preds = db.q1("SELECT count(*), sum(n_preds) FROM preds")
+    n_preds = db.q1("SELECT count(*), sum(n_preds), "
+                    "count(DISTINCT dataset || chr(0) || doc_id) FROM preds")
     n_ds = db.q1("SELECT count(DISTINCT dataset) FROM documents")
     size = db.q1("SELECT sum(size) FROM files")
     tiles = [
@@ -155,7 +156,8 @@ def _inventory():
         ui.stat_tile("Runs", n_runs[0] if n_runs else 0,
                      f"{counts.get('batch_preds', 0)} batch files"),
         ui.stat_tile("Predictions", human_count(n_preds[1] or 0) if n_preds else 0,
-                     f"over {human_count(n_preds[0] or 0)} documents" if n_preds else ""),
+                     f"{human_count(n_preds[0] or 0)} (run, document) lines · "
+                     f"{human_count(n_preds[2] or 0)} documents" if n_preds else ""),
     ]
     return html.Div([html.H3("Catalog", className="section-title"),
                      ui.kpi_row(tiles)])
@@ -355,11 +357,11 @@ def register(app):
         Output("home-inventory", "children"),
         Output("home-backends", "children"),
         Output("home-issues", "children"),
-        Input("vis-home", "data"),
+        State("vis-home", "data"), Input("shown-home", "data"),
         Input("catalog-version", "data"),
         Input("issues-groupby", "value"),
         prevent_initial_call=True)
-    def static(visible, _v, groupby):
+    def static(visible, _shown, _v, groupby):
         """Catalog, engine and issues: on show, after a scan publishes, or
         when the grouping changes — never on a timer."""
         if not visible:

@@ -1,0 +1,50 @@
+# python tools/kpviz_scaling_benchmark.py --quick --repeats 2   (2026-09-28, 4 vCPU container)
+KPViz scaling benchmark  —  min of 2 repeats
+
+### Scaling N (documents); V=5000, L=256
+
+  N=250   (N=250 docs, V=5000 vocab, L=256 tok, 6250 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise      220.9ms      3.7ms      2.4ms     30.8ms   59.5×   92.5×    7.2×
+    Stem          142.9ms      2.2ms      1.4ms      2.2ms   65.5×  100.2×   64.4×
+    PRMU           1.67s      43.6ms     40.9ms    121.9ms   38.4×   41.0×   13.7×
+
+  N=1000   (N=1000 docs, V=5000 vocab, L=256 tok, 25000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise      915.5ms     15.2ms      5.4ms    138.8ms   60.2×  170.5×    6.6×
+    Stem          557.6ms      9.6ms      4.7ms      9.7ms   58.3×  118.0×   57.3×
+    PRMU           6.82s     186.8ms    167.7ms    420.9ms   36.5×   40.7×   16.2×
+
+  N=4000   (N=4000 docs, V=5000 vocab, L=256 tok, 100000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise       3.59s      59.4ms      7.7ms    485.3ms   60.5×  466.0×    7.4×
+    Stem           2.21s      43.2ms     16.7ms     40.6ms   51.2×  132.4×   54.5×
+    PRMU          27.24s     718.1ms    645.0ms     1.56s    37.9×   42.2×   17.4×
+
+### Scaling V (shared vocabulary); N=2000, L=256
+
+  V=1000   (N=2000 docs, V=1000 vocab, L=256 tok, 50000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise       1.78s      29.3ms      3.6ms    242.4ms   60.6×  494.0×    7.3×
+    Stem           1.08s      18.6ms      7.2ms     17.9ms   57.9×  150.6×   60.3×
+    PRMU          13.36s     355.6ms    286.5ms    707.0ms   37.6×   46.6×   18.9×
+
+  V=8000   (N=2000 docs, V=8000 vocab, L=256 tok, 50000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise       1.75s      29.6ms      8.3ms    269.6ms   59.3×  211.5×    6.5×
+    Stem           1.10s      24.8ms     10.4ms     21.8ms   44.4×  106.2×   50.5×
+    PRMU          13.24s     370.2ms    322.3ms    835.6ms   35.8×   41.1×   15.8×
+
+### Scaling L (document length); N=2000, V=5000
+
+  L=128   (N=2000 docs, V=5000 vocab, L=128 tok, 50000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise       1.76s      27.7ms      6.5ms    260.9ms   63.3×  269.5×    6.7×
+    Stem           1.09s      20.3ms      9.2ms     19.1ms   53.8×  118.7×   57.3×
+    PRMU           8.53s     238.6ms    201.7ms    587.6ms   35.7×   42.3×   14.5×
+
+  L=1024   (N=2000 docs, V=5000 vocab, L=1024 tok, 50000 keyphrase occurrences)
+    component        SoTA       Ours  Ours+cache    Shipped   Ours×  cache×   ship×
+    Tokenise       1.83s      30.2ms      5.5ms    259.7ms   60.6×  331.5×    7.1×
+    Stem           1.15s      19.8ms      9.7ms     20.6ms   58.2×  119.2×   55.8×
+    PRMU          45.15s      1.20s      1.15s      2.59s    37.5×   39.1×   17.4×

@@ -22,7 +22,8 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
-    from . import derive, textproc  # noqa: F401  (the worker entry points)
+    from . import derive, textproc  # the worker entry points
+    _loaded = (derive, textproc)
     for _lang in filter(None, os.environ.get("KPVIZ_PRELOAD_LANGS", "").split(",")):
         try:
             textproc._blank(_lang)

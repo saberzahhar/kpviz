@@ -114,3 +114,69 @@ def test_other_engines(specs, tmp_path, engine):
     body = _body(specs["rq2"], "rq2", tmp_path, "generic", "auto")
     code, log = _compile(tmp_path, body, "generic", engine)
     assert code == 0, log[-3000:]
+
+
+# ---- export robustness (second review round: N2, N5, N15) --------------------
+def _bar(label, name="t"):
+    return {"kind": "bar", "size": "1col", "name": name, "xlabel": "x",
+            "ylabel": "F1", "series": [{"name": "s", "x": [label, "b"],
+                                        "y": [0.5, 0.6], "color": "#2a78d6"}]}
+
+
+@pytest.mark.parametrize("label", [r"prompt=Extract\nkeyphrases", "cost $ per doc",
+                                   "50% of it", "x^2", "a_b & c #1 {d} ~e"])
+def test_tex_specials_in_labels_typeset(label):
+    from kpviz import export
+    pdf, method, note = export.fig_pdf(_bar(label, "spec-" + label))
+    assert pdf[:5] == b"%PDF-" and method.startswith("TeX"), (method, note)
+    assert not export._demoted
+
+
+def test_figure_failure_does_not_demote_the_engine(monkeypatch):
+    """A figure TeX cannot set falls back for *that* figure; the engine stays
+    offered as long as the probe figure still compiles."""
+    from kpviz import export, figures
+    real = figures.render
+    calls = {"n": 0}
+
+    def flaky(spec, tex, fmt, **kw):
+        if spec.get("name") == "unsettable" and kw.get("backend") == "pgf":
+            calls["n"] += 1
+            raise RuntimeError("LaTeX was not able to process\n! Undefined control sequence.")
+        return real(spec, tex, fmt, **kw)
+    monkeypatch.setattr(export, "render", flaky)
+    pdf, method, note = export.fig_pdf(_bar("fine", "unsettable"))
+    assert pdf[:5] == b"%PDF-" and method == "Matplotlib"
+    assert "could not typeset this figure" in note
+    assert not export._demoted
+    ok_pdf, ok_method, _ = export.fig_pdf(_bar("fine", "settable"))
+    assert ok_method.startswith("TeX")
+
+
+def test_pdf_during_probe_never_waits_on_the_render_lock(tmp_path, monkeypatch):
+    """N15: the engine is resolved before the render lock; a PDF asked for
+    while the probe runs returns as soon as the probe does."""
+    import time
+    from kpviz import export
+    monkeypatch.setattr(export, "_probe_file", lambda: tmp_path / "probe.json")
+    monkeypatch.setitem(export._probe, "status", "idle")
+    export.start_tex_probe()
+    t0 = time.time()
+    _pdf, method, _note = export.fig_pdf(_bar("race", "race"))
+    assert time.time() - t0 < 60 and method.startswith("TeX")
+
+
+def test_snippet_download_and_bundle_agree_on_names():
+    import io
+    import zipfile
+    from kpviz import export
+    spec = dict(_bar("a", "pareto usd"), export={"venue": "acl"}, caption="c")
+    stem, ref = export.export_name(spec)
+    assert (stem, ref) == ("pareto-usd-acl", "figures/pareto-usd-acl")
+    z = zipfile.ZipFile(io.BytesIO(export.export_bundle(spec)))
+    names = set(z.namelist())
+    assert {f"{stem}.pdf", f"{stem}.png", f"{stem}.tex", "provenance.json"} <= names
+    tex = z.read(f"{stem}.tex").decode()
+    assert f"{ref}.pgf" in tex or f"{ref}.pdf" in tex
+    readme = z.read("README.txt").decode()
+    assert "Verified to compile" not in readme and "PDF rendered via: TeX" in readme

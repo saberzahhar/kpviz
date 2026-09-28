@@ -2,17 +2,19 @@
 
    Every page and workbench stays mounted (control state survives navigation),
    but only the visible ones may compute: this callback turns the URL and the
-   Insights tab into one boolean store per page and per workbench. Server
-   callbacks listen to their own store, so a hidden page costs nothing, and a
-   store is only written when its value actually changes (no_update
-   otherwise), so showing one workbench wakes one set of callbacks. */
+   Insights tab into one boolean store per page and per workbench (vis-*,
+   read by server callbacks as State) and one "shown" counter each (shown-*,
+   their Input), bumped when it appears. Leaving a page therefore wakes no
+   callback, and showing one workbench wakes one set of callbacks. */
 window.dash_clientside = Object.assign({}, window.dash_clientside, {
   kpviz: {
     route: function (pathname, activeRq) {
       var pages = ["/", "/datasets", "/models", "/architectures", "/insights"];
       var rqs = ["rq1", "rq2", "rq3", "rq4", "rq5"];
-      var nPages = pages.length;
+      var nPages = pages.length, nRqs = rqs.length;
       var states = Array.prototype.slice.call(arguments, 2);
+      var visSt = states.slice(0, nPages + nRqs);        // vis-* (booleans)
+      var shownSt = states.slice(nPages + nRqs);         // shown-* (counters)
       var path = pages.indexOf(pathname) >= 0 ? pathname : "/";
       var noUp = window.dash_clientside.no_update;
       var styles = pages.map(function (p) {
@@ -21,15 +23,18 @@ window.dash_clientside = Object.assign({}, window.dash_clientside, {
       var classes = pages.map(function (p) {
         return p === path ? "nav-link active" : "nav-link";
       });
-      var vis = pages.map(function (p, i) {
-        var v = p === path;
-        return v === states[i] ? noUp : v;
+      var want = pages.map(function (p) { return p === path; }).concat(
+        rqs.map(function (rq) {
+          return path === "/insights" && (activeRq || "rq4") === rq;
+        }));
+      // vis-* follow visibility both ways (servers read them as State);
+      // shown-* are bumped only when something becomes visible — the one
+      // Input that wakes a page, so hiding a page costs no request at all
+      var vis = want.map(function (v, i) { return v === visSt[i] ? noUp : v; });
+      var shown = want.map(function (v, i) {
+        return (v && !visSt[i]) ? (shownSt[i] || 0) + 1 : noUp;
       });
-      var rqVis = rqs.map(function (rq, i) {
-        var v = path === "/insights" && (activeRq || "rq4") === rq;
-        return v === states[nPages + i] ? noUp : v;
-      });
-      return styles.concat(classes, vis, rqVis);
+      return styles.concat(classes, vis, shown);
     },
     tabs: function () {
       /* Insights tab buttons: the clicked one becomes active */

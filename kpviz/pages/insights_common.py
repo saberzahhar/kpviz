@@ -15,18 +15,51 @@ from ..util import stable_hash
 
 
 def vis(rq: str) -> str:
-    """Id of the store that is True while this workbench is on screen."""
+    """Id of the store that is True while this workbench is on screen. Read
+    as a State: hiding a page writes False here without waking anything."""
     return f"vis-{rq}"
 
 
+def shown(rq: str) -> str:
+    """Id of the counter the router bumps each time this workbench is
+    *shown* — the Input that (re)renders it. Nothing listens to hiding."""
+    return f"shown-{rq}"
+
+
+# scan steps that delete or insert derived rows: while one runs, the tables
+# a workbench reads are half-written (a purged collection, a run being
+# re-matched), so nothing is computed — or cached — from them
+_WRITE_STEPS = {"documents", "inferences", "keyphrases", "scores", "finalize"}
+
+
+def catalog_unavailable() -> str | None:
+    """Why analyses are withheld right now, or None.
+
+    "scanning": a scan is writing the store. "incomplete": the last scan
+    failed or was cancelled after it had started deleting — the store may
+    mix old and new rows until a scan completes. Workbenches and exports
+    stay on what was shown before, and the Insights banner says why."""
+    snap = scanner.STATE.snapshot()
+    if snap["running"] and any(s["status"] == "running" and s["key"] in _WRITE_STEPS
+                               for s in snap["steps"]):
+        return "scanning"
+    if db.scan_version() and memo("last_scan_ok",
+                                  lambda: bool(db.kv_get("last_scan_ok", True)),
+                                  64) is False:
+        return "incomplete"
+    return None
+
+
 def gate(visible, inputs, last_sig) -> str:
-    """Compute only what is on screen, and only when something changed.
+    """Compute only what is on screen, only when something changed, and
+    only from a coherent catalog.
 
     Returns the signature of this view (its inputs + the catalog version);
-    raises PreventUpdate when the workbench is hidden, or when it is shown
-    again with nothing changed. The signature lives in a per-client store,
-    so a second tab or a reload still renders."""
-    if not visible:
+    raises PreventUpdate when the workbench is hidden, when a scan is
+    writing the store (or the last one left it incomplete), or when it is
+    shown again with nothing changed. The signature lives in a per-client
+    store, so a second tab or a reload still renders."""
+    if not visible or catalog_unavailable():
         raise PreventUpdate
     sig = stable_hash([inputs, db.scan_version()])
     if sig == last_sig:
@@ -168,12 +201,12 @@ def register_dataset_refresh(app, dropdown_id: str, multi: bool,
 
     @app.callback(Output(dropdown_id, "options"),
                   Output(dropdown_id, "value"),
-                  Input(vis(rq), "data"),
+                  State(vis(rq), "data"), Input(shown(rq), "data"),
                   Input("catalog-version", "data"),
                   State(dropdown_id, "options"),
                   State(dropdown_id, "value"),
                   prevent_initial_call=True)
-    def _refresh(visible, _v, cur_opts, current):
+    def _refresh(visible, _shown, _v, cur_opts, current):
         if not visible:
             raise PreventUpdate
         ds = datasets_with_runs()
@@ -247,11 +280,11 @@ def register_model_run_chain(app, prefix: str, multi_ds: bool,
 
     @app.callback(Output(f"{prefix}-models", "options"),
                   Output(f"{prefix}-models", "value"),
-                  Input(vis(prefix), "data"),
+                  State(vis(prefix), "data"), Input(shown(prefix), "data"),
                   Input(f"{prefix}-ds", "value"),
                   State(f"{prefix}-models", "value"),
                   prevent_initial_call=True)
-    def _models(visible, ds_sel, current):
+    def _models(visible, _shown, ds_sel, current):
         if not visible:
             raise PreventUpdate
         ds = (ds_sel or []) if multi_ds else ([ds_sel] if ds_sel else [])
@@ -262,12 +295,12 @@ def register_model_run_chain(app, prefix: str, multi_ds: bool,
 
     @app.callback(Output(f"{prefix}-runs", "options"),
                   Output(f"{prefix}-runs", "value"),
-                  Input(vis(prefix), "data"),
+                  State(vis(prefix), "data"), Input(shown(prefix), "data"),
                   Input(f"{prefix}-ds", "value"),
                   Input(f"{prefix}-models", "value"),
                   State(f"{prefix}-runs", "value"),
                   prevent_initial_call=True)
-    def _runs(visible, ds_sel, models_sel, current):
+    def _runs(visible, _shown, ds_sel, models_sel, current):
         if not visible:
             raise PreventUpdate
         ds = (ds_sel or []) if multi_ds else ([ds_sel] if ds_sel else [])
@@ -347,9 +380,11 @@ def gold_phrase(ann_choice: str | None, datasets: list[str]) -> str:
     return "; ".join(f"{g} ({', '.join(d)})" for g, d in groups.items())
 
 
-CONVENTIONS = ("predictions and gold lowercased, spaCy-tokenised, "
-               "Snowball (Porter2) stemmed and de-duplicated keeping rank "
-               "order; P@k = tp / min(k, #predictions) (no padding); "
+CONVENTIONS = ("predictions and gold lowercased, spaCy-tokenised and "
+               "Snowball (Porter2) stemmed; predictions de-duplicated keeping "
+               "rank order, gold de-duplicated per annotation set; PRMU "
+               "contiguous (Boudin & Gallina, 2021); "
+               "P@k = tp / min(k, #predictions) (no padding); "
                "documents with no gold after filtering excluded")
 
 
@@ -362,7 +397,7 @@ def metric_caption(measure: str, k: str, prmu: list[str], ann: str | None,
         extra = (", restricted to the "
                  + "/".join({"P": "Present", "R": "Reordered", "M": "Mixed",
                              "U": "Unseen"}[p] for p in prmu)
-                 + " classes (in-order PRMU)")
+                 + " classes; every prediction still counts in P@k")
     return (f"{lab}, macro-averaged over documents, against {gold}{extra}; "
             f"{CONVENTIONS}.")
 

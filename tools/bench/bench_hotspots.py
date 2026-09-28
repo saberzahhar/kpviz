@@ -5,7 +5,7 @@ Each pair runs the *old* strategy and the *new* one over the same rows in the
 same database, so the ratio isolates the change. Numbers are hardware
 specific — run it on your workstation and cite those.
 
-    python tools/bench_hotspots.py --data DIR --state DIR
+    python tools/bench/bench_hotspots.py --data DIR --state DIR
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def timed(fn):
@@ -125,7 +125,7 @@ def main() -> int:
     con.execute("DROP TABLE IF EXISTS bench_files")
     con.execute("CREATE TABLE bench_files(relpath VARCHAR PRIMARY KEY, "
                 "file_id BIGINT, size BIGINT)")
-    sample = db.q(f"SELECT relpath, file_id, size FROM files LIMIT 5000")
+    sample = db.q("SELECT relpath, file_id, size FROM files LIMIT 5000")
 
     def old_rows():
         for rel, fid, size in sample:
