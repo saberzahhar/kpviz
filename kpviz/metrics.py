@@ -7,7 +7,8 @@ leakage-excluded documents, …) reduces to counting pairs — no re-matching, n
 re-reading files.
 
 Conventions (documented in every export caption):
-  * predictions are lowercased, spaCy-tokenised, stemmed and de-duplicated,
+  * predictions are lowercased, tokenised (Unicode words), stemmed and
+    de-duplicated,
     keeping first occurrence order; gold '+'-variants all count as the same
     keyphrase;
   * P@k = tp / min(k, #unique predictions)   (no padding penalty),
@@ -126,7 +127,8 @@ def _from_run_metrics(dataset: str, run_keys: list[tuple], ann_key: str,
 # Per-dataset document index and compact per-document results
 # ---------------------------------------------------------------------------
 class DocIndex:
-    """Sorted document ids of one dataset; position = ordinal."""
+    """Sorted ids of the documents of one dataset that carry gold (the only
+    ones a score can exist for); position = ordinal."""
 
     __slots__ = ("ids", "pos")
 
@@ -237,11 +239,14 @@ def values_at(r: PerDoc, ords: np.ndarray) -> np.ndarray:
 
 
 def doc_index(dataset: str) -> DocIndex:
-    """The dataset's document index for the current catalog (cached)."""
+    """The dataset's document index for the current catalog (cached).
+
+    Documents with gold only, as in `_scores_sql`'s `di`: a training split
+    of millions of documents never scored must not be listed per query."""
     key = ("docindex", dataset, db.scan_version())
 
     def build():
-        ids = [r[0] for r in db.q("""SELECT DISTINCT doc_id FROM documents
+        ids = [r[0] for r in db.q("""SELECT DISTINCT doc_id FROM gold
                                      WHERE dataset=? ORDER BY doc_id""", dataset)]
         idx = DocIndex(ids)
         return idx, sum(len(d) + 120 for d in ids)   # ~ bytes of str + dict slot
@@ -298,7 +303,7 @@ def _scores_sql(n_runs: int, prmu: bool, need_pos: bool, tok: bool,
     return f"""
     WITH sel(ri, model, arch, run_id) AS (VALUES {runs}),
     di AS (SELECT doc_id, (row_number() OVER (ORDER BY doc_id) - 1)::INTEGER AS ord
-           FROM (SELECT DISTINCT doc_id FROM documents WHERE dataset = $ds)),{gold_cte}
+           FROM (SELECT DISTINCT doc_id FROM gold WHERE dataset = $ds)),{gold_cte}
     base AS (
       SELECT sel.ri, m.doc_id, m.n_uniq,
              {n_allowed} AS n_al, m.pred_ranks, m.gold_idxs{allowed}

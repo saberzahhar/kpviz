@@ -167,9 +167,11 @@ def test_unknown_tiktoken_encoding_is_explained(user_tree):
     con = _db(state)
     kv = dict(con.execute("SELECT k, v FROM kv").fetchall())
     tok = json.loads(kv["tokenizers"])
+    # not a tiktoken encoding: the Llama 3 tokenizer.json is read from the
+    # hub instead — offline here, so approximate, and the reason says where
     llama = tok["tiktoken[llama3]"]
     assert llama["status"] == "approx"
-    assert "no 'llama3' encoding" in llama.get("why", "")
+    assert "meta-llama/" in llama.get("why", "")
 
 
 def test_exact_tokenizer_from_local_file(tmp_path):

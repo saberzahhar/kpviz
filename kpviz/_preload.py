@@ -2,13 +2,12 @@
 
 Every scan worker forks from the forkserver, so what is imported and built
 here is paid once per server process instead of once per worker per scan:
-spaCy itself, and the blank tokenizers of the languages the catalog
-declares. French alone is ~3.8 s per worker (spaCy compiles one very large
-tokenizer-exception regex at import).
+the worker modules, the Unicode-complete tokenizer patterns and the
+stemmers of the languages the catalog declares.
 
-Thread pools are pinned *before* NumPy/spaCy load here: OpenBLAS and Rayon
-size their pools at load time, which is before `derive.init_worker` runs in
-a child, and forking a process with live BLAS threads is what the pinning
+Thread pools are pinned *before* NumPy loads here: OpenBLAS and Rayon size
+their pools at load time, which is before `derive.init_worker` runs in a
+child, and forking a process with live BLAS threads is what the pinning
 avoids. This module runs in the forkserver only; the server process keeps
 its own settings.
 """
@@ -24,9 +23,9 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 try:
     from . import derive, textproc  # the worker entry points
     _loaded = (derive, textproc)
+    textproc._complex()
     for _lang in filter(None, os.environ.get("KPVIZ_PRELOAD_LANGS", "").split(",")):
         try:
-            textproc._blank(_lang)
             textproc.stem_tokens(["preload"], _lang)
         except Exception:
             pass

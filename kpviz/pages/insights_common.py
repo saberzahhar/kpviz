@@ -380,8 +380,8 @@ def gold_phrase(ann_choice: str | None, datasets: list[str]) -> str:
     return "; ".join(f"{g} ({', '.join(d)})" for g, d in groups.items())
 
 
-CONVENTIONS = ("predictions and gold lowercased, spaCy-tokenised and "
-               "Snowball (Porter2) stemmed; predictions de-duplicated keeping "
+CONVENTIONS = ("predictions and gold NFKC-normalised, lowercased, split "
+               "into Unicode words and Snowball-stemmed; predictions de-duplicated keeping "
                "rank order, gold de-duplicated per annotation set; PRMU "
                "contiguous (Boudin & Gallina, 2021); "
                "P@k = tp / min(k, #predictions) (no padding); "

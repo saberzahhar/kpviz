@@ -15,6 +15,7 @@ from dash.exceptions import PreventUpdate
 from .. import db, scanner, ui
 from ..figures import MUTED, PATTERNS, to_plotly
 from ..metrics import memo
+from ..textproc import fix_text
 from ..naming import (group_key, natural_key, order_splits, parse_group_key,
                       run_labels, run_rows, split_color,
                       split_rank, tokenizer_label)
@@ -379,15 +380,14 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
             d = data.setdefault((a, sp), {})
             d[key] = d.get(key, 0) + n
         cats = sorted({k for d in data.values() for k in d}, key=natural_key)
-        # keyphrase length lives in spaCy word tokens; the tokenizer selector
-        # drives the *document* length panel, so name the unit honestly
+        # keyphrase length is in words; the tokenizer selector drives the
+        # *document* length panel only
         spec = {"kind": "bar", "barmode": "group",
                 "xlabel": f"length ({WORDS_TOK})",
                 "ylabel": "% of the group's gold", "yrange": [0, 100],
                 "series": _group_series(data, cats, anns, splits),
                 "size": "1col", "name": f"kp-length-{ds}",
-                "caption": (f"Length of the gold keyphrases of {ds} in spaCy "
-                            "word tokens, per annotation set and split.")}
+                "caption": (f"Length of the gold keyphrases of {ds} in words, per annotation set and split.")}
         c1 = ui.exportable("ds-kplen", spec,
                            ui.graph("ds-g-kplen", to_plotly(spec), PANEL_H),
                            title="Keyphrase length", style={"minWidth": 0})
@@ -623,7 +623,9 @@ def register(app):
                 html.Div(f"{s.get('field')} · "
                          f"{','.join(declared_langs(s)) or 'language from the card'}",
                          className="doc-field"),
-                html.Div(s.get("content", ""), className="doc-text"),
+                # Windows-1252 bytes read as Latin-1 ("d\x92analyse") shown
+                # as the characters they were
+                html.Div(fix_text(s.get("content", "")), className="doc-text"),
             ], className="doc-section"))
         gold_rows = db.q("""SELECT g.ann_key, coalesce(g.surface, g.display),
                                    g.prmu, k.pos, g.n_words
@@ -687,7 +689,7 @@ def _explain(ds: str, doc_id: str, key: tuple, ann: str):
     if line is None or str(line.get("_id")) != str(doc_id):
         return html.Div("the prediction file changed since the last scan — "
                         "rescan to explain this run", className="ins-banner")
-    raw = [str(x) for x in (line.get("inferences") or [])]
+    raw = [fix_text(str(x)) for x in (line.get("inferences") or [])]
     lang = (scanner.cards().dataset(ds).languages[:1] or ["en"])[0]
     cache = PhraseCache(max_size=4096)
     an = [cache.analyze(x, lang, persist=False) for x in raw]

@@ -95,8 +95,10 @@ def _guide():
                      "not as that sequence; Mixed — some; Unseen — none. A "
                      "PRMU filter restricts the gold only: every prediction "
                      "still counts in P@k."),
-                item("Matching", "predictions and gold lowercased, spaCy-"
-                     "tokenised, Snowball (Porter2)-stemmed; predictions "
+                item("Matching", "predictions and gold NFKC-normalised, "
+                     "lowercased, split into Unicode words (letters, digits "
+                     "and combining marks; one token per Chinese or Japanese "
+                     "character), Snowball-stemmed in their language; predictions "
                      "de-duplicated keeping rank order, gold de-duplicated "
                      "per annotation set; a repeated document or prediction "
                      "line counts once (first line)."),

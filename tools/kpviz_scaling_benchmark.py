@@ -23,9 +23,10 @@ Each component is measured four ways:
     Ours (cached) the same, each *unique* phrase analysed once (the cache
                   KPViz keeps across a corpus)
     Shipped       the code path KPViz actually runs, imported from
-                  kpviz.textproc: spaCy blank tokeniser + PyStemmer +
-                  contiguous PRMU with segment boundaries, phrases through
-                  its PhraseCache (run from the repository root)
+                  kpviz.textproc: its regex tokeniser with separator
+                  sentinels + PyStemmer + contiguous PRMU as a C substring
+                  search, phrases through its PhraseCache (run from the
+                  repository root)
 
 All PRMU columns use the same definition (Boudin & Gallina's contiguous P),
 so the comparison is like for like.
@@ -200,14 +201,14 @@ def bench_tokenize(docs, mode):
     strings = [kp for _, kps in docs for kp in kps]
     if mode == "shipped":
         tp = _shipped()
-        tp.spacy_word_tokens("warm up", "en")
+        tp.phrase_tokens("warm up")
     t0 = time.perf_counter()
     if mode == "sota":
         for s in strings: sota_tokenize(s)
     elif mode == "ours":
         for s in strings: ours_tokenize(s)
-    elif mode == "shipped":  # spaCy blank tokeniser, every occurrence
-        for s in strings: tp.spacy_word_tokens(s, "en")
+    elif mode == "shipped":  # KPViz's phrase tokeniser, every occurrence
+        for s in strings: tp.phrase_tokens(tp.norm_phrase(s))
     else:  # ours+cache: unique strings only
         cache = {}
         for s in strings:
@@ -259,11 +260,11 @@ def bench_prmu(docs, mode):
         pc = tp.PhraseCache()
         stem = tp.get_stemmer("en").stemWords
         for text, kps in docs:
-            low = tp.norm_text(text)
-            words, _ends, seg = tp.spacy_doc_stream(text, "en", low, [0])
-            doc = tp.StemmedDoc(stem(words), seg)
+            doc = tp.StemmedDoc(stem(tp.tokens(tp.norm_text(text))))
             for k in kps:
-                tp.prmu_classify([pc.analyze(k, "en")["stems"]], doc)
+                e = pc.analyze(k, "en")
+                tp.prmu_classify([e["stems"]], doc,
+                                 [e["pstems"]] if e["pstems"] else None)
     return time.perf_counter() - t0
 
 

@@ -24,10 +24,12 @@ class Settings:
     workers: int = 0            # 0 -> derived from the budget
     io_workers: int = 0         # 0 -> derived (hashing / stat fan-out)
     db_threads: int = 0         # 0 -> derived (DuckDB during a scan)
-    # Scope of the expensive derivations. "eval" = testing/validation splits
-    # only (runs are evaluated on those), "all" = every split. Distribution
-    # charts always cover every split through gold_agg regardless.
-    token_scope: str = "eval"     # per-tokenizer doc token counts + kp positions
+    # Scope of the derivations. "eval" = testing/validation splits only
+    # (runs are evaluated on those), "all" = every split. Document lengths
+    # in model tokens cover every split by default; gold positions are only
+    # ever needed where runs are scored. Distribution charts always cover
+    # every split through gold_agg.
+    token_scope: str = "all"      # per-tokenizer document token counts
     gold_scope: str = "eval"      # gold *instance* rows (+ always: flagged docs)
     # "auto": content-hash a file only when size/mtime moved (nothing to
     # compare against on a first scan, so hashing it then is pure I/O cost).

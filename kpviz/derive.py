@@ -1,9 +1,9 @@
 """Worker-side derivations.
 
 Per chunk of a document collection, one pass does everything except POS:
-spaCy-blank tokens (C path), PyStemmer stems (one C call per document),
-contiguous PRMU anchored on position indices, gold de-duplicated per
-annotation set, tokenizer counts and positions from one
+regex word tokens with separator sentinels, PyStemmer stems (one C call
+per document), contiguous PRMU as a C substring search, gold de-duplicated
+per annotation set, tokenizer counts and positions from one
 encoding per document, and a worker-local phrase cache so each unique
 (language, keyphrase) is analysed once per process. POS tagging happens in
 its own scan phase over globally unique untagged gold phrases.
@@ -194,7 +194,7 @@ def derive_doc_chunk(args: dict) -> dict:
     card_anns: dict = args["card"].get("anns", {})
     optional = set(args["card"].get("optional") or ())
     emit_combined = args["card"].get("combined", False)
-    token_scope = args.get("token_scope", "eval")
+    token_scope = args.get("token_scope", "all")
     gold_scope = args.get("gold_scope", "eval")
     toks = _tokenizers(args)
 
@@ -202,47 +202,44 @@ def derive_doc_chunk(args: dict) -> dict:
     gold_rows: list[dict] = []
     tok_rows: list[dict] = []
     tokpos_rows: list[dict] = []
-    pending: list[tuple] = []   # (doc_id, text, P-gold refs, byte offset)
+    # (doc_id, text or None, P-gold refs, byte offset, word count)
+    pending: list[tuple] = []
     agg: dict[tuple, list] = {}
     bad: list[int] = []
     n_docs = n_noid = n_gold_empty = n_gold_dup = 0
+    pos_specs = set(args.get("pos_tokenizers") or args.get("tokenizers") or ())
+    need_text = any(tk.exact for tk in toks)
+    SENT = tp.SENT
 
     def flush_tokens():
-        """Tokenizer counts + gold token positions for the pending documents,
-        then release their text (a chunk's worth of text held twice is the
-        one place worker RSS could grow without bound).
+        """Tokenizer counts (every document in scope) and gold token
+        positions (documents with present gold, for the tokenizers of the
+        models evaluated on this dataset), then release the texts.
 
-        One encoding per document and tokenizer: documents with present gold
-        get a full encoding (its length *is* the count); the rest are counted
-        in one batch. Approximate tokenizers share one regex pass per
-        document."""
+        One encoding per document and tokenizer: documents with positions
+        to compute get a full encoding (its length *is* the count); the rest
+        are counted in one batch. An approximate tokenizer needs no text at
+        all for a count — it scales the document's word count."""
         if not toks or not pending:
             pending.clear()
             return
-        starts_cache: dict[int, list[int]] = {}
-
-        def word_starts(i, text):
-            got = starts_cache.get(i)
-            if got is None:
-                got = starts_cache[i] = [m.start() for m in
-                                         tp._WORD_RE.finditer(text)]
-            return got
-
         for tk in toks:
             exact = tk.exact
             ratio = None if exact else tk._resolve()[1]
-            plain = [i for i, (_d, _t, g, _o) in enumerate(pending) if not g or not exact]
+            with_pos = tk.spec in pos_specs
+            plain = [i for i, (_d, _t, g, _o, _n) in enumerate(pending)
+                     if not (g and with_pos)]
             counts: dict[int, int] = {}
             if exact and plain:
                 got, _ap = tk.count_batch([pending[i][1] for i in plain])
                 counts.update(zip(plain, got))
-            for i, (doc_id, text, gold_p, src_off) in enumerate(pending):
+            for i, (doc_id, text, gold_p, src_off, n_words) in enumerate(pending):
                 enc = None
+                gold_p = gold_p if with_pos else ()
                 if not exact:
-                    ws = word_starts(i, text)
-                    counts[i] = int(round(len(ws) * ratio))
+                    counts[i] = int(round(n_words * ratio))
                     if gold_p:
-                        enc = {"kind": "approx", "starts": ws}
+                        enc = tk.encode_cached(text)
                 elif gold_p:
                     enc = tk.encode_cached(text)
                     counts[i] = enc.get("n", 0)
@@ -284,18 +281,25 @@ def derive_doc_chunk(args: dict) -> dict:
             fieldname = s.get("field") or "?"
             declared = declared_langs(s) or card_sections.get(fieldname) or []
             sections.append((fieldname, declared, s.get("content") or ""))
-        full_text = SECTION_JOIN.join(c for _f, _l, c in sections)
 
+        # one tokenisation per section, reused for the word count, the
+        # language check and (joined, with a sentinel between sections) the
+        # document's token stream
         flags: list[str] = []
-        sec_meta, detected, declared_union = [], [], []
+        sec_meta, detected, declared_union, sec_toks = [], [], [], []
+        n_words = 0
         for fieldname, declared, content in sections:
-            words = tp.tokenize(content)          # full text, never sampled
-            det, _conf = tp.detect_language(content, tokens=words)
+            tk_ = tp.tokens(tp.norm_text(content))
+            nw_ = len(tk_) - tk_.count(SENT)
+            scores = tp.language_scores(tk_, nw_) if nw_ >= 5 else {}
+            det = tp.best_language(scores)
             detected.append(det)
-            if det and declared and det not in [l[:2] for l in declared]:
+            if tp.contradicts(scores, declared):
                 flags.append(f"lang_mismatch:section:{fieldname}")
             sec_meta.append({"field": fieldname, "langs": declared, "det": det,
-                             "chars": len(content), "words": len(words)})
+                             "chars": len(content), "words": nw_})
+            sec_toks.append(tk_)
+            n_words += nw_
             for l in declared:
                 if l not in declared_union:
                     declared_union.append(l)
@@ -303,32 +307,6 @@ def derive_doc_chunk(args: dict) -> dict:
         for fieldname in card_sections:
             if fieldname not in present_fields and fieldname not in optional:
                 flags.append(f"missing_section:{fieldname}")
-
-        # one normalisation per document, shared by every language stream;
-        # token ends are mapped back to original-text offsets when NFKC or
-        # lowercasing changed the length
-        lowered, offmap = tp.norm_with_offsets(full_text)
-        # where each section starts in the normalised text: a contiguous
-        # (P) occurrence never spans two sections
-        sec_starts, at = [], 0
-        for _f, _l, c in sections:
-            sec_starts.append(at if offmap is None
-                              else bisect.bisect_left(offmap, at))
-            at += len(c) + len(SECTION_JOIN)
-        streams: dict[str, tuple] = {}
-
-        def stream(lang: str | None):
-            lang2 = (lang or "en")[:2]
-            got = streams.get(lang2)
-            if got is None:
-                words, ends, seg = tp.spacy_doc_stream(full_text, lang2, lowered,
-                                                       sec_starts)
-                if offmap is not None:
-                    ends = [offmap[e] for e in ends]
-                stems = tp.get_stemmer(lang2).stemWords(words)
-                got = (tp.StemmedDoc(stems, seg), ends)
-                streams[lang2] = got
-            return got
 
         anns = obj.get("annotations") or []
         ann_counts: dict[str, int] = {}
@@ -344,18 +322,58 @@ def derive_doc_chunk(args: dict) -> dict:
             kps = a.get("keyphrases") or []
             ann_counts[key] = len(kps)
             if kps:
-                joined = " ".join(tp.split_variants(str(k))[0] for k in kps)
-                det, _ = tp.detect_language(joined, min_tokens=6)
-                if det and langs and det not in [l[:2] for l in langs]:
+                words = tp.tokenize(" ".join(tp.split_variants(str(k))[0]
+                                             for k in kps))
+                scores = tp.language_scores(words) if len(words) >= 6 else {}
+                if tp.contradicts(scores, langs):
                     flags.append(f"lang_mismatch:ann:{key}")
         keep_gold = (gold_scope == "all") or eval_doc or bool(flags)
+
+        full_text = None
+        if keep_gold or need_text:
+            full_text = SECTION_JOIN.join(c for _f, _l, c in sections)
+        if keep_gold:
+            # stored gold needs where each present keyphrase ends in the
+            # original text: tokenise the whole normalised document with
+            # offsets, mapped back through the normalisation, with a
+            # sentinel where a section starts
+            lowered, offmap = tp.norm_with_offsets(full_text)
+            starts, at = [], 0
+            for _f, _l, c in sections[:-1]:      # where each later one starts
+                at += len(c) + len(SECTION_JOIN)
+                starts.append(at if offmap is None
+                              else bisect.bisect_left(offmap, at))
+            toks_all, ends_all = tp.tokens_with_ends(lowered)
+            doc_toks, word_ends, si = [], [], 0
+            for t_, e_ in zip(toks_all, ends_all):
+                while si < len(starts) and e_ - len(t_) >= starts[si]:
+                    doc_toks.append(SENT)
+                    si += 1
+                doc_toks.append(t_)
+                if t_ != SENT:
+                    word_ends.append(e_ if offmap is None else offmap[e_])
+        else:
+            doc_toks, word_ends = [], None
+            for i_, t_ in enumerate(sec_toks):
+                if i_:
+                    doc_toks.append(SENT)
+                doc_toks.extend(t_)
+        streams: dict[str, tp.StemmedDoc] = {}
+
+        def stream(lang: str | None) -> tp.StemmedDoc:
+            lang2 = (lang or "en")[:2]
+            got = streams.get(lang2)
+            if got is None:
+                got = streams[lang2] = tp.StemmedDoc(
+                    tp.get_stemmer(lang2).stemWords(doc_toks))
+            return got
 
         for a in anns:
             key = a.get("annotator") or "annotation"
             langs = declared_langs(a) or card_anns.get(key) or declared_union
             lang = (langs[0] if langs else None)
             kps = a.get("keyphrases") or []
-            sdoc, char_ends = stream(lang)
+            sdoc = stream(lang)
 
             # one gold keyphrase per stemmed identity: a keyphrase with no
             # word token is dropped (it can never be matched), and one whose
@@ -378,13 +396,14 @@ def derive_doc_chunk(args: dict) -> dict:
                     n_gold_dup += 1
                     continue
                 seen_sig.add(sig)
-                var_stems = [e["stems"] for e in entries]
-                cat, end_word = tp.prmu_classify(var_stems, sdoc)
-                end_char = char_ends[end_word] if end_word >= 0 else -1
+                cat, end_word = tp.prmu_classify(
+                    [e["stems"] for e in entries], sdoc,
+                    [e["pstems"] for e in entries if e.get("pstems")])
                 nw = entries[0]["n_tokens"]
                 agg_add(split, key, cat, nw)
                 row = None
                 if keep_gold:
+                    end_char = word_ends[end_word] if end_word >= 0 else -1
                     row = {"dataset": ds, "doc_id": doc_id, "ann_key": key,
                            "kp_idx": kept, "src_off": off,
                            "display": entries[0]["kp"],
@@ -409,7 +428,7 @@ def derive_doc_chunk(args: dict) -> dict:
         gold_rows.extend(combined)
 
         if toks and (token_scope == "all" or eval_doc):
-            pending.append((doc_id, full_text, doc_gold_p, off))
+            pending.append((doc_id, full_text, doc_gold_p, off, n_words))
             if len(pending) >= _TOK_SUBBATCH:
                 flush_tokens()
 
@@ -418,7 +437,7 @@ def derive_doc_chunk(args: dict) -> dict:
             "file_id": args["file_id"], "byte_off": off, "byte_len": ln,
             "n_sections": len(sections),
             "n_chars": sum(m["chars"] for m in sec_meta),
-            "n_words": sum(m["words"] for m in sec_meta),
+            "n_words": n_words,
             "langs": declared_union, "detected_langs": detected,
             "sections": _dumps_str(sec_meta),
             "metadata": _meta_json(meta),

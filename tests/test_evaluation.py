@@ -133,23 +133,42 @@ def test_run_tags_count_repeats_and_unscored(oracle):
 def test_contiguous_prmu_unit_cases():
     from kpviz import textproc as tp
 
-    def cls(kp, text, sections=None):
-        low = tp.norm_text(text)
-        words, _e, seg = tp.spacy_doc_stream(text, "en", low, sections)
-        doc = tp.StemmedDoc(tp.stem_tokens(words, "en"), seg)
-        var = [tp.stem_tokens(tp.spacy_word_tokens(v, "en"), "en")
-               for v in tp.split_variants(kp)]
-        return tp.prmu_classify(var, doc)[0]
+    def cls(kp, *sections, lang="en"):
+        words = []
+        for s in sections:                       # a sentinel between sections
+            words += ([tp.SENT] if words else []) + tp.tokens(tp.norm_text(s))
+        doc = tp.StemmedDoc(tp.stem_tokens(words, lang))
+        var, marked = [], []
+        for v in tp.split_variants(kp):
+            w, m = tp.phrase_tokens(tp.norm_phrase(v))
+            var.append(tp.stem_tokens(w, lang))
+            if m is not w:
+                marked.append(tp.stem_tokens(m, lang))
+        return tp.prmu_classify(var, doc, marked)[0]
     assert cls("neural network", "we train neural networks") == "P"
     assert cls("neural network", "neural very large network") == "R"   # gap
     assert cls("neural network", "network of neural units") == "R"     # reversed
     assert cls("neural network", "a neural, network") == "R"           # separator
+    assert cls("neural network", "a neural (network)") == "R"
     assert cls("e-commerce site", "an e-commerce site") == "P"         # infix mark
-    assert cls("neural network", "neural\n\nnetwork", [0, 8]) == "R"   # sections
+    assert cls("neural network", "neural", "network") == "R"           # sections
     assert cls("model model", "one model model") == "P"                # repeats
     assert cls("neural network", "neural nets") == "M"
     assert cls("deep learning", "nothing here") == "U"
     assert cls("deep+neural network", "neural network, deep") == "P"   # variants
+    assert cls("U.S. army", "the U.S. army moved") == "P"              # own marks
+    # French elision and accents: the apostrophe is word-internal
+    assert cls("analyse syntaxique", "L'analyse syntaxique de l'arabe",
+               lang="fr") == "P"
+    assert cls("système", "Le Système MASPAR", lang="fr") == "P"
+    # Windows-1252 apostrophe decoded as Latin-1 (U+0092) is repaired
+    assert cls("d'analyse", "outil d\x92analyse", lang="fr") == "P"
+    # Arabic words stay whole with their harakat (the stemmer drops them);
+    # Chinese is one token per character
+    assert cls("تحليل نحوي", "نظام تحليل نحوي للغة", lang="ar") == "P"
+    assert cls("تحليل", "تَحْلِيل النص", lang="ar") == "P"
+    assert cls("学习", "深度学习模型", lang="zh") == "P"
+    assert cls("学模", "深度学习模型", lang="zh") == "R"
 
 
 def test_variant_separator_keeps_plus_signs_in_names():
@@ -168,3 +187,31 @@ def test_overlapping_alternatives_get_a_maximum_matching():
     # a later prediction never displaces an earlier one out of the matching
     pr, _g = _match(["a", "a2", "b"], [["a", "a2"], ["b"]])
     assert pr == [0, 2]
+
+
+def test_section_boundaries_in_the_derivation(tmp_path):
+    """A phrase inside a later section is present; one spanning two
+    sections is not (and its end offset points into the original text)."""
+    import os
+    from kpviz import derive
+    title = "Oncologic disease and therapy"
+    abstract = "Recent progress on cardiovascular disease motivates this study."
+    doc = {"_id": "x", "metadata": {"split": "test"},
+           "sections": [{"field": "title", "content": title},
+                        {"field": "abstract", "content": abstract}],
+           "annotations": [{"annotator": "author", "keyphrases": [
+               "cardiovascular disease", "therapy recent", "oncologic disease"]}]}
+    p = tmp_path / "d.jsonl"
+    p.write_text(json.dumps(doc) + "\n")
+    derive.derive_doc_chunk({
+        "dataset": "t", "path": str(p), "start": 0, "end": os.path.getsize(p),
+        "card": {"sections": {"title": ["en"], "abstract": ["en"]},
+                 "anns": {"author": ["en"]}},
+        "out_dir": str(tmp_path), "tag": "t", "file_id": 0, "tokenizers": []})
+    rows = [json.loads(l) for l in (tmp_path / "gold_t.ndjson").read_text().splitlines()]
+    got = {r["display"]: (r["prmu"], r["end_char"]) for r in rows}
+    full = derive.SECTION_JOIN.join([title, abstract])
+    assert got["therapy recent"][0] == "R"
+    assert got["oncologic disease"][0] == "P"
+    cat, end = got["cardiovascular disease"]
+    assert cat == "P" and full[:end].endswith("cardiovascular disease")

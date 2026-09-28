@@ -25,7 +25,7 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--gold-scope", choices=["eval", "all"], default="eval")
-    ap.add_argument("--token-scope", choices=["eval", "all"], default="eval")
+    ap.add_argument("--token-scope", choices=["eval", "all"], default="all")
     ap.add_argument("--hash", choices=["auto", "always"], default="auto")
     a = ap.parse_args()
 

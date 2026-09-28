@@ -30,8 +30,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8050)
     ap.add_argument("--workers", type=int, default=None,
                     help="scan worker processes (default: all cores)")
-    ap.add_argument("--token-scope", choices=["eval", "all"], default="eval",
-                    help="tokenizer-count documents for eval splits only (default) or all")
+    ap.add_argument("--token-scope", choices=["eval", "all"], default="all",
+                    help="document lengths in model tokens for every split "
+                         "(default) or for evaluation splits only (faster)")
     ap.add_argument("--gold-scope", choices=["eval", "all"], default="eval",
                     help="store per-keyphrase gold rows for eval splits only "
                          "(default; quality-flagged documents are always kept, "

@@ -48,13 +48,13 @@ from .util import (RateEMA, declared_langs, file_hash, human_count,
 # The manual revision still marks deliberate semantic changes; the source
 # hash of the derivation modules makes a forgotten bump impossible — any edit
 # to them re-derives instead of silently serving stale numbers.
-_CODE_REV = 13      # 13: contiguous PRMU, gold de-duplicated, ingest dedup
+_CODE_REV = 14      # 14: regex tokenizer (sentinels), token counts for all splits
 
 
 def _code_version() -> str:
     """What derived rows depend on: the worker source (derive, textproc) and
-    the libraries that tokenise and stem (spaCy's tokenizer rules and the
-    Snowball stemmers change results without any KPViz file changing).
+    the stemming libraries (the Snowball stemmers change results without any
+    KPViz file changing).
     Orchestration changes in scanner.py bump _CODE_REV deliberately — hashing
     it would re-derive the whole corpus for every UI-irrelevant edit."""
     from importlib import metadata
@@ -65,7 +65,7 @@ def _code_version() -> str:
             h.update((here / name).read_bytes())
         except OSError:
             pass
-    for dist in ("spacy", "PyStemmer", "snowballstemmer"):
+    for dist in ("PyStemmer", "snowballstemmer"):
         try:
             h.update(f"{dist}={metadata.version(dist)}".encode())
         except Exception:
@@ -174,10 +174,8 @@ def _mp_context():
 
 _FORKSERVER_PREPARED = [False]
 # the server scans again and again from one forkserver: preloading pays for
-# itself from the second scan on. A one-shot command-line scan of an
-# English-only tree is ~1 s faster without it (four workers import spaCy in
-# parallel instead of the forkserver importing it once, serially), while a
-# French tree saves ~2 s even in one shot (measured; plan D12).
+# itself from the second scan on; a one-shot command-line scan of an
+# English-only tree skips it (the worker imports cost ~50 ms).
 _PRELOAD_ALWAYS = [False]
 
 
@@ -188,10 +186,10 @@ def enable_preload() -> None:
 
 def _prepare_forkserver(ctx, idx) -> None:
     """Before the forkserver starts (once per process), have it import the
-    worker modules and build the tokenizers of the languages the catalog
+    worker modules and build the stemmers of the languages the catalog
     declares (kpviz._preload): every worker of every later scan forks from
-    it instead of importing spaCy — and compiling French's tokenizer regex,
-    3.8 s — on its own. Ignored for spawn/fork contexts and once started."""
+    it instead of building them on its own. Ignored for spawn/fork contexts
+    and once started."""
     if _FORKSERVER_PREPARED[0] or ctx.get_start_method() != "forkserver":
         return
     if os.environ.get("KPVIZ_NO_PRELOAD"):
@@ -561,10 +559,19 @@ def _do_scan(full_rehash: bool):
                          if idx.errors else ""))
     STATE.step_status("cards", "done")
 
-    needed_tokenizers = _tokenizers_by_dataset(idx, run_dirs)
+    # token *positions* (RQ3) for the tokenizers of the models evaluated on
+    # a dataset; token *counts* (document length) for every tokenizer any
+    # card declares, on every split — a length distribution is read in a
+    # model's tokens whether or not that model ran on the dataset
+    pos_tokenizers = _tokenizers_by_dataset(idx, run_dirs)
+    every = _all_tokenizers(idx)
+    needed_tokenizers = {
+        f["info"]["dataset"]: sorted(set(every) | set(pos_tokenizers.get(
+            f["info"]["dataset"], [])))
+        for f in found.values() if f["kind"] == "dataset_docs"}
     tok_info = _resolve_tokenizers(needed_tokenizers)
     doc_jobs = _plan_doc_jobs(idx, found, known, needed_tokenizers, tok_info,
-                              full_rehash)
+                              full_rehash, pos_tokenizers)
 
     # ---- nothing changed: nothing to derive, publish or invalidate --------
     ch = STATE.changes
@@ -855,6 +862,18 @@ def _tokenizers_by_dataset(idx: CardIndex, run_dirs: dict) -> dict[str, list[str
     return {k: sorted(v) for k, v in out.items()}
 
 
+def _all_tokenizers(idx: CardIndex) -> list[str]:
+    """Every tokenizer a model or architecture card declares."""
+    out: set[str] = set()
+    for card in idx.models.values():
+        out.update(card.tokenizer_specs)
+    for card in idx.archs.values():
+        for vspec in card.variables.values():
+            if isinstance(vspec, dict) and vspec.get("tokenizer"):
+                out.add(vspec["tokenizer"])
+    return sorted(out)
+
+
 def _resolve_tokenizers(needed: dict[str, list[str]]) -> dict[str, dict]:
     """Resolve every tokenizer once, here, in the parent: {spec: {status,
     fingerprint, why}}.
@@ -883,7 +902,8 @@ def _resolve_tokenizers(needed: dict[str, list[str]]) -> dict[str, dict]:
     return out
 
 
-def _doc_sig(f: dict, card, tokenizers: list[str], tok_info: dict) -> str:
+def _doc_sig(f: dict, card, tokenizers: list[str], tok_info: dict,
+             pos: list[str] | None = None) -> str:
     """Everything a collection's derived rows depend on — and nothing else.
 
     Only the card fields that change derivation (section and annotation
@@ -902,23 +922,27 @@ def _doc_sig(f: dict, card, tokenizers: list[str], tok_info: dict) -> str:
                         "code": CODE_VERSION, "card": card_rel,
                         "tok": {t: (tok_info.get(t) or {}).get("fingerprint")
                                 for t in sorted(tokenizers)},
+                        "pos": sorted(pos or []),
                         "tokscope": st.token_scope, "gold": st.gold_scope})
 
 
 def _plan_doc_jobs(idx, found, known, needed_tokenizers, tok_info,
-                   full_rehash: bool = False) -> list[dict]:
+                   full_rehash: bool = False,
+                   pos_tokenizers: dict | None = None) -> list[dict]:
     jobs = []
     for rel, f in sorted(found.items()):
         if f["kind"] != "dataset_docs":
             continue
         ds = f["info"]["dataset"]
         card = idx.dataset(ds)
-        sig = _doc_sig(f, card, needed_tokenizers.get(ds, []), tok_info)
+        pos = (pos_tokenizers or {}).get(ds, [])
+        sig = _doc_sig(f, card, needed_tokenizers.get(ds, []), tok_info, pos)
         # "Full re-scan" means re-derive everything, documents included
         if (not full_rehash and f["status"] == "unchanged"
                 and known.get(rel, {}).get("sig") == sig):
             continue
-        jobs.append({"rel": rel, "f": f, "ds": ds, "card": card, "sig": sig})
+        jobs.append({"rel": rel, "f": f, "ds": ds, "card": card, "sig": sig,
+                     "pos": pos})
     return jobs
 
 
@@ -1079,6 +1103,7 @@ def _derive_documents(con, pool, doc_jobs: list[dict],
                                                          or v.get("required") is False)),
                          "combined": combined},
                 "tokenizers": sorted(needed_tokenizers.get(ds, [])),
+                "pos_tokenizers": sorted(j.get("pos") or []),
                 "tok_expect": expect,
                 "tok_cache": str(st.tokenizer_cache),
                 "token_scope": st.token_scope, "gold_scope": st.gold_scope,

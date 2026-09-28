@@ -147,7 +147,7 @@ def test_norm_offsets_map_back_to_source():
     from kpviz import textproc as tp
     text = "ﬃ cat Straße"
     low, m = tp.norm_with_offsets(text)
-    toks, ends = tp.spacy_doc_tokens(text, "en", low)
+    toks, ends = tp.tokens_with_ends(low)
     assert [text[:m[e]].split()[-1] for e in ends][-1] == "Straße"
 
 
@@ -162,7 +162,7 @@ def test_normalisation_alignment_is_exact():
     ]:
         low, m = tp.norm_with_offsets(text)
         assert m is not None and len(m) == len(low) + 1
-        toks, ends = tp.spacy_doc_tokens(text, "en", low)
+        toks, ends = tp.tokens_with_ends(low)
         i = toks.index(word)
         assert m[ends[i]] == want_end, (text, word, m[ends[i]])
     assert tp.norm_with_offsets("plain ascii")[1] is None
@@ -311,3 +311,37 @@ def test_window_minus_reserved_tokens():
     assert _reserved(ps, {}) == 2
     assert _reserved(ps, {"reserved_tokens": {"value": 300}}) == 300
     assert _as_count(float("inf")) is None and _as_count("x") is None
+
+
+def test_tokenizer_errors_are_one_actionable_line():
+    from kpviz import textproc as tp
+
+    class RepositoryNotFoundError(Exception):
+        pass
+
+    class GatedRepoError(Exception):
+        pass
+    raw = ("401 Client Error. (Request ID: Root=1-68d3-abc)\n\nRepository Not "
+           "Found for url: https://huggingface.co/llama-3.3/resolve/main/tokenizer.json.")
+    got = tp._hf_error(RepositoryNotFoundError(raw), "llama-3.3")
+    assert "Request ID" not in got and "\n" not in got and "llama-3.3" in got
+    assert "HF_TOKEN" in tp._hf_error(GatedRepoError("Cannot access gated repo"),
+                                      "meta-llama/Llama-3.3-70B-Instruct")
+    # the Llama 3 tokenizer is not a tiktoken encoding: it is read as the
+    # published tokenizer.json (here offline, so approximate — and said why)
+    tk = tp.ModelTokenizer("tiktoken[llama3]", allow_network=False)
+    assert tk.status == "approx" and "tiktoken has no" not in tk.why
+
+
+def test_multilingual_tokens():
+    """Accents, elision, Arabic, Devanagari and CJK; mojibake repaired."""
+    from kpviz import textproc as tp
+    t = lambda s: [x for x in tp.tokens(tp.norm_text(s)) if x != tp.SENT]
+    assert t("L'analyse d\x92un système") == ["l", "analyse", "d", "un", "système"]
+    assert tp.fix_text("d\x92analyse") == "d’analyse"
+    assert t("تَحْلِيل النص") == ["تَحْلِيل", "النص"]
+    assert t("हिन्दी भाषा") == ["हिन्दी", "भाषा"]
+    assert t("深度学习 model") == ["深", "度", "学", "习", "model"]
+    # a separating mark leaves a sentinel; a word-internal one does not
+    assert tp.tokens("a, b") == ["a", tp.SENT, "b"]
+    assert tp.tokens("e-commerce") == ["e", "commerce"]

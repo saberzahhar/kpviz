@@ -1,9 +1,9 @@
 """Text processing, throughput edition.
 
-Tokens come from spaCy (blank pipelines — pure tokenizers, no models
-needed); stems from PyStemmer (C); every keyphrase is analysed once and
-cached (worker-local dict + the global `keyphrases` table). PRMU follows
-Boudin & Gallina (2021), computed on stemmed spaCy tokens:
+One tokenizer for everything that is matched — documents, gold keyphrases
+and predictions: a Unicode-aware regular expression over NFKC-normalised,
+lowercased text. Stems come from the Snowball stemmers (PyStemmer, C).
+PRMU follows Boudin & Gallina (2021), computed on those stemmed tokens:
 
     P — the keyphrase's stemmed tokens occur in the stemmed document as a
         contiguous sequence, in order (within one section, not across a
@@ -11,6 +11,18 @@ Boudin & Gallina (2021), computed on stemmed spaCy tokens:
     R — every stemmed token occurs in the document, but never as that sequence
     M — some do
     U — none do
+
+Tokens are maximal runs of letters, digits and combining marks (so Arabic
+with harakat, Devanagari with vowel signs, and accented Latin stay whole);
+Chinese and Japanese characters are one token each. Punctuation is dropped,
+but a *separating* mark — one with whitespace (or a text boundary) beside
+it — leaves a sentinel a contiguous match cannot cross; word-internal marks
+("e-commerce", "and/or", "l'apprentissage") do not. A keyphrase carries the
+same sentinels, so "U.S. army" still finds "U.S. army".
+
+The documents phase used spaCy's blank tokenizers until revision 6: the
+same token classes, five times slower, and the tokenizer benchmarked in the
+paper's Table 2 was already this one.
 
 Model tokenizers (`transformers[...]`, `tiktoken[...]`) resolve exactly
 when their backend + assets are available and fall back to a flagged
@@ -29,27 +41,38 @@ from functools import lru_cache
 from pathlib import Path
 
 # --------------------------------------------------------------------------
-# Fast regex word tokenisation (language detection + section word counts)
+# Normalisation
 # --------------------------------------------------------------------------
-_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# C1 control characters in real text are almost always Windows-1252 bytes
+# decoded as Latin-1 ("d\x92analyse" for "d’analyse"): mapped back to the
+# characters they were. Other control characters become spaces. One
+# character each, so offsets are preserved.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_CP1252 = {}
+for _b in range(0x80, 0xA0):
+    try:
+        _CP1252[_b] = bytes([_b]).decode("cp1252")
+    except UnicodeDecodeError:
+        _CP1252[_b] = " "
+_CTRL_TABLE = {**{c: " " for c in range(0x20) if c not in (9, 10, 13)},
+               0x7F: " ", **_CP1252}
 
-_SNOWBALL_LANG = {
-    "en": "english", "fr": "french", "de": "german", "es": "spanish",
-    "it": "italian", "pt": "portuguese", "nl": "dutch", "ru": "russian",
-}
+
+def fix_text(text: str) -> str:
+    """Repair mojibake control characters (C1 → Windows-1252, others →
+    space); length-preserving, a no-op on clean text."""
+    if text and _CTRL_RE.search(text):
+        return text.translate(_CTRL_TABLE)
+    return text or ""
 
 
 def norm_text(text: str) -> str:
-    """NFKC, then str.lower() — deliberately not casefold(): casefold maps
-    German "ß" to "ss" and so would match "Strasse" against "Straße" in
-    German but also change stems the Snowball stemmers expect; lower() keeps
-    each language's own orthography (Turkish dotted/dotless i are left to
-    NFKC + lower, which is not locale-aware). Stated in the conventions."""
-    return unicodedata.normalize("NFKC", text or "").lower()
-
-
-def tokenize(text: str) -> list[str]:
-    return _WORD_RE.findall(norm_text(text))
+    """Repaired, NFKC, then str.lower() — deliberately not casefold():
+    casefold maps German "ß" to "ss" and so would match "Strasse" against
+    "Straße" in German but also change stems the Snowball stemmers expect;
+    lower() keeps each language's own orthography. Stated in the
+    conventions."""
+    return unicodedata.normalize("NFKC", fix_text(text)).lower()
 
 
 def norm_phrase(text: str) -> str:
@@ -72,21 +95,118 @@ def split_variants(raw: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# Stemming: PyStemmer (C) -> snowballstemmer -> identity
+# Tokenisation (one regex tokenizer for documents, gold and predictions)
 # --------------------------------------------------------------------------
+SENT = "\x01"          # a separating mark: no contiguous match crosses it
+
+# The common case — no combining mark, no CJK character — uses plain
+# classes the regex engine checks in C; the Unicode-complete patterns
+# (combining marks as word characters, one token per CJK character) are
+# built once, on first need, and used only for texts that need them.
+_FAST_TOK = re.compile(r"\x01|[^\W_]+")
+_FAST_SEP = re.compile(r"(?:\s|\A)[^\w\s\x01]+|[^\w\s\x01]+(?:\s|\Z)")
+_WORD_RE = re.compile(r"[^\W_]+")          # plain words (no sentinels)
+_CJK = r"぀-ヿ㐀-䶿一-鿿豈-﫿"
+_CJK_RE = re.compile(f"[{_CJK}]")
+
+
+@lru_cache(maxsize=1)
+def _complex():
+    """(mark-deletion table, token regex, separator regex, word regex) for
+    text with combining marks or CJK characters."""
+    ranges, start = [], None
+    for cp in range(0x10000):                  # marks outside the BMP are
+        is_m = unicodedata.category(chr(cp))[0] == "M"   # vanishingly rare
+        if is_m and start is None:
+            start = cp
+        elif not is_m and start is not None:
+            ranges.append((start, cp - 1))
+            start = None
+    marks = "".join(f"\\u{a:04x}" if a == b else f"\\u{a:04x}-\\u{b:04x}"
+                    for a, b in ranges)
+    delete = {cp: None for a, b in ranges for cp in range(a, b + 1)}
+    word = rf"[{_CJK}]|(?:[^\W_{_CJK}]|[{marks}])+"
+    p = rf"[^\w\s\x01{marks}]+"
+    sep = (rf"(?:\s|\A){p}|{p}(?:\s|\Z)|{p}(?=[{_CJK}])|(?<=[{_CJK}]){p}")
+    return (delete, re.compile(rf"\x01|{word}"), re.compile(sep),
+            re.compile(word))
+
+
+def _patterns(text: str):
+    """(token regex, separator regex, word regex) suited to `text`."""
+    if text.isascii():
+        return _FAST_TOK, _FAST_SEP, _WORD_RE
+    delete, tok, sep, word = _complex()
+    if len(text.translate(delete)) != len(text) or _CJK_RE.search(text):
+        return tok, sep, word
+    return _FAST_TOK, _FAST_SEP, _WORD_RE
+
+
+def tokens(lowered: str) -> list[str]:
+    """Word tokens of normalised text, with SENT for each separating mark."""
+    tok, sep, _w = _patterns(lowered)
+    return tok.findall(sep.sub(" \x01 ", lowered))
+
+
+def tokens_with_ends(lowered: str) -> tuple[list[str], list[int]]:
+    """`tokens` plus the end offset (in `lowered`) of every token — the
+    separators are replaced length-for-length, so offsets are preserved."""
+    tok, sep, _w = _patterns(lowered)
+    marked = sep.sub(lambda m: SENT + " " * (len(m.group()) - 1), lowered)
+    toks, ends = [], []
+    for m in tok.finditer(marked):
+        toks.append(m.group())
+        ends.append(m.end())
+    return toks, ends
+
+
+def tokenize(text: str) -> list[str]:
+    """Plain word tokens of raw text (normalised; punctuation dropped)."""
+    low = norm_text(text)
+    return _patterns(low)[2].findall(low)
+
+
+def phrase_tokens(norm: str) -> tuple[list[str], list[str]]:
+    """(words, words with separator sentinels) of a normalised keyphrase."""
+    toks = tokens(norm)
+    if SENT not in toks:
+        return toks, toks
+    words = [t for t in toks if t != SENT]
+    return words, toks
+
+
+# --------------------------------------------------------------------------
+# Stemming: PyStemmer (C) -> snowballstemmer -> identity, every Snowball
+# language KPViz can name by its ISO 639-1 code
+# --------------------------------------------------------------------------
+_SNOWBALL_LANG = {
+    "ar": "arabic", "hy": "armenian", "eu": "basque", "ca": "catalan",
+    "da": "danish", "nl": "dutch", "en": "english", "fi": "finnish",
+    "fr": "french", "de": "german", "el": "greek", "hi": "hindi",
+    "hu": "hungarian", "id": "indonesian", "ga": "irish", "it": "italian",
+    "lt": "lithuanian", "ne": "nepali", "no": "norwegian", "nb": "norwegian",
+    "nn": "norwegian", "pt": "portuguese", "ro": "romanian", "ru": "russian",
+    "sr": "serbian", "es": "spanish", "sv": "swedish", "ta": "tamil",
+    "tr": "turkish", "yi": "yiddish",
+}
+
+
 class _IdentityStemmer:
     def stemWords(self, tokens):
         return list(tokens)
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def get_stemmer(lang: str | None):
+    """The language's Snowball stemmer; identity when there is none. The C
+    stemmer keeps a word cache — sized for a corpus vocabulary, not the
+    default 10 000 words (a 20 % faster documents phase)."""
     name = _SNOWBALL_LANG.get((lang or "en")[:2])
     if not name:
         return _IdentityStemmer()
     try:
         import Stemmer  # PyStemmer — C bindings
-        return Stemmer.Stemmer(name)
+        return Stemmer.Stemmer(name, 300_000)
     except Exception:
         pass
     try:
@@ -101,100 +221,13 @@ def stem_tokens(tokens: list[str], lang: str | None) -> list[str]:
 
 
 def stem_phrase(text: str, lang: str | None) -> str:
-    """Stemmed representation of a short phrase (spaCy tokens + PyStemmer)."""
-    return " ".join(stem_tokens(spacy_word_tokens(text, lang), lang))
+    """Stemmed representation of a short phrase."""
+    return " ".join(stem_tokens(phrase_tokens(norm_phrase(text))[0], lang))
 
 
 # --------------------------------------------------------------------------
-# spaCy tokenisation (blank pipelines; no downloads, C-speed)
+# Offsets between original and normalised text
 # --------------------------------------------------------------------------
-_BLANK_LANGS = {"en", "fr", "de", "es", "it", "pt", "nl", "ru"}
-
-
-@lru_cache(maxsize=16)
-def _blank(lang: str | None):
-    import spacy
-    code = (lang or "en")[:2]
-    try:
-        nlp = spacy.blank(code if code in _BLANK_LANGS else "xx")
-    except Exception:
-        nlp = spacy.blank("xx")
-    nlp.max_length = 20_000_000
-    return nlp
-
-
-def spacy_word_tokens(text: str, lang: str | None) -> list[str]:
-    """Lowercased word tokens of a short text (punct/space dropped)."""
-    doc = _blank(lang).tokenizer(norm_text(text))
-    return [t.text for t in doc if not (t.is_punct or t.is_space)]
-
-
-def spacy_doc_tokens(text: str, lang: str | None,
-                     lowered: str | None = None) -> tuple[list[str], list[int]]:
-    """(lowercased word tokens, char END offset of each) for a document.
-
-    Offsets refer to the *normalised* text (see `norm_offsets` to map them
-    back). Uses Doc.to_array and NumPy masks to stay in C — iterating Token
-    objects in Python is ~4x slower on long documents. Pass `lowered` when the
-    caller already has `norm_text(text)`."""
-    lowered = norm_text(text) if lowered is None else lowered
-    doc = _blank(lang).tokenizer(lowered)
-    try:
-        from spacy.attrs import IDX, IS_PUNCT, IS_SPACE, LENGTH
-        arr = doc.to_array([IDX, LENGTH, IS_PUNCT, IS_SPACE])
-        if not len(arr):
-            return [], []
-        keep = (arr[:, 2] == 0) & (arr[:, 3] == 0)
-        starts = arr[keep, 0].tolist()
-        ends = (arr[keep, 0] + arr[keep, 1]).tolist()
-        return [lowered[a:b] for a, b in zip(starts, ends)], ends
-    except Exception:
-        toks, ends = [], []
-        for t in doc:
-            if t.is_punct or t.is_space:
-                continue
-            toks.append(t.text)
-            ends.append(t.idx + len(t.text))
-        return toks, ends
-
-
-def spacy_doc_stream(text: str, lang: str | None, lowered: str | None = None,
-                     section_starts: list[int] | None = None
-                     ) -> tuple[list[str], list[int], list[int]]:
-    """`spacy_doc_tokens` plus a segment id per kept token (see StemmedDoc):
-    the segment changes at every section start (offsets into the normalised
-    text) and at every *separating* punctuation mark — one with whitespace
-    before or after it. Word-internal marks (e-commerce, and/or) do not
-    separate. Stays in NumPy, like spacy_doc_tokens."""
-    import numpy as np
-    lowered = norm_text(text) if lowered is None else lowered
-    doc = _blank(lang).tokenizer(lowered)
-    try:
-        from spacy.attrs import IDX, IS_PUNCT, IS_SPACE, LENGTH, SPACY
-        arr = doc.to_array([IDX, LENGTH, IS_PUNCT, IS_SPACE, SPACY])
-    except Exception:
-        arr = np.array([[t.idx, len(t.text), t.is_punct, t.is_space,
-                         bool(t.whitespace_)] for t in doc], dtype=np.int64)
-    if not len(arr):
-        return [], [], []
-    arr = np.asarray(arr, dtype=np.int64)
-    punct, space, ws_after = arr[:, 2] == 1, arr[:, 3] == 1, arr[:, 4] == 1
-    # whitespace right after a token: its own trailing space, or a space token
-    ws_after = ws_after | np.concatenate((space[1:], [True]))
-    ws_before = np.concatenate(([True], ws_after[:-1]))
-    sep = punct & (ws_after | ws_before)
-    seg = np.cumsum(sep)
-    if section_starts and len(section_starts) > 1:
-        sec = np.searchsorted(np.asarray(section_starts), arr[:, 0], side="right")
-        seg = seg + sec * (len(arr) + 1)
-    keep = ~(punct | space)
-    starts = arr[keep, 0]
-    ends = (starts + arr[keep, 1]).tolist()
-    starts = starts.tolist()
-    return ([lowered[a:b] for a, b in zip(starts, ends)], ends,
-            seg[keep].tolist())
-
-
 def _offsets_shared(text: str) -> bool:
     """True when normalising cannot move any offset: ASCII, or already NFKC
     with a length-preserving lowercase (both checks run in C)."""
@@ -211,9 +244,10 @@ def norm_with_offsets(text: str) -> tuple[str, list[int] | None]:
     marks that follow it — and the pieces concatenated, so every boundary
     is known: composition ("e" + U+0301 -> "é"), compatibility expansion
     ("ﬁ" -> "fi") and changes that cancel out in total length all map
-    exactly, instead of the proportional guess this replaced. A document
-    normalised this way differs from whole-string NFKC only where a
-    composition would span two clusters (not a case in scripts KPViz stems)."""
+    exactly. A document normalised this way differs from whole-string NFKC
+    only where a composition would span two clusters (not a case in scripts
+    KPViz stems)."""
+    text = fix_text(text)
     if _offsets_shared(text):
         return norm_text(text), None
     out, m = [], [0]
@@ -248,10 +282,8 @@ def norm_offsets(text: str, lowered: str) -> list[int] | None:
 class PhraseCache:
     """Analyse each unique (language, normalised phrase) once per worker.
 
-    Keyed by language as well as text: spaCy's blank tokenisers split the
-    same string differently per language ("l'apprentissage", "e-commerce"),
-    so a text-only key made the tokens — and therefore matches and scores —
-    depend on which language a worker happened to see first.
+    Keyed by language as well as text: the stemmer is per language, so the
+    same string has different stems in two languages.
 
     Memory-bounded without cliffs: two generations. When the current one is
     full it becomes the old one; a hit in the old generation is promoted, so
@@ -288,11 +320,16 @@ class PhraseCache:
             entry = self._old.pop(key, None)
             if entry is None:
                 self.misses += 1
-                tokens = spacy_word_tokens(norm, lang2)
-                stems = get_stemmer(lang2).stemWords(tokens)
-                entry = {"kp": norm, "raw": " ".join(str(raw).split()),
-                         "lang": lang2, "tokens": tokens, "stems": stems,
-                         "sstr": " ".join(stems), "n_tokens": len(tokens)}
+                words, marked = phrase_tokens(norm)
+                stemmer = get_stemmer(lang2)
+                stems = stemmer.stemWords(words)
+                entry = {"kp": norm, "raw": " ".join(fix_text(str(raw)).split()),
+                         "lang": lang2, "tokens": words, "stems": stems,
+                         "sstr": " ".join(stems), "n_tokens": len(words),
+                         # the same stems with the keyphrase's own separating
+                         # marks, for PRMU ("U.S. army" in "U.S. army")
+                         "pstems": (stemmer.stemWords(marked)
+                                    if marked is not words else None)}
             else:
                 self.hits += 1
             if len(self._new) >= self.max_size // 2:     # generation rollover
@@ -329,71 +366,51 @@ class PhraseCache:
 # --------------------------------------------------------------------------
 
 class StemmedDoc:
-    """A document as the PRMU classifier sees it: its stemmed word tokens, a
-    position index per stem, and a segment id per token.
+    """A document as the PRMU classifier sees it: its stemmed tokens (with
+    SENT at every section boundary and separating mark) as one padded
+    string, searched in C, and as a set.
 
-    Segments are what a contiguous match may not cross: a new section, or a
-    separating punctuation mark (one with whitespace on either side — a
-    comma, a full stop, a bracket). Word-internal punctuation (the hyphen of
-    "e-commerce", the slash of "and/or") is transparent, as it is inside the
-    keyphrase, whose own punctuation tokens are dropped the same way."""
+    A contiguous occurrence is a substring " a b c " of the padded string;
+    a sentinel between two stems makes that substring impossible, which is
+    how a match is kept inside one section and off separating punctuation."""
 
-    __slots__ = ("stems", "index", "seg")
+    __slots__ = ("stems", "pad", "set")
 
-    def __init__(self, stems: list[str], seg: list[int] | None = None):
+    def __init__(self, stems: list[str]):
         self.stems = stems
-        self.index = position_index(stems)
-        self.seg = seg if seg is not None else [0] * len(stems)
-
-
-def position_index(stems: list[str]) -> dict[str, list[int]]:
-    idx: dict[str, list[int]] = {}
-    for i, s in enumerate(stems):
-        idx.setdefault(s, []).append(i)
-    return idx
+        self.pad = " " + " ".join(stems) + " "
+        self.set = set(stems)
 
 
 def contiguous_end(kp_stems: list[str], doc: StemmedDoc) -> int:
-    """Token position where the earliest contiguous, in-order occurrence of
-    kp_stems ends inside one segment of the document, else -1.
-
-    Anchored on the keyphrase's rarest stem: the candidate starts are that
-    stem's positions shifted back by its offset in the keyphrase, so a
-    common first word ("model", "system") costs nothing extra."""
-    n = len(kp_stems)
-    index = doc.index
-    anchor, best_len = 0, None
-    for j, s in enumerate(kp_stems):
-        lst = index.get(s)
-        if not lst:
-            return -1
-        if best_len is None or len(lst) < best_len:
-            anchor, best_len = j, len(lst)
-    stems, seg, total = doc.stems, doc.seg, len(doc.stems)
-    for q in index[kp_stems[anchor]]:
-        p = q - anchor
-        if p < 0 or p + n > total:
-            continue
-        if stems[p:p + n] == kp_stems and seg[p] == seg[p + n - 1]:
-            return p + n - 1
-    return -1
+    """Word position (sentinels not counted) where the earliest contiguous,
+    in-order occurrence of kp_stems ends, else -1."""
+    needle = " " + " ".join(kp_stems) + " "
+    pad = doc.pad
+    pos = pad.find(needle)
+    if pos < 0:
+        return -1
+    end = pos + len(needle) - 1                 # the space after the match
+    last = pad.count(" ", 0, end) - 1           # token index of its last stem
+    return last - pad.count(SENT, 0, end)       # minus the sentinels before
 
 
 _PRMU_RANK = {"P": 3, "R": 2, "M": 1, "U": 0}
 
 
-def prmu_classify(variant_stems: list[list[str]],
-                  doc: StemmedDoc) -> tuple[str, int]:
+def prmu_classify(variant_stems: list[list[str]], doc: StemmedDoc,
+                  marked: list[list[str]] | None = None) -> tuple[str, int]:
     """Best PRMU class over the '+'-variants, and where the earliest present
-    occurrence ends (token position; -1 unless P).
+    occurrence ends (word position; -1 unless P). `marked` holds variants
+    with their own separating marks (tried too for P).
 
     P: the stemmed tokens occur contiguously, in order, in the stemmed
        document · R: every stemmed token occurs somewhere, never as that
        sequence · M: some do · U: none do."""
     best, best_end = "U", -1
     rank = _PRMU_RANK
-    index = doc.index
-    for stems in variant_stems:
+    present_set = doc.set
+    for stems in list(variant_stems) + list(marked or ()):
         if not stems:
             continue
         end = contiguous_end(stems, doc)
@@ -401,8 +418,11 @@ def prmu_classify(variant_stems: list[list[str]],
             if best != "P" or end < best_end:
                 best, best_end = "P", end
             continue
+        if best == "P":
+            continue
         distinct = set(stems)
-        present = sum(1 for s in distinct if s in index)
+        distinct.discard(SENT)
+        present = len(distinct & present_set)
         cat = "R" if present == len(distinct) else ("M" if present else "U")
         if rank[cat] > rank[best]:
             best = cat
@@ -419,10 +439,12 @@ _STOPWORDS: dict[str, frozenset[str]] = {
     "es": frozenset("de la que el en y a los del se las por un para con no una su al lo como más pero sus le ya o este sí porque esta entre cuando".split()),
     "it": frozenset("di che e la il un a per in una sono mi si lo ma le ci con non del più questo al come da dei nel alla".split()),
     "pt": frozenset("de a o que e do da em um para é com não uma os no se na por mais as dos como mas foi ao ele das tem à seu sua".split()),
-    # Dutch and Russian: every language KPViz stems and tokenises also votes
-    # (a declared nl/ru collection used to get stems but no detection)
     "nl": frozenset("de en van het een in is dat op te zijn voor met die niet aan er om ook als bij door wordt worden maar dan of uit naar deze kan zij tot".split()),
     "ru": frozenset("и в не на что с по как это из за от для к о но же его а то все так было он мы она они при бы также или".split()),
+    "ar": frozenset("في من على إلى أن عن مع هذا هذه التي الذي كان التى ما لا هو هي ثم أو قد كل بين بعد عند إن لم ذلك تلك منذ حتى كما أيضا وفي ومن".split()),
+    "sv": frozenset("och att det som en på är av för med till den har de inte om ett han men var jag sig från vi så kan man när år".split()),
+    "tr": frozenset("ve bir bu da de için ile olarak çok daha gibi olan ama en kadar sonra ne her mi göre ise ya veya şu".split()),
+    "pl": frozenset("i w na z się nie do to że jest o jak ale po co tak za od przez przy dla jego oraz lub są być".split()),
 }
 # token -> languages whose stop-word list contains it, built once: one pass
 # over the tokens instead of one generator per candidate language
@@ -432,27 +454,36 @@ for _l, _ws in _STOPWORDS.items():
         _STOP_INDEX[_w] = _STOP_INDEX.get(_w, ()) + (_l,)
 
 
-def detect_language(text: str, candidates: list[str] | None = None,
-                    min_tokens: int = 5,
-                    tokens: list[str] | None = None) -> tuple[str | None, float]:
-    """Stopword vote over the *whole* text (no prefix sampling). Pass
-    `tokens` to reuse a tokenisation the caller already has."""
-    toks = tokens if tokens is not None else tokenize(text or "")
-    if len(toks) < min_tokens:
-        return None, 0.0
-    langs = [l for l in (candidates or list(_STOPWORDS)) if l in _STOPWORDS]
-    if not langs:
-        return None, 0.0
-    counts = dict.fromkeys(langs, 0)
+def language_scores(toks: list[str], n: int | None = None) -> dict[str, float]:
+    """Share of the tokens that are each language's stop words."""
+    n = n if n is not None else len(toks)
+    if not n:
+        return {}
+    counts: dict[str, int] = {}
     # keep only stop words (a C-level filter), count each distinct one once,
-    # then credit its languages — same counts as a per-token loop, ~40 %
-    # less time on typical abstracts
+    # then credit its languages
     for w, k in Counter(filter(_STOP_INDEX.__contains__, toks)).items():
         for l in _STOP_INDEX[w]:
-            if l in counts:
-                counts[l] += k
-    n = len(toks)
-    scores = {l: counts[l] / n for l in langs}
+            counts[l] = counts.get(l, 0) + k
+    return {l: c / n for l, c in counts.items()}
+
+
+def detect_language(text: str, candidates: list[str] | None = None,
+                    min_tokens: int = 5,
+                    tokens: list[str] | None = None,
+                    n: int | None = None) -> tuple[str | None, float]:
+    """Stopword vote over the *whole* text (no prefix sampling). Pass
+    `tokens` (and their word count `n`) to reuse a tokenisation the caller
+    already has."""
+    toks = tokens if tokens is not None else tokenize(text or "")
+    n = n if n is not None else len(toks)
+    if n < min_tokens:
+        return None, 0.0
+    scores = language_scores(toks, n)
+    if candidates:
+        scores = {l: v for l, v in scores.items() if l in candidates}
+    if not scores:
+        return None, 0.0
     best = max(scores, key=scores.get)
     ordered = sorted(scores.values(), reverse=True)
     margin = ordered[0] - (ordered[1] if len(ordered) > 1 else 0.0)
@@ -461,12 +492,61 @@ def detect_language(text: str, candidates: list[str] | None = None,
     return best, round(min(1.0, scores[best] * 2 + margin), 3)
 
 
+def best_language(scores: dict[str, float]) -> str | None:
+    """The stop-word language of `language_scores`, or None when no list
+    reaches 8 % of the tokens (too short, or a language without a list)."""
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 0.08 else None
+
+
+def contradicts(scores: dict[str, float], declared: list[str]) -> bool:
+    """Does the text's language contradict every declared one?
+
+    Only when the best stop-word language is not declared and no declared
+    language comes close to it (at least half its share): closely related
+    languages sharing function words (Danish/Norwegian, Spanish/Portuguese)
+    raise no false alarm, and a declared language without a stop-word list
+    is never contradicted."""
+    best = best_language(scores)
+    if best is None or not declared:
+        return False
+    decl = [l[:2] for l in declared]
+    if best in decl or not any(l in _STOPWORDS for l in decl):
+        return False
+    return max((scores.get(l, 0.0) for l in decl), default=0.0) < 0.5 * scores[best]
+
+
 # --------------------------------------------------------------------------
 # Model tokenizer registry — exact when possible, flagged-approx otherwise
 # --------------------------------------------------------------------------
 _SPEC_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)\s*\[\s*([^\]]+)\s*\]\s*$")
-_HF_ALIASES = {"bart-base": "facebook/bart-base",
-               "bart-large": "facebook/bart-large"}
+# short names cards use -> Hugging Face repositories holding the tokenizer
+# (tried in order; Llama 3.x share one tokenizer, the Meta repositories are
+# gated and need HF_TOKEN, the mirror after them is not)
+_LLAMA3 = ("meta-llama/Llama-3.3-70B-Instruct", "unsloth/Llama-3.3-70B-Instruct")
+_HF_ALIASES = {"bart-base": ("facebook/bart-base",),
+               "bart-large": ("facebook/bart-large",),
+               **{k: _LLAMA3 for k in ("llama3", "llama-3", "llama-3.1",
+                                       "llama-3.2", "llama-3.3", "llama3.3")}}
+
+
+def _hf_error(e: Exception, name: str) -> str:
+    """One line a user can act on (no request ids, no tracebacks)."""
+    kind, msg = type(e).__name__, str(e)
+    if kind == "GatedRepoError" or "gated" in msg.lower():
+        return (f"'{name}' is gated on Hugging Face: accept its licence on the "
+                "model page and set HF_TOKEN")
+    if (kind == "RepositoryNotFoundError" or "401" in msg or "404" in msg
+            or "not found" in msg.lower()):
+        return (f"no Hugging Face repository '{name}' (or it is private): "
+                "declare transformers[<owner>/<repo>] (with HF_TOKEN if gated) "
+                "or transformers[file:<path>/tokenizer.json]")
+    if kind in ("ProxyError", "ConnectError", "ConnectionError", "ConnectTimeout",
+                "Timeout", "ReadTimeout") or "403" in msg:
+        return "Hugging Face is unreachable from this machine (network or proxy)"
+    return f"{kind}: {msg.splitlines()[0][:120]}" if msg else kind
 _FALLBACK_RATIO = {"transformers": 1.30, "tiktoken": 1.25, None: 1.30}
 
 
@@ -547,7 +627,10 @@ class ModelTokenizer:
             if self.backend == "transformers":
                 impl = self._try_hf()
             elif self.backend == "tiktoken":
-                impl = self._try_tiktoken()
+                # the Llama 3 tokenizer is tiktoken-*style* but not shipped
+                # with tiktoken: it is published as a tokenizer.json
+                impl = (self._try_hf() if self.name.lower() in _HF_ALIASES
+                        else self._try_tiktoken())
             elif self.backend:
                 self.why = f"unknown tokenizer backend {self.backend!r}"
         if impl is None:
@@ -572,20 +655,37 @@ class ModelTokenizer:
                 try:
                     return ("hf", Tokenizer.from_file(str(f)))
                 except Exception as e:
-                    self.why = f"unreadable {f.name}: {e}"
+                    self.why = f"unreadable {f}: {str(e)[:120]}"
+        if self.name.startswith("file:"):
+            self.why = self.why or f"no file {self.name[5:]}"
+            return None
         if not self.allow_network:
-            self.why = self.why or ("offline" if offline() else "not cached locally")
+            src = _HF_ALIASES.get(self.name.lower(), (self.name,))[0]
+            self.why = self.why or (
+                ("offline" if offline() else "not cached locally")
+                + f" — read from Hugging Face ({src}) when online")
             return None
         if self._known_unavailable():
             self.why = "unavailable at the last attempt (retried daily)"
             return None
         last = ""
-        for repo in dict.fromkeys([_HF_ALIASES.get(self.name, self.name),
-                                   self.name, f"facebook/{self.name}"]):
+        token = (os.environ.get("HF_TOKEN")
+                 or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None)
+        repos = list(_HF_ALIASES.get(self.name.lower(), ())) or [self.name]
+        if "/" not in self.name and self.name.lower() not in _HF_ALIASES:
+            repos.append(f"facebook/{self.name}")
+        for repo in dict.fromkeys(repos):
             try:
-                tok = Tokenizer.from_pretrained(repo)
+                tok = Tokenizer.from_pretrained(repo, token=token)
+            except TypeError:                   # tokenizers < 0.14
+                try:
+                    tok = Tokenizer.from_pretrained(repo)
+                except Exception as e:
+                    last = last or _hf_error(e, repo)
+                    continue
             except Exception as e:
-                last = f"{type(e).__name__}: {str(e)[:160]}"
+                # the first failure names the repository the user meant
+                last = last or _hf_error(e, repo)
                 continue
             if d:
                 # atomic: a torn tokenizer.json would silently degrade every
@@ -615,12 +715,10 @@ class ModelTokenizer:
         except Exception:
             known = set()
         if known and self.name not in known:
-            # a card naming an encoding tiktoken does not have (e.g. the
-            # Llama 3 tokenizer, which is tiktoken-*style* but not shipped
-            # with tiktoken) can never become exact: say what would work
             self.why = (f"tiktoken has no '{self.name}' encoding (it has "
                         f"{', '.join(sorted(known))}); declare "
-                        "transformers[<hub id>] or file:<path/tokenizer.json>")
+                        "transformers[<owner>/<repo>] or "
+                        "transformers[file:<path>/tokenizer.json]")
             return None
         if self.allow_network and self._known_unavailable():
             self.why = "unavailable at the last attempt (retried daily)"
@@ -692,7 +790,9 @@ class ModelTokenizer:
     def count_batch(self, texts: list[str]) -> tuple[list[int], bool]:
         kind, obj = self._resolve()
         if kind == "hf":
-            return [len(e.ids) for e in obj.encode_batch(texts)], False
+            # a count needs no offsets: the fast variant skips them (-25 %)
+            enc = getattr(obj, "encode_batch_fast", obj.encode_batch)
+            return [len(e.ids) for e in enc(texts)], False
         if kind == "tiktoken":
             return [len(ids) for ids in
                     obj.encode_ordinary_batch(texts)], False
