@@ -1,342 +1,236 @@
 # KPViz
 
-A local, reproducible cockpit for keyphrase extraction/generation evaluation.
+Evaluate keyphrase extraction and generation models on your own machine, and
+put the figures straight into your paper.
 
-**Paper:** Saber Zahhar, Christophe Rodrigues, Nédra Mellouli and Nicolas Travers.
-*KPViz: A Framework for Keyphrase Prediction Experiments.* JCDL '26.
-https://doi.org/10.1145/3805696.3846518
-**Demo video:** https://youtu.be/WS2iCDfloYM ·
-**Archive (code + demo data):** https://doi.org/10.5281/zenodo.22789345
+KPViz reads a folder of **cards** (datasets, models, architectures) and the
+**runs** produced with them. It scores every run, then serves a web app to
+explore the collections, compare models, answer five research questions with
+proper statistics, and export PDF/PGF/PNG figures and LaTeX tables with
+ready-written captions. Your files are never copied: KPViz keeps an index and
+statistics in DuckDB and reads documents in place.
 
-KPViz scans a folder of dataset, model and architecture **cards** plus the
-inference runs produced against them, derives an analytical store (DuckDB,
-byte-offset indices — your corpus is never copied), and serves a web app:
-explorers for datasets, models and architectures, and a set of
-research-question workbenches whose figures export straight to the paper —
-PGF / PDF / PNG with auto-written editable captions, and booktabs LaTeX
-tables. Plotly renders the interactive view; Matplotlib's PGF backend renders
-the export, from the same figure spec.
-
-Everything runs on your machine; the only network access is the one-time
-download of tokenizer assets (cached, with a flagged offline fallback).
-`python app.py --offline` guarantees no network access at all: tokenizers
-that are not already cached fall back to flagged approximations at once.
+**Paper:** Saber Zahhar, Christophe Rodrigues, Nédra Mellouli and Nicolas
+Travers. *KPViz: A Framework for Keyphrase Prediction Experiments.* JCDL '26.
+[doi:10.1145/3805696.3846518](https://doi.org/10.1145/3805696.3846518) ·
+[demo video](https://youtu.be/WS2iCDfloYM) ·
+[code + demo data](https://doi.org/10.5281/zenodo.22789345)
 
 ## Quick start
 
 ```bash
-git clone https://github.com/saberzahhar/kpviz
-cd kpviz
-
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+git clone https://github.com/saberzahhar/kpviz && cd kpviz
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python tools/make_sample_data.py   # optional: a small generated tree (~1 s)
+python tools/make_sample_data.py   # optional: a small generated tree in sample_data/
 python app.py                      # serves ./data, else ./sample_data
 ```
 
-The browser opens on the **Overview** page. On an empty catalog the first
-scan starts automatically; afterwards, **Scan for changes** re-derives only
-what is new, modified or deleted, in parallel across all CPU cores, with
-per-step progress and an ETA.
+The browser opens on **Overview**. The first scan starts on its own; after
+that, **Scan for changes** re-derives only the files that changed.
 
-**Demo data.** A full demo tree (five datasets, seven models, three
-architectures, seventy-five runs) is archived on Zenodo:
+To try the full demo (5 datasets, 7 models, 3 architectures, 75 runs),
+download the tree from [Zenodo](https://doi.org/10.5281/zenodo.22789345) and
+place it as `data/` at the repository root.
 
-> https://doi.org/10.5281/zenodo.22789345
+Useful options (`python app.py --help` lists all):
 
-(mirror: https://drive.google.com/drive/folders/136Gj3Gv_rMyZHwdmBWIge0kI1BIAlQpj)
+| Option | What it does |
+|---|---|
+| `--data PATH` | the data tree (default `./data`, else `./sample_data`) |
+| `--state PATH` | where the DuckDB store lives (default `.kpviz/` next to the data) |
+| `--workers N` | scan processes (default: every core) |
+| `--token-scope eval` | count model tokens on evaluation splits only (faster scans of huge training splits; default `all`) |
+| `--gold-scope all` | keep per-keyphrase gold rows for training splits too (default: evaluation splits) |
+| `--offline` | never use the network; uncached tokenizers become flagged approximations |
 
-Download it and place it as a `data/` folder at the repository root, then run
-`python app.py`. `app.py` needs a `data/` folder (or a `sample_data/` folder,
-or `--data PATH`) to start; the repository itself ships no data, but
-`tools/make_sample_data.py` generates a self-contained `sample_data/` tree
-(five datasets, every card type, deliberate contract edge cases) and
-`tools/make_scaled_data.py` scales it up for load testing.
+Optional extras: a TeX distribution (PGF figures set in your paper's fonts;
+without it PDF/PNG still work), and `HF_TOKEN` in the environment for gated
+Hugging Face tokenizers (e.g. Llama). For a very large tree, derive it once
+without the UI: `python tools/scan_once.py --data PATH`.
 
-Optional: any TeX distribution (TeX Live, MiKTeX) enables PGF-typeset PDF
-exports — the figure is then set in your paper's own fonts. Without TeX,
-PDF/PNG exports still work through Matplotlib.
+## Your data
 
-## The data contract
-
-KPViz is driven entirely by the data tree — nothing about your datasets,
-models, metrics variables or costs is hardcoded. Keys are contractual;
-values are yours.
+Everything is driven by the tree; nothing about your datasets, models or
+costs is hard-coded.
 
 ```
 data/
-  documents/document.{dataset}.json      # dataset card
-  documents/document.{dataset}.jsonl     # the collection (one document per line)
-  models/model.{model}.json              # model card ("inference" = parameter schema)
-  architectures/architecture.{arch}.json # cost variables + linear rate models
-  insights/scores.jsonl                  # document similarity pairs (leakage)
+  documents/document.{dataset}.json      dataset card
+  documents/document.{dataset}.jsonl     the collection, one document per line
+  models/model.{model}.json              model card (with its inference-parameter schema)
+  architectures/architecture.{arch}.json cost variables and rates
+  insights/scores.jsonl                  optional: document similarity pairs
   inferences/{dataset}/{model}/{arch}/{run}/
-      run_{run}.json                     # the run's parameters
-      batch_%05d.json                    # batch metadata (timestamps, batch-level costs)
-      batch_%05d.jsonl                   # predictions: {"_id", "inferences", "costs"?}
+      run_{run}.json                     the parameters the run used
+      batch_00000.json                   optional: batch metadata (timestamps, batch costs)
+      batch_00000.jsonl                  predictions, one document per line
 ```
 
-Cards are JSON; `//` and `/* */` comments are accepted (JSONC), exactly as
-in the examples below. A section or annotation set may declare its languages
-as `"languages": ["en"]` or `"language": "en"`. A card that cannot be parsed
-is listed with its line and column on the Overview page rather than
-silently ignored; the same holds for malformed JSONL lines in collections
-and runs.
-
-Folder tokens resolve to cards by file-name token first, then by declared
-ids/names (`openai_api` finds `architecture.api.json` through its `arch_id`).
-A token like `n.a` resolves to nothing *on purpose*: its runs stay
-first-class for quality analysis and appear as performance-only wherever
-cost is an axis. Run parameters resolve against the model card — missing
-ones take the card's default, none is invented, and illegal values are
-flagged, never dropped.
-
-### Dataset card — `documents/document.{dataset}.json`
-
-Declares what a document is (sections, languages), which annotation sets
-exist and who produced them, and any extra metadata fields.
+Cards are JSON with `//` and `/* */` comments allowed. Examples, trimmed:
 
 ```jsonc
-{
-  "description": "SemEval-2010 scholarly documents (title + full text).",
-  "domain": "Academic",
-  "sub-domain": "computer-sciences",
-  "metadata": {
-    "split":    { "type": "split" },
-    "category": { "type": "classification", "taxonomy": "ACM CCS (1998)", "depth": 3 }
-  },
-  "document": {
-    "title+full-text": { "type": ["title", "body"], "modality": "text", "languages": ["en"] }
-  },
-  "annotations": {
-    "author": { "type": "author", "expertise": "author",  "languages": ["en"] },
-    "reader": { "type": "reader", "expertise": "student", "languages": ["en"],
-                "post_annotation": { "type": "expert" } }
-  }
-}
-```
+// documents/document.semeval-2010.json
+{ "description": "SemEval-2010 scholarly documents",
+  "metadata":    { "split": { "type": "split" } },
+  "document":    { "title+full-text": { "type": ["title", "body"], "languages": ["en"] } },
+  "annotations": { "author": { "type": "author", "languages": ["en"] },
+                   "reader": { "type": "reader", "languages": ["en"] } } }
 
-A document that lacks a declared section is flagged `missing_section:…`,
-unless the card marks that section `"optional": true`. There is exactly one
-collection file per dataset (`documents/document.{dataset}.jsonl`, no
-sharding); a document id repeated inside it keeps its first line.
+// one line of documents/document.semeval-2010.jsonl
+{ "_id": "C-41", "metadata": { "split": "test" },
+  "sections":    [ { "field": "title+full-text", "content": "…" } ],
+  "annotations": [ { "annotator": "author", "keyphrases": ["grid computing", "…"] } ] }
 
-### Model card — `models/model.{model}.json`
-
-Identity, lineage and capabilities, plus the **`inference` schema** every
-run is validated against: types, legal ranges/values, defaults, and — for
-context windows — the tokenizer that measures them.
-
-```jsonc
-{
-  "model_id": "https://huggingface.co/taln-ls2n/bart-base-kp20k",
-  "name": "bart-base-kp20k",
-  "family": [["Neural model", "Paradigms", "One2Seq"],
-             ["Pre-trained models", "BART"]],
-  "backend": "transformers",
+// models/model.bart-base-kp20k.json
+{ "name": "bart-base-kp20k", "backend": "transformers", "supervision": ["kp20k"],
   "capabilities": { "extractive": true, "abstractive": true },
-  "parameters": { "total": 139420416 },
-  "supervision": ["kp20k"],
-  "languages": ["en"],
-  "references": { "url": "…", "bibtex": "…" },
   "inference": {
-    "num_beams":       { "type": "int", "min": 1 },
-    "input_max_size":  { "type": "context_window",
-                         "tokenizer": "transformers[bart-base]",
-                         "min": 1, "max": 1024, "default": 1024 },
-    "output_max_size": { "type": "context_window",
-                         "tokenizer": "transformers[bart-base]",
-                         "min": 1, "max": 1024, "default": 1024 }
-  }
-}
-```
+    "num_beams":      { "type": "int", "min": 1 },
+    "input_max_size": { "type": "context_window", "tokenizer": "transformers[facebook/bart-base]",
+                        "min": 1, "max": 1024, "default": 1024 } } }
 
-Card defaults are validated like given values, a numeric parameter may
-restrict itself to `values`, and a parameter type KPViz cannot check is
-flagged rather than trusted. A context-window parameter may declare
-`"reserved_tokens"` (special tokens, a prompt, few-shot examples) — or a run
-may set a `reserved_tokens` parameter — and RQ3 then measures what fits in
-the window *minus* that reservation.
+// architectures/architecture.api.json
+{ "arch_id": "openai_api", "kind": "api",
+  "variables": { "input_tokens":  { "unit": "token", "level": "document",
+                                    "tokenizer": "tiktoken[o200k_base]" },
+                 "output_tokens": { "unit": "token", "level": "document",
+                                    "tokenizer": "tiktoken[o200k_base]" } },
+  "rates": { "usd": { "input_tokens": 2.5e-6, "output_tokens": 1e-5 } } }
 
-### Architecture card — `architectures/architecture.{arch}.json`
+// inferences/…/run_04b902a7.json, then one line of a batch_*.jsonl
+{ "parameters": { "num_beams": 4, "input_max_size": 512 } }
+{ "_id": "C-41", "inferences": ["grid computing", "…"],
+  "costs": { "input_tokens": 1430, "output_tokens": 31 } }
 
-Where inference physically ran. Declares raw cost **variables** (with a
-`document` or `batch` level) and linear **rate** models per cost unit;
-run costs are resolved against these — never invented.
-
-```jsonc
-{
-  "arch_id": "openai_api",
-  "name": "OpenAI API",
-  "kind": "api",
-  "variables": {
-    "input_tokens":  { "unit": "token", "tokenizer": "tiktoken[o200k_base]", "level": "document" },
-    "output_tokens": { "unit": "token", "tokenizer": "tiktoken[o200k_base]", "level": "document" },
-    "time":          { "unit": "s", "level": "document" }
-  },
-  "rates": {                                  // usd = 2.5e-6·input + 1e-5·output
-    "usd":  { "input_tokens": 2.5e-6, "output_tokens": 1e-5 },
-    "time": { "time": 1.0 }
-  }
-}
-```
-
-### Similarity pairs — `insights/scores.jsonl`
-
-One pair per line; used by the data-quality workbench (e.g. train→test
-leakage against a model's own supervision data).
-
-Both key spellings are accepted (`dataset_a`/`doc_id_a` and `dataset_A`/`doc_id_A`).
-
-```jsonc
+// insights/scores.jsonl (one pair per line)
 { "dataset_a": "kp20k", "doc_id_a": "…", "dataset_b": "kpbiomed", "doc_id_b": "…",
   "score": 0.93, "label": "near-duplicate" }
 ```
 
-### Runs — `inferences/{dataset}/{model}/{arch}/{run}/`
+What KPViz does with them:
 
-`run_{run}.json` carries the parameters actually used (validated against the
-model card). Each `batch_*.jsonl` line is one document's predictions; costs
-may live at the document level or in the batch's `batch_*.json` metadata —
-KPViz maps whatever is mappable at its declared level.
+- **Run parameters** are checked against the model card: a missing one takes
+  the card's default, an illegal one is flagged, never dropped.
+- **Folder names** find their card by file name, then by declared id or name.
+  A run whose card is missing stays usable; what needs the card (cost,
+  validation) is shown as unknown.
+- **Costs** are the architecture's linear rates applied to the variables the
+  runs report, per document or per batch. Nothing is invented: a cost that
+  cannot be resolved is drawn as "unknown", not zero.
+- **Tokenizers** are `transformers[<owner>/<repo>]`,
+  `transformers[file:/path/tokenizer.json]` or `tiktoken[<encoding>]`
+  (`llama3`, `llama-3.3` and similar names resolve to the Llama 3
+  tokenizer). Assets are downloaded once and cached; a tokenizer that cannot
+  be loaded is replaced by a flagged approximation, with the reason on the
+  Overview page.
+- **Problems** (unreadable cards, malformed lines, repeated document ids,
+  duplicate or empty gold keyphrases, a detected language that contradicts
+  the declared one) are counted and listed under *Needs attention* on the
+  Overview page, never silently ignored.
 
-```jsonc
-// run_04b902a7dc7b.json
-{ "parameters": { "num_beams": 4, "input_max_size": 512, "output_max_size": 128 } }
+## The app
 
-// batch_00000.jsonl (one line)
-{ "_id": "kp20k_testing_0",
-  "inferences": ["feedback vertex set", "…"],
-  "costs": { "input_tokens": 143, "output_tokens": 31, "time": 0.8 } }
-```
+- **Overview** — scan with progress and ETA, catalog size, and one table of
+  everything that needs attention.
+- **Datasets** — per split: document lengths (in words or in any declared
+  model's tokens, against the models' input windows), PRMU classes,
+  keyphrase length and part-of-speech patterns; a document browser with the
+  gold, and "why did this run score this?" for any run and document.
+- **Models** and **Architectures** — the cards, their runs (checked against
+  the card), and costs.
+- **Insights** — five workbenches, each a figure, a table and an export:
+  1. Do datasets rank systems the same way? (correlation between benchmarks)
+  2. Does poor input data move the scores? (language mismatch, train–test
+     similarity)
+  3. How much does a bounded input window cost? (present gold inside vs.
+     beyond each model's window, and scores along document length)
+  4. What does a point of quality cost? (Pareto frontier in USD, kWh or time)
+  5. How do hyperparameters move the needle? (controlled sweeps)
 
-## What you get
+A model keeps one colour everywhere, its runs are lighter shades of it, and
+an architecture keeps one marker shape. Each workbench shows the few controls
+most people change; the rest are under *More options*.
 
-**Overview** — scan control, catalog summary, and integrity at a glance:
-every run carries `key:value` issue tags (illegal parameter, missing
-architecture/run/dataset, incomplete coverage) and every collection its
-data-quality flags, each counted with its share of the collection.
+**Statistics** (one setting for all workbenches): rank tests (Wilcoxon,
+Mann–Whitney, Friedman), mean tests (paired t, Welch t, repeated-measures
+ANOVA) or resampling (permutation, bootstrap); Holm, Bonferroni or
+Benjamini–Hochberg correction; 95 % intervals; effect sizes. Verified against
+SciPy; resampled p-values are seeded from the data, so they are reproducible.
 
-**Datasets / Models / Architectures** — card explorers with per-split
-statistics, PRMU distributions, run tables validated against the cards,
-resolved costs, and a document browser that reads your files in place
-through the byte-offset index.
+**Export**: PDF, PNG or the LaTeX `figure` snippet in one click; under
+*Caption & export options*, the paper style (article, *ACL, ACM, IEEE, LNCS,
+NeurIPS/ICLR), width, height, legend, PGF, a zip bundle, a booktabs table and
+a print-size preview. Figures are drawn at the venue's real column or text
+width, never rescaled. Captions are written from the exact configuration and
+stay editable.
 
-**Insights** — research-question workbenches (dataset correlation, data
-quality & bias, extractability & truncation, cost–performance,
-hyperparameters) with statistical inference built in and one-click export.
+## How scores are computed
 
-- *Statistics* (one setting for every workbench, so a paper never mixes
-  procedures): rank-based tests (Wilcoxon signed-rank, Mann–Whitney U,
-  Friedman), mean-based tests (paired t, Welch t, repeated-measures ANOVA) or
-  resampling (paired sign-flip permutation — the approximate-randomisation
-  test of the NLP literature — and bootstrap); Holm, Bonferroni or
-  Benjamini–Hochberg correction across the runs of a table; 95 % Student-t
-  or bootstrap intervals as error bars and in every table; effect sizes
-  (rank-biserial r, Cohen's d_z, Hedges' g, Kendall's W, partial η²);
-  Pearson, Spearman and Kendall τ-b between benchmarks with Fisher-z
-  intervals. Dependency-free, verified against SciPy, and every resampled
-  p-value is seeded from its data, so it is reproducible.
-- *Export*: pick the paper (article, *ACL, ACM, IEEE, LNCS, NeurIPS/ICLR),
-  the width (column or full text width), height and legend placement, and
-  preview the figure at print size. Figures are drawn at the venue's real
-  `\columnwidth`/`\textwidth` in its figure font — never rescaled — and go
-  into `figure` or `figure*` accordingly; copy the LaTeX, or download
-  PGF / PDF / PNG / a zip bundle. Tables are booktabs, with value, interval
-  and significance mark per cell, a statistics note, and a caption that
-  points to their figure. Captions are auto-written from the exact
-  configuration and stay editable. Every workbench's export is compiled in
-  the test suite inside article, IEEEtran, llncs and acmart documents
-  (pdflatex, xelatex, lualatex) with nothing allowed into the margin.
+- **Text**: NFKC-normalised, lowercased, with Windows-1252 bytes mis-read as
+  Latin-1 (`d\x92analyse`) repaired. Words are runs of letters, digits and
+  combining marks, so accented Latin, Arabic with harakat and Indic scripts
+  stay whole; each Chinese or Japanese character is a word. Words are
+  stemmed with the Snowball stemmer of their declared language (28
+  languages, Porter2 for English; others are matched unstemmed).
+- **Predictions** are de-duplicated after stemming, keeping rank order;
+  **gold** is de-duplicated per annotation set, and keyphrases with no word
+  are dropped (both counted). A `+` between two words separates gold
+  variants (`C++` stays whole).
+- **Metrics**: P, R and F1 at 5, 10, O (the number of gold keyphrases) and M
+  (all predictions); P@k = tp / min(k, #predictions), without padding.
+  Scores are per document, then macro-averaged; documents without gold after
+  filtering are excluded and counted.
+- **PRMU** (Boudin & Gallina, 2021), on stemmed words: **P** the keyphrase
+  occurs as a contiguous sequence, in order; **R** all its words occur but
+  not as that sequence; **M** some occur; **U** none. A contiguous
+  occurrence stays inside one section and does not cross a separating
+  punctuation mark (one next to a space, like a comma or full stop);
+  word-internal marks (`e-commerce`, `and/or`, `l'analyse`) do not break it.
+  A PRMU filter restricts the gold only: every prediction still counts.
+- **One line per document**: a repeated document id in a collection, or a
+  document predicted twice by a run, keeps its first line; both are counted
+  (`duplicate_doc_ids`, `duplicate_docs`).
 
-Evaluation conventions are stated in every caption: predictions lowercased,
-tokenised, stemmed and deduplicated keeping rank order; gold deduplicated
-per annotation set after stemming (token-less keyphrases dropped, both
-counted as collection issues); P/R/F1 at k ∈ {5, 10, O, M}; documents with
-no gold after filtering excluded with n reported; scores macro-averaged.
-PRMU follows Boudin & Gallina (2021) on stemmed tokens:
+Every caption states these conventions, so a figure carries its method.
 
-* **P** — the keyphrase's stemmed tokens occur in the stemmed document as a
-  contiguous sequence, in order;
-* **R** — all of its stemmed tokens occur in the document, but not as that
-  sequence;
-* **M** — some of them occur; **U** — none do.
+## Scale
 
-A contiguous occurrence stays inside one section and does not cross a
-separating punctuation mark (one with whitespace beside it, such as a comma
-or a full stop); word-internal marks ("e-commerce", "and/or") are
-transparent, as they are inside the keyphrase. For a '+'-separated gold
-entry the best class over its variants counts; a lone '+' between two
-characters separates variants, so "C++" stays whole. A filter on PRMU
-restricts the *gold* side only: every prediction still counts in P@k, and
-the caption says so.
+A scan runs in parallel on every core and re-derives only what changed. On 4
+cores, 263 000 documents (430 MB) take about 60 s for the documents phase;
+exact model-token counts are the main extra cost on large training splits
+(`--token-scope eval` skips them outside evaluation splits). The UI reads
+precomputed aggregates, so pages stay interactive on millions of documents.
 
-One evaluation unit per document: a collection that repeats a document id
-keeps its first line, and a run that predicts a document twice keeps its
-first line (lowest batch, then byte offset). Both are counted and shown as
-issue tags (`duplicate_doc_ids`, `duplicate_docs`), with `unscored` for
-predictions that no gold can score (training splits).
-
-## Reproducibility
-
-The derived store holds indices and statistics only — deleting `.kpviz/`
-and rescanning rebuilds everything from your files, deterministically.
-Every scan archives its exact per-step timings to `.kpviz/scan_stats/`.
-Every export bundle carries `provenance.json`: the KPViz code and schema
-versions, the catalog version and a fingerprint of the input files' content
-hashes. The automated checks live in `tests/` (run by CI on every push, with
-TeX and the publishers' classes installed); `tools/` holds the data
-generators and `tools/bench/` the measurement scripts, each taking
-`--data`/`--state` and running against any tree.
+## Development
 
 ```bash
-pip install -r requirements-dev.txt -c constraints.txt   # the tested versions
-python -m pytest tests -rs              # contract, raw-JSON oracle, parity, statistics vs SciPy, LaTeX in venue classes, UI
-python tools/bench/scan_profile.py --data sample_data --state /tmp/st --full
-python tools/bench/probe_ui.py http://127.0.0.1:8050   # against a running app
-python tools/bench/fingerprint.py --state .kpviz   # per-table content hashes
-python tools/bench/profile_scan.py --data TREE --state /tmp/p   # per-function profile, workers included
-
-# your own cards, synthetic documents and runs around them (too-big data stays home)
-python tools/synth_tree.py --cards MY_TREE --out synth_data   # MY_TREE: architectures/ models/ insights/
+pip install -r requirements-dev.txt -c constraints.txt    # the tested versions
+python -m pytest tests -rs                                 # what CI runs on every push
+python tools/bench/profile_scan.py --data TREE --state /tmp/p   # per-function scan profile
+python tools/bench/probe_ui.py http://127.0.0.1:8050      # callbacks and latency of a running app
+python tools/synth_tree.py --cards MY_CARDS --out synth    # synthetic documents and runs around your cards
 ```
 
-The test suite generates its own data tree, checks every SQL score against
-an independent reference implementation, verifies that the worker count
-and incremental re-scans never change a derived number, and renders and
-exports every workbench. `docs/PERFORMANCE_PLAN.md` records the
-performance work, its measured results, and the status of every review
-finding (Section 6.7). `tools/kpviz_scaling_benchmark.py` is the
-self-contained scaling benchmark behind Table 2 of the paper (`pip install
-nltk PyStemmer`, then `python tools/kpviz_scaling_benchmark.py`); besides
-the field's baselines and KPViz's algorithm it times the code path KPViz
-actually ships (`kpviz.textproc`: spaCy tokeniser, contiguous PRMU). Its
-original output is in `docs/benchmark_results_jcdl26.txt`, the current one
-in `docs/scaling_benchmark_quick.txt`.
-
-## Status
-
-KPViz is under active development. The data contract above is stable; the
-set of insights, statistics and supported card fields will keep growing.
-Issues and suggestions are welcome.
+The tests generate their own data, check every SQL score against an
+independent implementation and a hand-computed oracle, verify that worker
+count and incremental scans never change a number, and compile every export
+inside article, IEEEtran, llncs and acmart. Every export bundle carries a
+`provenance.json` (code, schema and catalog versions, input fingerprint).
+`tools/kpviz_scaling_benchmark.py` is the benchmark behind Table 2 of the
+paper; `docs/PERFORMANCE_PLAN.md` records the performance work.
 
 ## Citation
-
-If you use KPViz, please cite:
 
 ```bibtex
 @inproceedings{zahhar2026kpviz,
   author    = {Zahhar, Saber and Rodrigues, Christophe and Mellouli, N{\'e}dra and Travers, Nicolas},
   title     = {{KPViz}: A Framework for Keyphrase Prediction Experiments},
   booktitle = {The 2026 ACM/IEEE Joint Conference on Digital Libraries (JCDL '26)},
-  series    = {JCDL '26},
   year      = {2026},
   publisher = {Association for Computing Machinery},
   address   = {New York, NY, USA},
-  location  = {Frisco, TX, USA},
-  isbn      = {979-8-4007-2597-5},
   doi       = {10.1145/3805696.3846518}
 }
 ```

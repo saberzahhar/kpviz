@@ -1,6 +1,12 @@
 # KPViz performance plan: memory, parallel workers, efficiency, latency
 
-Status: **revision 5**, 28 Sep 2026, 15 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements; Section 6.7 answers the second review round (evaluation semantics, statistics, export, state) finding by finding.
+Status: **revision 6**, 28 Sep 2026, 15 days before the JCDL '26 demo (13–16 Oct). The plan was revised after six reviews of revision 1, and Waves 1 and 2 plus most of Wave 3 are implemented on branch `claude/modest-knuth-j3991q`. Section 6 has the before/after measurements; Section 6.7 answers the second review round (evaluation semantics, statistics, export, state) finding by finding.
+
+**Revision 6 (after the authors' first full-size scan: 6.43 M documents, 13.5 GB, 36 min, 34 of them in the documents phase).**
+- *Documents phase, 3.1× faster* (263 k documents, 430 MB, 4 workers: 180 s → 58 s; worker time 655 s → 190 s). The profile put 60 % of worker time in spaCy's blank tokenizer and 12 % in the Python position index. Both are gone: one Unicode regex tokenizer (separating punctuation leaves a sentinel no contiguous match crosses) and PRMU as a C substring search on the padded stem string; the stemmer word cache is sized for a corpus (300 k). Same PRMU class on all 237,666 gold keyphrases of the tree, same end offsets, identical scores on all 828 metric rows. The comparison caught a section-offset bug in the first version, fixed before commit.
+- *Token counts for every split and every declared tokenizer* (the authors' request). An exact Hugging Face tokenizer costs 0.32–0.43 ms per 1.6 KB document, more than the rest of the text pipeline (0.23 ms), so on training splits of millions of documents it is the main remaining cost; counts use the offset-free encoder (−25 %) and `--token-scope eval` restores the old scope.
+- *Serving*: the scoring index lists only documents with gold (the whole 5.6 M-document training split was listed per query before); the Datasets length histogram is binned in DuckDB instead of fetched row by row.
+- `docs/scaling_benchmark_quick.txt` re-run: the shipped phrase tokenizer is 2.5× faster than the spaCy path it replaces.
 
 **Identifiers.** This plan's own action IDs (A1, C13, E1 …) collide with the reviews' finding IDs (the review's E1 is present/absent scoring, this plan's E1 is the memory budget). From revision 5 on, cross-references say which is meant: **P-E1** for a plan action, **R2-N1** for `REVIEW-2.md`, **RV-R01** for the revised-review report, **RC1–RC4** for the four commit notes.
 

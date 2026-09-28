@@ -162,17 +162,17 @@ def main() -> int:
             settle(0.6)
 
             def change_k(rq=rq):
-                page.click(f"#{rq}-k")
-                opt = page.get_by_role("option", name="@M", exact=True)
+                page.click(f"#{rq}-metric")
+                opt = page.get_by_role("option", name="F1@M", exact=True)
                 if opt.count():
                     opt.first.click()
                 else:                       # dropdowns without ARIA options
-                    page.keyboard.type("@M")
+                    page.keyboard.type("F1@M")
                     page.keyboard.press("Enter")
-                txt = page.inner_text(f"#{rq}-k")
+                txt = page.inner_text(f"#{rq}-metric")
                 if "@M" not in txt:
-                    print(f"  ! {rq}: @k did not change (shows {txt.strip()!r})")
-            act(f"{rq}: @k -> M", change_k)
+                    print(f"  ! {rq}: the metric did not change (shows {txt.strip()!r})")
+            act(f"{rq}: metric -> F1@M", change_k)
             act(f"{rq}: tab away and back", lambda rq=rq: (
                 page.click("#tab-rq1" if rq != "rq1" else "#tab-rq2"),
                 page.click(f"#tab-{rq}")))
