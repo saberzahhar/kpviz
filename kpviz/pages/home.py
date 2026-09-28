@@ -16,21 +16,17 @@ def layout():
     return html.Div([
         html.H2("Overview", className="page-title"),
         html.P(["Data root ", html.Code(str(st.data_root)),
-                " — scans detect new, modified and deleted components by "
-                "size/mtime + BLAKE2 content hash, then re-derive only what "
-                "changed, in parallel across the CPU cores. Exact per-step "
-                "timings and memory of every scan are archived in "
-                ".kpviz/scan_stats/."],
+                ". A scan re-derives only the files that changed."],
                className="page-desc"),
         html.Div([
             html.Button("Scan for changes", id="btn-scan",
                         className="btn primary", n_clicks=0),
-            html.Button("Full re-scan (re-derive everything)", id="btn-rescan",
+            html.Button("Full re-scan", id="btn-rescan",
                         className="btn", n_clicks=0,
                         title="Re-hash every file and re-derive every "
                               "collection and run"),
             html.Button("Retry tokenizer downloads", id="btn-retry-tok",
-                        className="btn small", n_clicks=0,
+                        className="btn small ghost", n_clicks=0,
                         title="Forget which tokenizer assets were unavailable "
                               "and try again on the next scan"),
             html.Button("Cancel", id="btn-cancel", className="btn small",
@@ -40,19 +36,8 @@ def layout():
         html.Div(id="scan-progress", children=_progress_panel(
             scanner.STATE.snapshot())),
         html.Div(id="home-inventory"),
+        html.Div(id="home-issues"),
         html.Div(id="home-backends"),
-        html.Div([
-            html.H3("Issues & integrity", className="section-title"),
-            ui.filter_row([
-                ui.control("Group runs by", dcc.RadioItems(
-                    id="issues-groupby",
-                    options=[{"label": " dataset", "value": "dataset"},
-                             {"label": " model", "value": "model"}],
-                    value="dataset", inline=True,
-                    className="kp-check kp-inline"), 240),
-            ]),
-            html.Div(id="home-issues"),
-        ]),
         dcc.Store(id="scan-panel-sig"),
     ], className="page")
 
@@ -163,82 +148,141 @@ def _inventory():
                      ui.kpi_row(tiles)])
 
 
-def _issues(groupby: str):
-    if not db.q1("SELECT 1 FROM runs LIMIT 1"):
-        return None
+_TAG_KEEP_VALUE = ("illegal parameter", "missing", "unresolved")
+
+
+def _tag_group(tag: str) -> tuple[str, str]:
+    """(group, value): a categorical tag keeps its value in the group
+    ("missing:architecture"), a count does not ("unscored:5" -> "unscored")."""
+    key, _, val = str(tag).partition(":")
+    if key.startswith(_TAG_KEEP_VALUE):
+        return tag, ""
+    return key, val
+
+
+def _few(names, n: int = 3) -> str:
+    names = sorted(set(names), key=str)
+    return ", ".join(names[:n]) + (f" +{len(names) - n}" if len(names) > n else "")
+
+
+def _issues():
+    """Everything that needs attention, one row per kind of issue: what, how
+    widespread, what it means and what KPViz did about it. The per-run list
+    is one click away."""
     idx = scanner.cards()
-    rows = db.q("""SELECT dataset, model, arch, run_id, tags, coverage
-                   FROM runs WHERE tags IS NOT NULL AND tags <> '[]'
+    rows_out = []            # (severity, chip, where, meaning)
+
+    runs = db.q("""SELECT dataset, model, arch, run_id, tags FROM runs
+                   WHERE tags IS NOT NULL AND tags <> '[]'
                    ORDER BY dataset, model, run_id""")
-    blocks = []
+    groups: dict[str, list] = {}
+    for ds, m, a, rid, tj in runs:
+        for t in json.loads(tj):
+            g, val = _tag_group(t)
+            groups.setdefault(g, []).append((ds, idx.model(m).name, val))
+    for g, hits in groups.items():
+        n_runs = len(hits)
+        vals = [v for *_x, v in hits if v]
+        span = ""
+        if vals:
+            try:
+                nums = sorted(float(v.rstrip("%")) for v in vals)
+                unit = "%" if vals[0].endswith("%") else ""
+                lo, hi = nums[0], nums[-1]
+                span = (f" · {lo:g}{unit}" if lo == hi
+                        else f" · {lo:g}–{hi:g}{unit}")
+            except ValueError:
+                span = ""
+        where = (f"{n_runs} run{'s' if n_runs > 1 else ''}{span} · "
+                 f"{_few(h[1] for h in hits)} · on {_few(h[0] for h in hits)}")
+        sev = 0 if g.startswith(("illegal", "missing", "unresolved")) else 1
+        rows_out.append((sev, g, where, _meaning(g)))
 
-    if rows:
-        groups: dict[str, list] = {}
-        for ds, m, a, rid, tj, cov in rows:
-            gk = ds if groupby == "dataset" else idx.model(m).name
-            groups.setdefault(gk, []).append((ds, m, a, rid, json.loads(tj), cov))
-        content = []
-        for gname in sorted(groups):
-            runs = groups[gname]
-            content.append(html.Div([
-                html.Span(gname),
-                html.Span(f"{len(runs)} run(s) flagged", className="muted"),
-            ], className="group-head"))
-            trs = []
-            for ds, m, a, rid, tags, cov in runs:
-                other = idx.model(m).name if groupby == "dataset" else ds
-                trs.append([
-                    other, html.Code(rid[:12]), a or "—",
-                    html.Span([ui.tag_chip(t) for t in tags]),
-                ])
-            content.append(ui.table(
-                ["Model" if groupby == "dataset" else "Dataset", "Run",
-                 "Architecture", "Issue tags"], trs))
-        n_flag = len(rows)
-        n_all = db.q1("SELECT count(*) FROM runs")[0]
-        blocks.append(ui.card(
-            [html.Div(f"{n_flag} of {n_all} runs carry at least one issue tag.",
-                      className="muted small", style={"marginBottom": "4px"}),
-             *content],
-            title="Run issues"))
-    else:
-        blocks.append(ui.card(html.Div([
-            ui.badge("all clear", "ok"),
-            html.Span(" every run is complete, valid and fully linked",
-                      className="muted small")]), title="Run issues"))
+    for e in db.kv_get("card_errors", []) or []:
+        rows_out.append((0, "unreadable card", html.Code(e["file"]),
+                         e["error"] + " — treated as absent until fixed"))
 
-    card_errors = db.kv_get("card_errors", []) or []
-    if card_errors:
-        blocks.append(ui.card(ui.table(
-            ["Card", "Problem"],
-            [[html.Code(e["file"]), e["error"]] for e in card_errors]),
-            title="Unreadable cards — treated as absent until fixed"))
     coll = db.kv_get("collection_issues", {}) or {}
-    coll_rows = [[ds, ui.tag_chip(f"{k}:{v}")] for ds, d in sorted(coll.items())
-                 for k, v in d.items() if k != "first_malformed_byte"]
-    if coll_rows:
-        blocks.append(ui.card(ui.table(["Dataset", "Collection integrity"],
-                                       coll_rows),
-                              title="Collection integrity"))
+    by_key: dict[str, list] = {}
+    for ds, d in sorted(coll.items()):
+        for k, v in d.items():
+            if k != "first_malformed_byte" and v:
+                by_key.setdefault(k, []).append(f"{ds} {human_count(v)}")
+    for k, parts in by_key.items():
+        rows_out.append((1, k, " · ".join(parts), _meaning(k)))
 
-    # share of the dataset's own documents, in the same cell as the count —
-    # "157" means nothing until you know whether the collection has 200 or 20k
-    fl = db.q("""SELECT d.dataset, f.fl, count(*),
+    fl = db.q("""SELECT f.fl, d.dataset, count(*),
                         (SELECT count(*) FROM documents t
                           WHERE t.dataset = d.dataset)
                  FROM documents d, UNNEST(d.flags) AS f(fl)
                  GROUP BY 1, 2 ORDER BY 1, 3 DESC""")
-    if fl:
-        trs = [[ds, ui.tag_chip(flag),
-                html.Span([f"{n:,}".replace(",", " "),
-                           html.Span(f" ({100.0 * n / tot:.1f}%)"
-                                     if tot else " (—)",
-                                     className="muted")])]
-               for ds, flag, n, tot in fl]
-        blocks.append(ui.card(ui.table(
-            ["Dataset", "Quality flag", "Documents"], trs, num_cols={2}),
-            title="Data quality"))
-    return html.Div(blocks)
+    # one row per kind of flag: "lang_mismatch" lists where (dataset ·
+    # section or annotation set) instead of one near-identical row each
+    by_flag: dict[str, list] = {}
+    for flag, ds, n, tot in fl:
+        kind, _, where = flag.partition(":")
+        share = f" {100.0 * n / tot:.1f}%" if tot else ""
+        by_flag.setdefault(kind, []).append(
+            f"{ds}{' ' + where if where else ''} {human_count(n)}{share}")
+    for flag, parts in by_flag.items():
+        rows_out.append((2, flag, " · ".join(parts[:4])
+                         + (f" +{len(parts) - 4}" if len(parts) > 4 else ""),
+                         _meaning(flag)))
+
+    toks = db.kv_get("tokenizers", {}) or {}
+    for spec, info in sorted(toks.items()):
+        if info.get("status") != "exact":
+            rows_out.append((1, "approximate tokens", html.Code(spec),
+                             (info.get("why") or "asset unavailable")
+                             + " — counts and window positions are estimated"))
+
+    if not rows_out:
+        return html.Div([html.H3("Needs attention", className="section-title"),
+                         ui.card(html.Div([ui.badge("all clear", "ok"), html.Span(
+                             " every run is complete, valid and linked; every "
+                             "collection and tokenizer is clean",
+                             className="muted small")]))])
+    rows_out.sort(key=lambda r: (r[0], str(r[1])))
+    n_all = (db.q1("SELECT count(*) FROM runs") or [0])[0]
+    trs = [[ui.tag_chip(g) if isinstance(g, str) else g, where,
+            html.Span(meaning, className="muted small")]
+           for _sev, g, where, meaning in rows_out]
+    detail = None
+    if runs:
+        det = [[ds, idx.model(m).name, html.Code(rid[:12]), a or "—",
+                html.Span([ui.tag_chip(t) for t in json.loads(tj)])]
+               for ds, m, a, rid, tj in runs]
+        detail = html.Details([
+            html.Summary(f"Every flagged run ({len(runs)} of {n_all})"),
+            ui.table(["Dataset", "Model", "Run", "Architecture", "Issue tags"],
+                     det)], className="fold")
+    return html.Div([
+        html.H3("Needs attention", className="section-title"),
+        ui.card([ui.table(["Issue", "Where", "What it means"], trs), detail])])
+
+
+def _meaning(key: str) -> str:
+    """What an issue means and what was done about it (one line)."""
+    base = str(key).split(":", 1)[0]
+    if base.startswith("illegal parameter"):
+        return ("a run's parameter value is outside what its model card "
+                "declares (or undeclared); the run is kept and flagged")
+    what = str(key).split(":", 1)[1] if ":" in key else ""
+    if base == "missing" and what == "run":
+        return ("the run folder has no run_*.json: its parameters are unknown, "
+                "so the model card's defaults are assumed")
+    if base == "missing" and what == "dataset":
+        return ("predictions for a dataset with no document collection; they "
+                "enter no score")
+    if base == "missing":
+        return (f"no {what or 'matching'} card for this run's folder name; the "
+                "run is kept, and what needs the card (costs, validation) is "
+                "unknown")
+    if base.startswith("lang_mismatch"):
+        return ("the detected language of a section or annotation set "
+                "differs from the declared one; the documents stay in, and "
+                "Insights → data quality measures their effect")
+    return ui.TAG_HELP.get(base, "")
 
 
 def _backends_panel():
@@ -283,17 +327,17 @@ def _backends_panel():
                                                      else "none"),
                                           "ok" if teng else "gray"),
                  "PGF typesetting" if teng else "PDF/PNG via Matplotlib"])
-    warn = [n for n, i in b.items() if i["level"] == "warn" and n != "TeX"] + [
-        s_ for s_, i in toks.items() if i.get("status") != "exact"]
-    return html.Div([
-        html.H3("Engine", className="section-title"),
-        html.Div("Fast paths in use on this machine"
-                 + (" — some are falling back, see below"
-                    if warn else " — all optimal"),
-                 className="section-note"),
+    warn = [n for n, i in b.items() if i["level"] == "warn" and n != "TeX"]
+    n_exact = sum(1 for i in toks.values() if i.get("status") == "exact")
+    summary = (f"{d['workers']} scan workers · DuckDB threads {d['db_threads']} · "
+               f"tokenizers {n_exact}/{len(toks)} exact · TeX "
+               f"{teng or 'none'}"
+               + (f" · {len(warn)} fallback(s)" if warn else ""))
+    return html.Details([
+        html.Summary(["Engine", html.Span(" · " + summary, className="stats-sum")]),
         ui.kpi_row(tiles),
         ui.card(ui.table(["Component", "Active", "Note"], rows)),
-    ])
+    ], className="more-opts engine-fold", open=bool(warn))
 
 
 def _panel_sig(snap: dict) -> str:
@@ -359,12 +403,11 @@ def register(app):
         Output("home-issues", "children"),
         State("vis-home", "data"), Input("shown-home", "data"),
         Input("catalog-version", "data"),
-        Input("issues-groupby", "value"),
         prevent_initial_call=True)
-    def static(visible, _shown, _v, groupby):
-        """Catalog, engine and issues: on show, after a scan publishes, or
-        when the grouping changes — never on a timer."""
+    def static(visible, _shown, _v):
+        """Catalog, engine and issues: on show and after a scan publishes —
+        never on a timer."""
         if not visible:
             raise PreventUpdate
-        return (_inventory(), _backends_panel(),
-                _issues(groupby or "dataset"))
+        has = db.q1("SELECT 1 FROM files LIMIT 1")
+        return (_inventory(), _backends_panel(), _issues() if has else None)

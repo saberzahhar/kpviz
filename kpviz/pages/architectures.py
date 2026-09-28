@@ -48,10 +48,9 @@ def _arch_options():
 def layout():
     return html.Div([
         html.H2("Architectures", className="page-title"),
-        html.P("Where inference physically ran. Each card declares raw cost "
-               "variables (with a document or batch level) and linear rate "
-               "models per cost unit; run costs are resolved against these — "
-               "never invented.", className="page-desc"),
+        html.P("Where inference ran: the cost variables each card declares, "
+               "the rates that price them, and what its runs cost.",
+               className="page-desc"),
         ui.filter_row([
             ui.control("Architecture", dcc.Dropdown(
                 id="ar-pick", options=[], clearable=False,
@@ -152,9 +151,11 @@ def _body(token):
                  "time": "Total wall time"}.get(unit, unit)
         val = human_cost(unit, tot)
         tiles.append(ui.stat_tile(label, val, f"across {len(runs)} runs"))
-    runs_card = ui.card(ui.table(
+    runs_card = ui.card(ui.fold(ui.table(
         ["Dataset", "Model", "Run", "Documents", *ac.cost_units], trs,
-        num_cols=set(range(3, 4 + len(ac.cost_units)))),
+        num_cols=set(range(3, 4 + len(ac.cost_units)))), len(trs),
+        f"{len(trs)} runs of {len({m for _d, m, *_r in runs})} model(s) on "
+        f"{len({d for d, *_r in runs})} dataset(s) — show the table"),
         title=f"Runs on this architecture · {len(runs)}") if runs else None
 
     return html.Div([header, ui.kpi_row(tiles) if tiles else None,

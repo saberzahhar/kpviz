@@ -173,8 +173,11 @@ def graph(id, figure=None, height: int = 420, config: dict | None = None,
                             else {"height": f"{height}px"}))
 
 
-def export_bar(rq: str, spec: dict | None = None):
-    """One export bar per figure: stores + buttons + clipboards.
+def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
+    """One export bar per figure: the three exports people use (PDF, PNG,
+    the LaTeX figure snippet) in view; the caption, the paper and layout
+    options, the .pgf, the bundle, the LaTeX table and the print preview
+    folded under "Caption & options".
 
     The figure/table spec is written to {'type':'fig-spec','rq':rq} by the
     RQ callback — or given here for a figure drawn once (Datasets, Models);
@@ -183,10 +186,12 @@ def export_bar(rq: str, spec: dict | None = None):
     if spec:
         from .export import snippets
         clip_fig, clip_tab, hint = snippets(spec)
-    def b(what, label, primary=False):
+
+    def b(what, label, primary=False, title=None):
         return html.Button(label, id={"type": "exp-btn", "rq": rq, "what": what},
                            className="btn small" + (" primary" if primary else ""),
-                           n_clicks=0)
+                           n_clicks=0, title=title)
+
     def opt(kind, label, options, value, width):
         # remembered per browser: a paper keeps its venue across sessions
         return html.Div([
@@ -196,6 +201,15 @@ def export_bar(rq: str, spec: dict | None = None):
                          persistence=True, persistence_type="local",
                          className="dash-dropdown exp-dd")],
             className="exp-opt", style={"minWidth": f"{width}px"})
+
+    def clip(kind, label, title):
+        # the label is drawn by CSS on the clipboard itself (::after), so a
+        # click anywhere on the button copies
+        return dcc.Clipboard(title=title, id={"type": f"exp-clip-{kind}", "rq": rq},
+                             content=clip_fig if kind == "fig" else clip_tab,
+                             className=f"btn small clip-btn clip-{kind}",
+                             style={"display": "inline-flex"})
+
     from .figures import VENUES
     return html.Div([
         # data only when there is a spec: an explicit data=None makes Dash
@@ -204,57 +218,56 @@ def export_bar(rq: str, spec: dict | None = None):
                   **({"data": spec} if spec else {})),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
         html.Div([
-            opt("venue", "Paper", [{"label": v["label"], "value": k}
-                                   for k, v in VENUES.items()], "generic", 250),
-            opt("span", "Width", [{"label": "as designed", "value": "auto"},
-                                  {"label": "one column", "value": "col"},
-                                  {"label": "full text width", "value": "full"}],
-                "auto", 150),
-            opt("height", "Height", [{"label": "compact", "value": "compact"},
-                                     {"label": "standard", "value": "std"},
-                                     {"label": "tall", "value": "tall"}],
-                "std", 115),
-            opt("legend", "Legend", [{"label": "auto", "value": "auto"},
-                                     {"label": "above", "value": "top"},
-                                     {"label": "right", "value": "right"},
-                                     {"label": "none (in caption)", "value": "none"}],
-                "auto", 150),
-            opt("cells", "Table cells", [
-                {"label": "value", "value": "value"},
-                {"label": "value [CI]", "value": "ci"},
-                {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
-        ], className="exp-opts"),
-        html.Div([
-            dcc.Clipboard(title="copy LaTeX (figure environment)",
-                          id={"type": "exp-clip-fig", "rq": rq},
-                          content=clip_fig, className="btn small",
-                          style={"display": "inline-flex"}),
-            html.Span("LaTeX figure", className="small muted",
-                      style={"marginRight": "10px", "marginLeft": "-2px"}),
-            dcc.Clipboard(title="copy LaTeX (booktabs table)",
-                          id={"type": "exp-clip-tab", "rq": rq},
-                          content=clip_tab, className="btn small",
-                          style={"display": "inline-flex"}),
-            html.Span("LaTeX table", className="small muted",
-                      style={"marginRight": "10px", "marginLeft": "-2px"}),
-            b("pdf", "PDF", primary=True), b("png", "PNG"),
-            b("pgf", ".pgf"), b("zip", "Bundle"),
-            html.Button("Preview", id={"type": "exp-prev", "rq": rq},
-                        className="btn small ghost", n_clicks=0,
-                        title="Show the exported figure at its printed size"),
+            b("pdf", "PDF", primary=True, title="vector PDF at the paper's size"),
+            b("png", "PNG", title="300 dpi PNG"),
+            clip("fig", "LaTeX", "copy the LaTeX figure environment"),
             html.Span(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
         ], className="export-bar"),
+        html.Details([
+            html.Summary("Caption & export options"),
+            caption_editor(rq, caption or ""),
+            html.Div([
+                opt("venue", "Paper", [{"label": v["label"], "value": k}
+                                       for k, v in VENUES.items()], "generic", 250),
+                opt("span", "Width", [{"label": "as designed", "value": "auto"},
+                                      {"label": "one column", "value": "col"},
+                                      {"label": "full text width", "value": "full"}],
+                    "auto", 150),
+                opt("height", "Height", [{"label": "compact", "value": "compact"},
+                                         {"label": "standard", "value": "std"},
+                                         {"label": "tall", "value": "tall"}],
+                    "std", 115),
+                opt("legend", "Legend", [{"label": "auto", "value": "auto"},
+                                         {"label": "above", "value": "top"},
+                                         {"label": "right", "value": "right"},
+                                         {"label": "none (in caption)", "value": "none"}],
+                    "auto", 150),
+                opt("cells", "Table cells", [
+                    {"label": "value", "value": "value"},
+                    {"label": "value [CI]", "value": "ci"},
+                    {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
+            ], className="exp-opts"),
+            html.Div([
+                clip("tab", "LaTeX table", "copy the booktabs table"),
+                b("pgf", ".pgf", title="PGF picture, typeset by your paper"),
+                b("zip", "Bundle", title="PDF + PGF + PNG + .tex + data"),
+                html.Button("Preview", id={"type": "exp-prev", "rq": rq},
+                            className="btn small ghost", n_clicks=0,
+                            title="Show the exported figure at its printed size"),
+            ], className="export-bar"),
+        ], className="exp-more"),
         loading(html.Div(id={"type": "exp-preview", "rq": rq},
                          className="exp-preview")),
-    ])
+    ], className="exp-wrap")
 
 
 def exportable(key: str, spec: dict, graph_component, title: str | None = None,
                **card_kw):
     """A card holding a figure drawn once (not by a workbench callback) with
-    the full export bar: caption, LaTeX snippets, PDF/PNG/PGF, bundle."""
-    return card([graph_component, caption_editor(key, spec.get("caption", "")),
-                 export_bar(key, spec)], title=title, **card_kw)
+    its export bar (caption and options folded)."""
+    return card([graph_component,
+                 export_bar(key, spec, caption=spec.get("caption", ""))],
+                title=title, **card_kw)
 
 
 def caption_editor(rq: str, initial: str = ""):
@@ -263,6 +276,21 @@ def caption_editor(rq: str, initial: str = ""):
     return html.Div(dcc.Textarea(
         id={"type": "caption", "rq": rq}, value=initial,
         placeholder="Caption used in exports…"), className="caption-box")
+
+
+def more(children, label: str = "More options", open_: bool = False):
+    """Secondary controls, folded: the page shows what most people change."""
+    return html.Details([html.Summary(label),
+                         html.Div(children, className="more-body")],
+                        className="more-opts", open=open_)
+
+
+def fold(child, n_rows: int, label: str, limit: int = 8):
+    """A long table (or list) folded behind a one-line summary; short ones
+    are shown as they are."""
+    if n_rows <= limit:
+        return child
+    return html.Details([html.Summary(label), child], className="fold")
 
 
 def empty_state(msg: str):

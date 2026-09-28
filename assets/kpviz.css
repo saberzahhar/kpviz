@@ -380,3 +380,25 @@ table.kp-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .pred-list .bad { color: var(--critical); font-weight: 700; }
 .pred-list .dup { opacity: .75; }
 .mono { font-family: var(--mono); }
+
+/* ---------- folded controls, export options, long tables ---------- */
+.exp-wrap { margin-top: 6px; }
+.clip-btn { gap: 5px; }
+.clip-btn.clip-fig::after { content: "LaTeX"; }
+.clip-btn.clip-tab::after { content: "LaTeX table"; }
+.exp-more, .more-opts, .fold { margin-top: 8px; }
+.exp-more > summary, .more-opts > summary, .fold > summary {
+  cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--accent-ink);
+  padding: 3px 0; list-style-position: inside; width: max-content; }
+.exp-more[open] > summary, .more-opts[open] > summary, .fold[open] > summary {
+  margin-bottom: 6px; }
+.exp-more .caption-box { margin-top: 4px; }
+.more-opts { margin: -8px 0 16px; }
+.more-body { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: flex-end;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 16px 14px; }
+.stats-sum { font-weight: 500; color: var(--ink-2); margin-left: 6px; }
+.stats-fold { margin: 0 0 8px; }
+.engine-fold { margin: 22px 0 0; }
+.engine-fold > summary, .stats-fold > summary { font-size: 13px; }
+.fold > summary { margin-top: 2px; }

@@ -20,12 +20,14 @@ from ... import db, scanner, ui
 from ...metrics import memo, metric_label, paired, run_scores_many
 from ...naming import run_labels, run_rows, window_str
 from ...stats import fmt_effect, p_str, sig_mark
-from ..insights_common import (ann_options, datasets_with_runs,
-                               effective_runs, effect_cell, figure_block, gate,
-                               metric_caption, metric_controls, models_control,
+from ..insights_common import (ann_options, best_per_model,
+                               datasets_with_runs, effective_runs, effect_cell,
+                               figure_block, gate, gold_controls,
+                               metric_caption, metric_control, models_control,
                                p_cells, p_headers, resolve_ann, rq_header,
-                               runs_control, selected_runs, stats_cfg,
-                               stats_inputs, stats_note, value_cell, vis, shown)
+                               runs_control, selected_runs, split_metric,
+                               stats_cfg, stats_inputs, stats_note,
+                               systems_control, value_cell, vis, shown)
 
 RQ = "rq3"     # panel (a): truncation conditions
 RQB = "rq3b"   # panel (b): length bins
@@ -37,31 +39,38 @@ COND_WIN = "present gold inside the context window"
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("To what extent is a keyphrase extractable?",
-                  "Models with a bounded input window never see part of a "
-                  "long document. The same predictions are scored twice, "
-                  "against *present* gold only (class P): every present "
-                  "keyphrase, and only those whose first occurrence ends "
-                  "inside the run's usable window (its model's own tokenizer, "
-                  "minus reserved tokens). Both bars are over the same "
-                  "documents, so the gap is the paired difference the dagger "
-                  "tests. This is gold-reference eligibility — the model is "
-                  "not re-run on truncated input."),
+        rq_header("How much does a bounded input window cost?",
+                  "A model with a bounded window never reads the end of a long "
+                  "document. The same predictions are scored against every "
+                  "present keyphrase (class P) and against those that end "
+                  "inside the run's usable window (its own tokenizer); the gap "
+                  "is what the window costs. Below: scores along document "
+                  "length."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
-                id=f"{RQ}-ds", options=ds,
-                value=("semeval2010" if "semeval2010" in ds else (ds[0] if ds else None)),
+                id=f"{RQ}-ds", options=ds, value=_longest(ds),
                 clearable=False, className="dash-dropdown"), 200),
-            *metric_controls(RQ, include_prmu=False),
+            metric_control(RQ),
+            systems_control(RQ),
         ]),
-        ui.filter_row([
-            models_control(RQ),
-            runs_control(RQ, 460),
-        ]),
-        figure_block(RQ, height=430),
+        ui.more([*gold_controls(RQ, include_prmu=False), models_control(RQ),
+                 runs_control(RQ, 460)]),
+        figure_block(RQ, height=360),
         html.Div(style={"height": "10px"}),
-        figure_block(RQB, height=430),
+        figure_block(RQB, height=400),
     ])
+
+
+def _longest(ds: list[str]):
+    """Default dataset: the one with the longest documents (where a window
+    can bite), else the first."""
+    if not ds:
+        return None
+    try:
+        got = dict(db.q("SELECT dataset, avg(n_words) FROM documents GROUP BY 1"))
+    except Exception:
+        got = {}
+    return max(ds, key=lambda d: (got.get(d) or 0, -ds.index(d)))
 
 
 def _as_count(v) -> int | None:
@@ -133,7 +142,7 @@ def register(app):
     from ..insights_common import (register_dataset_refresh,
                                    register_model_run_chain)
     register_dataset_refresh(app, f"{RQ}-ds", multi=False,
-                             prefer=["semeval2010"])
+                             prefer=lambda: [_longest(datasets_with_runs())])
     register_model_run_chain(app, RQ, multi_ds=False)
 
     @app.callback(Output(f"{RQ}-ann", "options"), State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -154,10 +163,10 @@ def register(app):
         Output({"type": "rq-table", "rq": RQB}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
-        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
-        Input(f"{RQ}-k", "value"), Input(f"{RQ}-ann", "value"),
+        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-metric", "value"),
+        Input(f"{RQ}-ann", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
-        *stats_inputs(),
+        Input(f"{RQ}-unit", "value"), *stats_inputs(),
         Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
@@ -168,9 +177,10 @@ def register(app):
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
-    def _update(ds, measure, k, ann_choice, models_sel, runs_sel, *stat_vals):
+    def _update(ds, metric, ann_choice, models_sel, runs_sel, unit, *stat_vals):
         from ...figures import MUTED, to_plotly
-        from ...naming import encode_runs, group_key
+        from ...naming import encode_runs, group_key, legend_items
+        measure, k = split_metric(metric)
         empty = to_plotly({"kind": "bar", "series": []})
         if not ds:
             return empty, None, "", None, empty, None, "", None
@@ -182,7 +192,6 @@ def register(app):
         ann = resolve_ann(ds, ann_choice)
         rows_meta = run_rows([ds])
         labels = run_labels(idx, rows_meta)
-        enc = encode_runs(idx, rows_meta)
         mlab = metric_label(measure, k)
 
         # one call for the "present" condition across every run, and one per
@@ -213,6 +222,14 @@ def register(app):
                     per_doc=True)
         got = run_scores_many(calls)
         present_all, plain_all = got.pop("present"), got.pop("plain")
+        if unit != "run":
+            # one system per model: its best run on present gold here
+            keys = best_per_model(
+                keys, lambda key: (present_all.get(key) or {}).get("mean"))
+        shown_keys = {group_key(*key) for key in keys}
+        # shades are assigned among the runs actually drawn
+        enc = encode_runs(idx, [r for r in rows_meta if group_key(
+            r["model"], r["arch"], r["run_id"]) in shown_keys])
         trunc_all: dict[tuple, dict] = {}
         for res in got.values():
             trunc_all.update(res)
@@ -297,6 +314,10 @@ def register(app):
             if st["n_win"]:
                 n_win_seen.append(st["n_win"])
             marks.append(mark)
+            if unit != "run":
+                # one bar per model: its name is the label (the run's
+                # settings are in the hover and the table)
+                xs[-1] = idx.model(key[0]).name
             cells = [value_cell(ma, st["n_all"], ci=st["ci_all"]),
                      value_cell(tm, st["n_win"] or None, ci=st["ci_win"]),
                      value_cell(t.get("diff"), None, signed=True, mark=mark,
@@ -318,11 +339,13 @@ def register(app):
         ci_txt = cfg.ci_text()
         # many runs: horizontal bars, one readable row per run (rotated
         # labels ate more room than the plot); few runs: columns
-        horiz = len(xs) > 8
+        horiz = len(xs) > 8 or max((len(x) for x in xs), default=0) > 16
+        # the reference condition recedes (grey), the window condition
+        # carries the accent: the eye reads the gap, not two loud bars
         ser = [{"name": name_all, "x": xs, "y": ys_all, "hover": hv_all,
-                "color": "#2a78d6", "err": err_all},
+                "color": "#a3a29b", "err": err_all},
                {"name": name_win, "x": xs, "y": ys_win, "hover": hv_win,
-                "color": "#1baf7a", "text": marks, "err": err_win}]
+                "color": "#2a78d6", "text": marks, "err": err_win}]
         if horiz:
             ser = [dict(sr, x=sr["y"], y=sr["x"]) for sr in ser]
         specA = {
@@ -358,8 +381,11 @@ def register(app):
                           "notes": f"Statistics: {methods_a}"
                                    + (f"; {ci_txt}" if ci_txt else "") + "."}
         tableA = html.Div([
-            ui.table(headers, table_rows,
-                     num_cols=set(range(2, len(headers)))),
+            ui.fold(ui.table(headers, table_rows,
+                             num_cols=set(range(2, len(headers)))),
+                    len(table_rows),
+                    f"Table · {len(table_rows)} runs · "
+                    f"{sum(1 for m_ in marks if m_)} significant gaps"),
             stats_note(cfg, "paired", n_tests_a)])
 
         # ---- panel (b): length-binned curves ------------------------------
@@ -455,9 +481,8 @@ def register(app):
                             "legendgroup": model})
             if lim and lim[1] not in used_tok:
                 used_tok[lim[1]] = 1
-                vlines.append({"x": lim[1],
-                               "label": f"{lab} limit {lim[1]}",
-                               "color": e.get("color", MUTED), "dash": True,
+                vlines.append({"x": lim[1], "label": window_str(*lim),
+                               "color": MUTED, "dash": True,
                                "shade_beyond": len(keys) == 1})
         xmax = max((max(s["x"]) for s in seriesB if s["x"]), default=0)
         inside = [v for v in vlines if v["x"] <= xmax * 1.35]
@@ -474,7 +499,8 @@ def register(app):
                 for x in sorted({v["x"] for v in beyond}))
                if beyond else ""), "ylabel": mlab,
             "series": seriesB, "vlines": inside,
-            "legend": "right" if len(seriesB) > 6 else "top",
+            "legend_items": legend_items(enc, [group_key(*key) for key in keys],
+                                         lines=True),
             "name": f"length-curve-{ds}",
             "caption": (f"{mlab} on {ds} across document-length bins "
                         "(about equal-count bins over each run's own "
@@ -501,8 +527,11 @@ def register(app):
                           "label": f"length-split-{ds}",
                           "notes": f"Statistics: {methods_b}"
                                    + (f"; {ci_txt}" if ci_txt else "") + "."}
-        tableB = (html.Div([ui.table(headersB, splitB_rows,
-                                     num_cols=set(range(2, len(headersB)))),
+        tableB = (html.Div([ui.fold(ui.table(headersB, splitB_rows,
+                                             num_cols=set(range(2, len(headersB)))),
+                                    len(splitB_rows),
+                                    f"Table · {len(splitB_rows)} runs split at "
+                                    "their window"),
                             stats_note(cfg, "indep", n_tests_b)])
                   if splitB_rows else
                   html.Div("no run on this dataset declares a context window, "

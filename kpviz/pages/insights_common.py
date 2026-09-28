@@ -169,6 +169,20 @@ def datasets_with_runs() -> list[str]:
            ORDER BY 1""")])
 
 
+def default_datasets(n: int) -> list[str]:
+    """The n datasets most runs were evaluated on (in name order): a
+    workbench opens on the slice with the most to compare, whatever the
+    collections are called."""
+    def build():
+        return [r[0] for r in db.q(
+            """SELECT r.dataset, count(DISTINCT (r.model, r.arch, r.run_id)) AS n
+               FROM runs r
+               WHERE EXISTS (SELECT 1 FROM documents d WHERE d.dataset = r.dataset)
+               GROUP BY 1 ORDER BY n DESC, 1""")]
+    ranked = memo("datasets_by_runs", build)
+    return sorted(ranked[:n])
+
+
 def _ann_keys(ds: str) -> list[str]:
     return memo(("ann_keys", ds), lambda: [r[0] for r in db.q(
         "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? ORDER BY 1", ds)])
@@ -192,7 +206,7 @@ def ann_options(datasets: list[str]) -> list[str]:
 
 
 def register_dataset_refresh(app, dropdown_id: str, multi: bool,
-                             prefer: list[str] | None = None,
+                             prefer=None,
                              rq: str | None = None):
     """Keep an RQ dataset selector in sync with the catalog — when the
     workbench is on screen (a hidden one catches up when shown)."""
@@ -212,13 +226,15 @@ def register_dataset_refresh(app, dropdown_id: str, multi: bool,
         ds = datasets_with_runs()
         if cur_opts == ds and current:
             raise PreventUpdate
+        pref = prefer() if callable(prefer) else prefer
         if multi:
             kept = [d for d in (current or []) if d in ds]
             if not kept:
-                kept = [d for d in (prefer or []) if d in ds] or ds[:3]
+                kept = ([d for d in (pref or []) if d in ds]
+                        or default_datasets(3))
             return ds, kept
         value = current if current in ds else (
-            next((d for d in (prefer or []) if d in ds), None) or
+            next((d for d in (pref or []) if d in ds), None) or
             (ds[0] if ds else None))
         return ds, value
 
@@ -321,18 +337,28 @@ def effective_runs(datasets: list[str], models_sel, runs_sel,
     return chosen or eligible
 
 
-def metric_controls(prefix: str, default_k: str = "O",
-                    include_prmu: bool = True):
-    out = [
-        ui.control("Measure", dcc.Dropdown(
-            id=f"{prefix}-measure",
-            options=[{"label": m.upper(), "value": m} for m in ("f1", "p", "r")],
-            value="f1", clearable=False, className="dash-dropdown"), 110),
-        ui.control("@k", dcc.Dropdown(
-            id=f"{prefix}-k",
-            options=[{"label": f"@{k}", "value": k} for k in ("5", "10", "O", "M")],
-            value=default_k, clearable=False, className="dash-dropdown"), 100),
-    ]
+METRIC_OPTIONS = [{"label": f"{m.upper()}@{k}", "value": f"{m}|{k}"}
+                  for m in ("f1", "p", "r") for k in ("5", "10", "O", "M")]
+
+
+def split_metric(value) -> tuple[str, str]:
+    """"f1|O" -> ("f1", "O"); anything unexpected -> F1@O."""
+    m, _, k = str(value or "").partition("|")
+    if m not in ("f1", "p", "r") or k not in ("5", "10", "O", "M"):
+        return "f1", "O"
+    return m, k
+
+
+def metric_control(prefix: str, default_k: str = "O"):
+    """One control for the measure and its cutoff (F1@5 … R@M)."""
+    return ui.control("Metric", dcc.Dropdown(
+        id=f"{prefix}-metric", options=METRIC_OPTIONS, value=f"f1|{default_k}",
+        clearable=False, searchable=False, className="dash-dropdown"), 110)
+
+
+def gold_controls(prefix: str, include_prmu: bool = True):
+    """Which gold counts: PRMU classes and annotation set (secondary)."""
+    out = []
     if include_prmu:
         out.append(ui.control("PRMU classes", dcc.Checklist(
             id=f"{prefix}-prmu",
@@ -342,6 +368,27 @@ def metric_controls(prefix: str, default_k: str = "O",
         id=f"{prefix}-ann", options=["auto"], value="auto",
         clearable=False, className="dash-dropdown"), 150))
     return out
+
+
+def systems_control(prefix: str, default: str = "model"):
+    """One point per model (its best run on the selection) or every run."""
+    return ui.control("Systems", dcc.RadioItems(
+        id=f"{prefix}-unit", value=default, className="kp-check kp-inline",
+        options=[{"label": " best run per model", "value": "model",
+                  "title": "each model's best-scoring run on this selection"},
+                 {"label": " every run", "value": "run"}]), 250)
+
+
+def best_per_model(keys: list[tuple], score) -> list[tuple]:
+    """Each model's best run by `score(key)` (None scores lose), in the
+    order the models first appear."""
+    best: dict[str, tuple] = {}
+    for key in keys:
+        v = score(key)
+        cur = best.get(key[0])
+        if cur is None or (v is not None and (cur[1] is None or v > cur[1])):
+            best[key[0]] = (key, v)
+    return [kv[0] for kv in best.values()]
 
 
 def models_control(prefix: str, width: int = 280):
@@ -381,7 +428,7 @@ def gold_phrase(ann_choice: str | None, datasets: list[str]) -> str:
 
 
 CONVENTIONS = ("predictions and gold NFKC-normalised, lowercased, split "
-               "into Unicode words and Snowball-stemmed; predictions de-duplicated keeping "
+               "into Unicode words and Snowball-stemmed (Porter2 for English); predictions de-duplicated keeping "
                "rank order, gold de-duplicated per annotation set; PRMU "
                "contiguous (Boudin & Gallina, 2021); "
                "P@k = tp / min(k, #predictions) (no padding); "
@@ -428,7 +475,6 @@ def figure_block(rq: str, height: int = 470, with_table: bool = True):
         dcc.Store(id={"type": "fig-sig", "rq": rq}),
         ui.loading(ui.graph({"type": "rq-graph", "rq": rq}, height=height,
                             grow=True)),
-        ui.caption_editor(rq),
         ui.export_bar(rq),
     ]
     if with_table:

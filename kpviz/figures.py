@@ -37,7 +37,8 @@ BASELINE = "#c3c2b7"
 SEQ_RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
             "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281",
             "#0d366b"]
-DIV_LOW, DIV_MID, DIV_HIGH = "#2a78d6", "#f0efec", "#e34948"
+# diverging pair: agreement (positive) reads calm blue, disagreement red
+DIV_LOW, DIV_MID, DIV_HIGH = "#e34948", "#f0efec", "#2a78d6"
 STATUS = {"good": "#0ca30c", "warning": "#fab219",
           "serious": "#ec835a", "critical": "#d03b3b"}
 
@@ -296,7 +297,7 @@ def _has_err(err) -> bool:
 
 
 def _plotly_layout(spec: dict) -> dict:
-    n_series = len(spec.get("series", []))
+    n_series = len(spec.get("legend_items") or spec.get("series", []))
     show_legend = spec.get("show_legend",
                            (n_series >= 2 or spec.get("kind") == "dumbbell")
                            and spec.get("kind") != "heatmap")
@@ -347,6 +348,9 @@ def _plotly_layout(spec: dict) -> dict:
     if spec.get("title"):
         lay["title"] = dict(text=spec["title"], font=dict(size=14, color=INK),
                             x=0, xanchor="left")
+    if spec.get("xticks"):
+        lay["xaxis"].update(tickmode="array", tickvals=spec["xticks"]["vals"],
+                            ticktext=spec["xticks"]["text"])
     if spec.get("xrange"):
         lay["xaxis"]["range"] = spec["xrange"]
     if spec.get("yrange"):
@@ -453,8 +457,10 @@ def to_plotly(spec: dict) -> go.Figure:
             hovertemplate=h.get("hover", "%{y} × %{x}: %{z:.3f}<extra></extra>"),
             colorbar=dict(thickness=10, outlinewidth=0,
                           tickfont=dict(size=10, color=MUTED))))
-        fig.update_yaxes(autorange="reversed", showgrid=False)
-        fig.update_xaxes(showgrid=False)
+        # square cells: a 3 × 3 matrix is not a banner
+        fig.update_yaxes(autorange="reversed", showgrid=False,
+                         scaleanchor="x", scaleratio=1, constrain="domain")
+        fig.update_xaxes(showgrid=False, constrain="domain")
         return fig
 
     if kind == "dumbbell":
@@ -496,9 +502,21 @@ def to_plotly(spec: dict) -> go.Figure:
 
     # scatter / line / bar families ----------------------------------------
     anchors = place_labels(spec) if kind != "bar" else {}
+    items = spec.get("legend_items") or []
+    for it in items:
+        # a legend entry per model (hue) and per architecture (shape); the
+        # marks themselves stay out of the legend and toggle with their model
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], name=it["name"], legendgroup=it.get("group"),
+            mode="lines+markers" if it.get("line") else "markers",
+            marker=dict(size=9, color=it["color"],
+                        symbol=it.get("shape", "circle"),
+                        line=dict(color=SURFACE, width=1)),
+            line=dict(color=it["color"], width=2), hoverinfo="skip",
+            showlegend=True))
     for si, s in enumerate(spec.get("series", [])):
         common = dict(name=s.get("name", ""),
-                      showlegend=bool(s.get("in_legend", True)))
+                      showlegend=bool(s.get("in_legend", True)) and not items)
         hover = s.get("hover")
         if kind == "bar":
             horiz = spec.get("orientation") == "h"
@@ -530,13 +548,13 @@ def to_plotly(spec: dict) -> go.Figure:
         mode = s.get("mode", "markers")
         if s.get("text") and s.get("show_text", True) and "text" not in mode:
             mode = mode + "+text"
-        marker = dict(size=s.get("size", 10),
+        marker = dict(size=s.get("size", 9),
                       color=s.get("color", "#2a78d6"),
                       symbol=s.get("shape", "circle"),
                       opacity=s.get("alpha", 1.0),
-                      line=dict(color=SURFACE, width=2))
+                      line=dict(color=SURFACE, width=1.5))
         line = dict(color=s.get("color", "#2a78d6"),
-                    width=s.get("width", 2),
+                    width=s.get("width", 1.8),
                     dash=_plotly_dash(s.get("dash")))
         pos = [anchors.get((si, pi), "middle right")
                for pi in range(len(s.get("text") or []))] or "middle right"
@@ -997,7 +1015,7 @@ def to_mpl(spec: dict, pgf: bool = False):
                             label=s.get("name", "") if s.get("in_legend", True) else None)
                 else:
                     ax.scatter(s["x"], s["y"],
-                               s=(s.get("size", 10) ** 2) * 0.55,
+                               s=(s.get("size", 9) ** 2) * 0.55,
                                c=s.get("color", "#2a78d6"),
                                marker=s.get("mpl_marker", "o"),
                                alpha=s.get("alpha", 1.0),
@@ -1024,10 +1042,30 @@ def to_mpl(spec: dict, pgf: bool = False):
                 ax.xaxis.set_major_formatter(_log_fmt())
             if spec.get("yscale") == "log":
                 ax.set_yscale("log")
-            handles, labels_ = ax.get_legend_handles_labels()
-            if len(labels_) >= 2:
-                _legend(ax, spec, len(labels_), (0, 1.22),
-                        2 if size == "1col" else 3)
+            if spec.get("xticks"):
+                ax.set_xticks(spec["xticks"]["vals"], spec["xticks"]["text"])
+                ax.grid(axis="x", visible=False)
+            items = spec.get("legend_items") or []
+            if items:
+                from matplotlib.lines import Line2D
+                hs = [Line2D([], [], color=it["color"],
+                             ls="-" if it.get("line") else "none", lw=1.4,
+                             marker=it.get("mpl_marker", "o"), ms=4.5,
+                             markeredgecolor="white", markeredgewidth=0.6)
+                      for it in items]
+                if fr and fr.get("x"):
+                    hs.append(Line2D([], [], color=MUTED, lw=1.0,
+                                     drawstyle="steps-post"))
+                    items = items + [{"name": "Pareto frontier"}]
+                if len(hs) >= 2:
+                    _legend(ax, spec, len(hs), (0, 1.22),
+                            2 if size == "1col" else 4,
+                            handles=hs, labels=[it["name"] for it in items])
+            else:
+                handles, labels_ = ax.get_legend_handles_labels()
+                if len(labels_) >= 2:
+                    _legend(ax, spec, len(labels_), (0, 1.22),
+                            2 if size == "1col" else 3)
 
         for hl in spec.get("hlines", []):
             ax.axhline(hl["y"], color=hl.get("color", MUTED),
@@ -1068,18 +1106,20 @@ def to_mpl(spec: dict, pgf: bool = False):
         return fig
 
 
-def _legend(ax, spec: dict, n: int, anchor, ncols: int):
+def _legend(ax, spec: dict, n: int, anchor, ncols: int, handles=None,
+            labels=None):
     """Legend placement: above the axes (default), in a column to the right
     (many entries), or none (the caption carries it)."""
     where = spec.get("legend") or "auto"
     if where == "none":
         return
+    hl = (handles, labels) if handles is not None else ()
     if where == "right":
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), ncols=1,
+        ax.legend(*hl, loc="upper left", bbox_to_anchor=(1.01, 1.0), ncols=1,
                   fontsize="x-small", handlelength=1.6, borderaxespad=0)
         return
     rows = -(-n // max(1, ncols))
-    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.01), ncols=ncols,
+    ax.legend(*hl, loc="lower left", bbox_to_anchor=(0, 1.01), ncols=ncols,
               borderaxespad=0.2, handlelength=1.6, columnspacing=1.0,
               fontsize="small" if rows > 2 else None)
 

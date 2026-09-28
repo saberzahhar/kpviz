@@ -31,7 +31,7 @@ def test_hidden_workbench_does_nothing(app):
     from dash.exceptions import PreventUpdate
     rq4 = _cb(app, '"rq":"rq4","type":"rq-graph"')
     with pytest.raises(PreventUpdate):
-        rq4(False, 1, ["kp20k"], "f1", "O", ["P", "R", "M", "U"], "auto", "usd",
+        rq4(False, 1, ["kp20k"], "f1|O", ["P", "R", "M", "U"], "auto", "usd",
             "per_doc", "log", None, None, ["y"], 2, "rank", "holm", "t", 1000,
             1, None)
 
@@ -44,14 +44,15 @@ def _calls(stats, v=1):
     # the last two arguments: the catalog version (an input) and the
     # workbench's last signature (a state)
     return {
-        "rq1": (True, 1, THREE, "f1", "O", ALLS, "auto", "kendall", None, None,
+        "rq1": (True, 1, THREE, "f1|O", ALLS, "auto", "kendall", None, None,
                 "model", *stats, v, None),
-        "rq2": (True, 1, "kpbiomed", "f1", "O", ALLS, "auto", None, None,
-                ["lang", "sup_leak"], 0.8, "(any)", *stats, v, None),
-        "rq3": (True, 1, "semeval2010", "f1", "O", "auto", None, None, *stats, v, None),
-        "rq4": (True, 1, THREE, "r", "M", ["R", "M", "U"], "auto", "usd",
+        "rq2": (True, 1, "kpbiomed", "f1|O", ALLS, "auto", None, None,
+                ["lang", "sup_leak"], 0.8, "(any)", "run", *stats, v, None),
+        "rq3": (True, 1, "semeval2010", "f1|O", "auto", None, None, "run",
+                *stats, v, None),
+        "rq4": (True, 1, THREE, "r|M", ["R", "M", "U"], "auto", "usd",
                 "per_doc", "log", None, None, ["y"], *stats, v, None),
-        "rq5": (True, 1, "num_beams", None, THREE, "controlled", "f1", "O", ALLS,
+        "rq5": (True, 1, "num_beams", None, THREE, "controlled", "f1|O", ALLS,
                 "auto", *stats, v, None),
     }
 
@@ -89,6 +90,32 @@ def test_statistics_reach_captions_and_tables(app):
     assert any(s.get("err") for s in spec["series"])
     out = _cb(app, '"rq":"rq1","type":"rq-graph"')(*_calls((2, "rank", "holm", "t", 1000))["rq1"])
     assert "Kendall" in out[1]["caption"] and "Fisher-z" in out[1]["caption"]
+
+
+def test_one_system_per_model_and_one_identity(app):
+    """Best run per model keeps one row per model; the model's hue is the
+    same in every workbench and the legend lists models, not runs."""
+    cb = _cb(app, '"rq":"rq3","type":"rq-graph"')
+    args = list(_calls((2, "rank", "holm", "t", 1000))["rq3"])
+    args[7] = "model"
+    out = cb(*args)
+    specA, specB = out[1], out[5]
+    rows = specA["series"][0]["x"] if specA.get("orientation") != "h" \
+        else specA["series"][0]["y"]
+    from kpviz import db
+    n_models = db.q1("SELECT count(DISTINCT model) FROM runs "
+                     "WHERE dataset='semeval2010'")[0]
+    assert len(rows) <= n_models
+    from kpviz.naming import model_color
+    items = specB["legend_items"]
+    assert items and all(it["color"] == model_color(it["group"]) for it in items)
+    rq4 = _cb(app, '"rq":"rq4","type":"rq-graph"')(
+        *_calls((2, "rank", "holm", "t", 1000))["rq4"])[1]
+    colors4 = {it["group"]: it["color"] for it in rq4["legend_items"]
+               if not it["group"].startswith("arch:")}
+    for it in items:
+        if it["group"] in colors4:
+            assert colors4[it["group"]] == it["color"]
 
 
 def test_caption_names_the_gold_actually_used(app_ctx):

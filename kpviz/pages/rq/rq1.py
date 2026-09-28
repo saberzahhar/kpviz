@@ -15,11 +15,13 @@ from ...stats import (ADJUST, alpha_str, kendall_ci, kendall_tau_b, p_str,
 from dash.exceptions import PreventUpdate
 
 from ..insights_common import (ann_options, datasets_with_runs,
+                               default_datasets,
                                effective_runs, figure_block, gate,
-                               metric_caption, metric_controls, models_control,
-                               p_cells, p_headers, prmu_arg, resolve_ann,
-                               rq_header, runs_control, selected_runs,
-                               stats_cfg, stats_inputs, value_cell, vis, shown)
+                               gold_controls, metric_caption, metric_control,
+                               models_control, p_cells, p_headers, prmu_arg,
+                               resolve_ann, rq_header, runs_control,
+                               selected_runs, split_metric, stats_cfg,
+                               stats_inputs, value_cell, vis, shown)
 
 METHODS = {"pearson": "Pearson r", "spearman": "Spearman ρ",
            "kendall": "Kendall τ-b"}
@@ -30,19 +32,16 @@ RQ = "rq1"
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("Are datasets linearly correlated?",
+        rq_header("Do datasets rank systems the same way?",
                   "Each cell correlates two datasets over the scores of the "
-                  "(model, run) pairs they share — a high r means the two "
-                  "benchmarks rank systems the same way. Pearson tests linear "
-                  "association, Spearman monotone (rank) association, Kendall "
-                  "τ-b pairwise ranking agreement (robust with few systems). "
-                  "Each cell is tested (H0: no association) and the family "
-                  "of dataset pairs corrected as set under Statistics."),
+                  "systems they share: a high value means the two benchmarks "
+                  "agree on which system is better. Every cell is tested (no "
+                  "association) and corrected as set under Statistics."),
         ui.filter_row([
             ui.control("Datasets (≥ 2)", dcc.Dropdown(
-                id=f"{RQ}-ds", options=ds, value=ds[:3], multi=True,
-                className="dash-dropdown"), 300),
-            *metric_controls(RQ),
+                id=f"{RQ}-ds", options=ds, value=default_datasets(4), multi=True,
+                className="dash-dropdown"), 320),
+            metric_control(RQ),
             ui.control("Method", dcc.Dropdown(
                 id=f"{RQ}-method",
                 options=[{"label": v, "value": k} for k, v in METHODS.items()],
@@ -57,11 +56,9 @@ def layout():
                           "title": "descriptive; many runs of one model "
                                    "dominate the test"}]), 230),
         ]),
-        ui.filter_row([
-            models_control(RQ),
-            runs_control(RQ, 460, "all shared runs of the selected models"),
-        ]),
-        figure_block(RQ, height=470),
+        ui.more([*gold_controls(RQ), models_control(RQ),
+                 runs_control(RQ, 460, "all shared runs of the selected models")]),
+        figure_block(RQ, height=380),
     ])
 
 
@@ -97,8 +94,8 @@ def register(app):
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
-        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
-        Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
+        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-metric", "value"),
+        Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-method", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
         Input(f"{RQ}-unit", "value"),
@@ -113,9 +110,10 @@ def register(app):
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
-    def _update(ds_sel, measure, k, prmu_sel, ann_choice, method, models_sel,
+    def _update(ds_sel, metric, prmu_sel, ann_choice, method, models_sel,
                 runs_sel, unit, *stat_vals):
         from ...figures import to_plotly
+        measure, k = split_metric(metric)
         ds_sel = [d for d in (ds_sel or [])]
         if len(ds_sel) < 2:
             return (to_plotly({"kind": "bar", "series": []}), None,
@@ -164,14 +162,15 @@ def register(app):
         p_adj = dict(zip(pairs, cfg.adjust_all(p_raw)))
         n_tests = sum(p is not None for p in p_raw)
         z, ztext, zhover = [], [], []
-        for i, da in enumerate(ds_sel):
+        # the lower triangle only: each pair once, and no diagonal of 1s
+        # (the darkest cells of the figure would be the uninformative ones)
+        for i, da in enumerate(ds_sel[1:], start=1):
             row, trow, hrow = [], [], []
-            for j, dbs in enumerate(ds_sel):
-                if i == j:
-                    r = 1.0 if n >= 2 else None
-                    row.append(r)
-                    trow.append("" if r is None else "1")
-                    hrow.append(f"{da}")
+            for j, dbs in enumerate(ds_sel[:-1]):
+                if j >= i:
+                    row.append(None)
+                    trow.append("")
+                    hrow.append("")
                     continue
                 pq = (min(i, j), max(i, j))
                 r, p, lo, hi = res[pq]
@@ -194,7 +193,8 @@ def register(app):
                    "dataset pairs" if cfg.adjust != "none" and n_tests > 1 else "")
         spec = {
             "kind": "heatmap", "size": "1col",
-            "heat": {"z": z, "x": ds_sel, "y": ds_sel, "zmin": -1, "zmax": 1,
+            "heat": {"z": z, "x": ds_sel[:-1], "y": ds_sel[1:], "zmin": -1,
+                     "zmax": 1,
                      "zmid": 0, "diverging": True, "text": ztext,
                      "customdata": zhover,
                      "hover": "%{customdata}<extra></extra>"},
@@ -246,4 +246,8 @@ def register(app):
                         className="muted small", style={"margin": "6px 0"})
         pairs_tab = ui.table(headers, rows_h, num_cols={2, 3, 4})
         return (to_plotly(spec), spec, spec["caption"],
-                html.Div([pairs_tab, note, detail]))
+                html.Div([pairs_tab, note,
+                          ui.fold(detail, len(keep),
+                                  f"Scores behind the matrix ({len(keep)} "
+                                  + ("models" if per_model else "runs") + ")",
+                                  limit=0)]))

@@ -15,13 +15,15 @@ from ...naming import run_labels, run_rows
 from ...stats import fmt_effect, p_str, sig_mark
 from dash.exceptions import PreventUpdate
 
-from ..insights_common import (ann_options, datasets_with_runs,
-                               effective_runs, effect_cell, figure_block, gate,
-                               metric_caption, metric_controls, models_control,
+from ..insights_common import (ann_options, best_per_model,
+                               datasets_with_runs, effective_runs, effect_cell,
+                               figure_block, gate, gold_controls,
+                               metric_caption, metric_control, models_control,
                                p_cells, p_headers, prmu_arg, resolve_ann,
                                rq_header, runs_control, selected_runs,
-                               stats_cfg, stats_inputs, stats_note, value_cell,
-                               vis, shown)
+                               split_metric, stats_cfg, stats_inputs,
+                               stats_note, systems_control, value_cell, vis,
+                               shown)
 from .rq3 import _ci_hover, _pmap
 
 RQ = "rq2"
@@ -36,31 +38,23 @@ CRITERIA = [
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("To what extent can poor input data quality affect evaluation?",
-                  "Documents are flagged by data-quality checks — detected "
-                  "language disagreeing with the declared one, or testing "
-                  "documents whose similarity pairs point back to a model's "
-                  "own supervision data (possible train→test leakage). The "
-                  "metric is recomputed without the flagged documents: the "
-                  "change is how much they move the reported score. A flag "
-                  "is evidence to inspect, not proof — flagged documents can "
-                  "also differ in domain, length or difficulty, and an "
-                  "unflagged document is not thereby verified clean."),
+        rq_header("Does poor input data move the scores?",
+                  "Documents flagged by a data-quality check (language "
+                  "disagreeing with the declared one, or similarity to a "
+                  "model's own training data) are removed and the metric "
+                  "recomputed: the shift is how much they move the reported "
+                  "score. A flag is evidence to inspect, not proof."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
-                id=f"{RQ}-ds", options=ds,
-                value=("kpbiomed" if "kpbiomed" in ds else (ds[0] if ds else None)),
+                id=f"{RQ}-ds", options=ds, value=_default_ds(ds),
                 clearable=False, className="dash-dropdown"), 200),
-            *metric_controls(RQ),
-        ]),
-        ui.filter_row([
-            models_control(RQ),
-            runs_control(RQ, 460),
-        ]),
-        ui.filter_row([
+            metric_control(RQ),
             ui.control("Quality criteria", dcc.Checklist(
                 id=f"{RQ}-crit", options=CRITERIA,
-                value=["lang", "sup_leak"], className="kp-check"), 380),
+                value=["lang", "sup_leak"], className="kp-check"), 360),
+            systems_control(RQ),
+        ]),
+        ui.more([
             ui.control("Similarity threshold", dcc.Slider(
                 id=f"{RQ}-thr", min=0.5, max=1.0, step=0.01, value=0.8,
                 marks={0.5: "0.5", 0.75: "0.75", 1.0: "1.0"},
@@ -68,9 +62,23 @@ def layout():
             ui.control("Pair label", dcc.Dropdown(
                 id=f"{RQ}-label", options=["(any)"], value="(any)",
                 clearable=False, className="dash-dropdown"), 190),
+            *gold_controls(RQ), models_control(RQ), runs_control(RQ, 460),
         ]),
-        figure_block(RQ, height=430),
+        figure_block(RQ, height=400),
     ])
+
+
+def _default_ds(ds: list[str]):
+    """The dataset with the most quality-flagged documents (where the
+    question has an answer), else the first."""
+    if not ds:
+        return None
+    try:
+        got = dict(db.q("""SELECT dataset, count(*) FILTER (WHERE len(flags) > 0)
+                           FROM documents GROUP BY 1"""))
+    except Exception:
+        got = {}
+    return max(ds, key=lambda d: (got.get(d) or 0, -ds.index(d)))
 
 
 def _leak_docs(ds: str, thr: float, label: str | None,
@@ -118,7 +126,7 @@ def register(app):
     from ..insights_common import (register_dataset_refresh,
                                    register_model_run_chain)
     register_dataset_refresh(app, f"{RQ}-ds", multi=False,
-                             prefer=["kpbiomed"])
+                             prefer=lambda: [_default_ds(datasets_with_runs())])
     register_model_run_chain(app, RQ, multi_ds=False)
 
     @app.callback(Output(f"{RQ}-ann", "options"),
@@ -140,12 +148,13 @@ def register(app):
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
-        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
-        Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
+        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-metric", "value"),
+        Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-models", "value"),
         Input(f"{RQ}-runs", "value"),
         Input(f"{RQ}-crit", "value"), Input(f"{RQ}-thr", "value"),
-        Input(f"{RQ}-label", "value"), *stats_inputs(),
+        Input(f"{RQ}-label", "value"), Input(f"{RQ}-unit", "value"),
+        *stats_inputs(),
         Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
         prevent_initial_call=True)
@@ -156,9 +165,10 @@ def register(app):
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
-    def _update(ds, measure, k, prmu_sel, ann_choice, models_sel, runs_sel,
-                crit, thr, label, *stat_vals):
+    def _update(ds, metric, prmu_sel, ann_choice, models_sel, runs_sel,
+                crit, thr, label, unit, *stat_vals):
         from ...figures import to_plotly
+        measure, k = split_metric(metric)
         if not ds:
             return (to_plotly({"kind": "bar", "series": []}), None, "",
                     html.Div("no dataset", className="muted small"))
@@ -184,6 +194,8 @@ def register(app):
         # questions (all / excluding flagged / flagged only / the test) in
         # array arithmetic, so the gold mask is built once instead of 4×N times
         per_all = run_scores(ds, keys, ann, measure, k, prmu=prmu, per_doc=True)
+        if unit != "run":
+            keys = best_per_model(keys, lambda key: (per_all.get(key) or {}).get("mean"))
         # the flagged set only varies with the model's supervision datasets
         # …and resolved to document ordinals once per distinct set, not per run
         base_flagged = set(lang_docs) | set(any_leak)
@@ -229,8 +241,9 @@ def register(app):
             lab = labels.get("||".join(key), model)
             shift = ((excl["mean"] - base["mean"])
                      if excl["mean"] is not None else None)
+            short = idx.model(model).name if unit != "run" else lab
             rows_out.append({
-                "label": lab + (f" {mark}" if mark else ""),
+                "label": short + (f" {mark}" if mark else ""),
                 "x0": base["mean"], "x1": excl["mean"],
                 "x2": only["mean"] if only else None,
                 "err": {"x0": st["ci_all"], "x1": st["ci_cl"], "x2": st["ci_fl"]},
@@ -310,7 +323,11 @@ def register(app):
                          "label": f"quality-{ds}",
                          "notes": f"Statistics: {methods}"
                                   + (f"; {ci_txt}" if ci_txt else "") + "."}
-        table = html.Div([ui.table(headers, table_rows,
-                                   num_cols=set(range(1, len(headers)))),
+        table = html.Div([ui.fold(ui.table(headers, table_rows,
+                                           num_cols=set(range(1, len(headers)))),
+                                  len(table_rows),
+                                  f"Table · {len(table_rows)} runs · "
+                                  f"{sum(1 for r in rows_out if r['label'].endswith('†'))}"
+                                  " significant"),
                           stats_note(cfg, "indep", n_tests)])
         return to_plotly(spec), spec, spec["caption"], table

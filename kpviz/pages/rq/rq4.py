@@ -11,13 +11,16 @@ from dash.exceptions import PreventUpdate
 
 from ... import scanner, ui
 from ...metrics import metric_label, run_scores_many
-from ...naming import encode_runs, group_key, run_labels, run_rows
+from ...naming import (encode_runs, group_key, legend_items, run_labels,
+                       run_rows)
 from ..insights_common import (ann_options, datasets_with_runs,
+                               default_datasets,
                                effective_runs, figure_block, gate,
-                               metric_caption, metric_controls, models_control,
-                               prmu_arg, resolve_ann, rq_header,
-                               runs_control, selected_runs, stats_cfg,
-                               stats_inputs, value_cell, vis, shown)
+                               gold_controls, metric_caption, metric_control,
+                               models_control, prmu_arg, resolve_ann,
+                               rq_header, runs_control, selected_runs,
+                               split_metric, stats_cfg, stats_inputs,
+                               value_cell, vis, shown)
 from .rq3 import _ci_hover
 
 RQ = "rq4"
@@ -28,26 +31,25 @@ UNIT_LABEL = {"usd": "cost (USD)", "kwh": "energy (kWh)",
 
 def layout():
     ds = datasets_with_runs()
-    default = [d for d in ("kp20k", "kpbiomed", "kptimes") if d in ds] or ds[:3]
     return html.Div([
         rq_header("What does a point of quality cost?",
-                  "Each mark is one (model, run) triple, macro-averaged over "
-                  "the selected datasets — only triples evaluated on all of "
-                  "them qualify. The step line is the Pareto frontier: "
-                  "nothing above-left of it exists. Only runs with a complete "
-                  "cost and full document coverage can define it; the others "
-                  "are drawn faded as provisional. Dashed horizontal lines "
-                  "carry runs whose cost cannot be resolved (unknown "
-                  "architecture or unobserved cost variables)."),
+                  "Each mark is one run (colour = model, shape = "
+                  "architecture), averaged over the selected datasets. The "
+                  "grey staircase is the Pareto frontier: nothing is both "
+                  "cheaper and better. Faded marks are provisional (partial "
+                  "cost or missing documents); dashed lines are runs whose "
+                  "cost is unknown."),
         ui.filter_row([
             ui.control("Datasets", dcc.Dropdown(
-                id=f"{RQ}-ds", options=ds, value=default, multi=True,
-                className="dash-dropdown"), 300),
-            *metric_controls(RQ),
-            ui.control("Cost unit", dcc.Dropdown(
+                id=f"{RQ}-ds", options=ds, value=default_datasets(3), multi=True,
+                className="dash-dropdown"), 320),
+            metric_control(RQ),
+            ui.control("Cost", dcc.Dropdown(
                 id=f"{RQ}-unit",
                 options=[{"label": v, "value": u} for u, v in UNIT_LABEL.items()],
                 value="usd", clearable=False, className="dash-dropdown"), 170),
+        ]),
+        ui.more([
             ui.control("Normalisation", dcc.Dropdown(
                 id=f"{RQ}-norm",
                 options=[{"label": "per document", "value": "per_doc"},
@@ -61,12 +63,10 @@ def layout():
                 options=[{"label": " frontier", "value": "frontier"},
                          {"label": " all", "value": "all"},
                          {"label": " none", "value": "none"}]), 220),
-        ]),
-        ui.filter_row([
-            models_control(RQ),
+            *gold_controls(RQ), models_control(RQ),
             runs_control(RQ, 460, "all consistent runs of the selected models"),
         ]),
-        figure_block(RQ, height=520),
+        figure_block(RQ, height=500),
     ])
 
 
@@ -92,8 +92,7 @@ def _frontier(pts: list[tuple[float, float]]):
 def register(app):
     from ..insights_common import (register_dataset_refresh,
                                    register_model_run_chain)
-    register_dataset_refresh(app, f"{RQ}-ds", multi=True,
-                             prefer=["kp20k", "kpbiomed", "kptimes"])
+    register_dataset_refresh(app, f"{RQ}-ds", multi=True)
     register_model_run_chain(app, RQ, multi_ds=True, require_all=True)
 
     @app.callback(Output(f"{RQ}-ann", "options"), State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -110,8 +109,8 @@ def register(app):
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
-        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-measure", "value"),
-        Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
+        Input(f"{RQ}-ds", "value"), Input(f"{RQ}-metric", "value"),
+        Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), Input(f"{RQ}-unit", "value"),
         Input(f"{RQ}-norm", "value"), Input(f"{RQ}-xscale", "value"),
         Input(f"{RQ}-models", "value"), Input(f"{RQ}-runs", "value"),
@@ -126,9 +125,10 @@ def register(app):
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
-    def _update(ds_sel, measure, k, prmu_sel, ann_choice, unit, norm, xscale,
+    def _update(ds_sel, metric, prmu_sel, ann_choice, unit, norm, xscale,
                 models_sel, runs_sel, labels_on, *stat_vals):
         from ...figures import to_plotly
+        measure, k = split_metric(metric)
         ds_sel = ds_sel or []
         empty = to_plotly({"kind": "scatter", "series": []})
         if not ds_sel:
@@ -233,7 +233,8 @@ def register(app):
                     "color": e.get("color", "#2a78d6"),
                     "shape": e.get("shape", "circle"),
                     "mpl_marker": e.get("mpl_marker", "o"),
-                    "size": e.get("size", 11),
+                    "size": e.get("size", 10),
+                    "legendgroup": e.get("model"),
                     "alpha": min(alpha, 0.35) if provisional else alpha,
                     "text": [lab], "show_text": False,
                     "hover": [hover], "in_legend": True,
@@ -249,7 +250,7 @@ def register(app):
                                    ", ".join(note_bits) or "—"])
             else:
                 hlines.append({"y": perf, "label": f"{lab} — no {unit}",
-                               "color": e.get("color", "#898781"), "dash": True,
+                               "color": e.get("base", "#898781"), "dash": True,
                                "alpha": max(0.35, alpha)})
                 pc = value_cell(perf, None, ci=ci if ci[0] is not None else None)
                 table_rows.append([lab, pc, None, ui.pct(cov, 0),
@@ -284,15 +285,8 @@ def register(app):
         fmt_cost = (lambda v: "—" if v is None else
                     (f"{v:.2e}" if sci else f"{v:.3g}"))
         table_rows = [[r[0], r[1], fmt_cost(r[2]), *r[3:]] for r in table_rows]
-        enc_note = ""
-        vals = list(enc.values())
-        if vals:
-            dims = [f"colour = {vals[0].get('color_dim')}"]
-            if vals[0].get("shape_dim"):
-                dims.append(f"shape = {vals[0]['shape_dim']}")
-            if vals[0].get("size_dim"):
-                dims.append(f"size = {vals[0]['size_dim']}")
-            enc_note = "; ".join(dims)
+        enc_note = ("colour = model (lighter = another run of it), "
+                    "shape = architecture")
         spec = {
             "kind": "scatter", "size": "2col", "xscale": xscale,
             "xlabel": f"{UNIT_LABEL.get(unit, unit)} — "
@@ -300,6 +294,7 @@ def register(app):
                       + (", log scale" if xscale == "log" else ""),
             "ylabel": f"{mlab} (macro over {len(ds_sel)} datasets)",
             "series": series, "hlines": hlines,
+            "legend_items": legend_items(enc, [group_key(*key) for key in keys]),
             "frontier": {"x": fx, "y": fy},
             "name": f"pareto-{unit}-{'-'.join(ds_sel)}",
             "caption": (f"Cost–performance trade-off over {', '.join(ds_sel)}: "
@@ -333,4 +328,7 @@ def register(app):
             f"{unit}.", className="muted small", style={"margin": "6px 0"})
         table = ui.table(headers, [[r[0], r[1][0], *r[2:]] for r in table_rows],
                          num_cols={1, 2, 3})
-        return to_plotly(spec), spec, spec["caption"], html.Div([note, table])
+        return (to_plotly(spec), spec, spec["caption"],
+                html.Div([note, ui.fold(table, len(table_rows),
+                                        f"Table · {len(table_rows)} runs · "
+                                        f"{len(fx)} on the frontier")]))

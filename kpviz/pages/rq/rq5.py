@@ -17,14 +17,15 @@ from dash.exceptions import PreventUpdate
 from ... import db, scanner, ui
 from ...metrics import (PerDoc, common_ords, memo, metric_label,
                        run_scores_many, values_at)
-from ...naming import (DASHES, natural_key, param_value_str, shade, slot_color,
-                       value_key)
+from ...naming import (DASHES, arch_shape, model_color, natural_key,
+                       param_value_str, shade, value_key)
 from ...util import fmt_num
 from ..insights_common import (ann_options, effect_cell, figure_block, gate,
-                               metric_caption, metric_controls, p_cells,
-                               p_headers, prmu_arg, resolve_ann, rq_header,
-                               stats_cfg, stats_inputs, stats_note, value_cell,
-                               vis, shown)
+                               gold_controls, metric_caption, metric_control,
+                               p_cells, p_headers, prmu_arg, resolve_ann,
+                               rq_header, split_metric, stats_cfg,
+                               stats_inputs, stats_note, value_cell, vis,
+                               shown)
 from .rq3 import _ci_hover, _pmap
 
 RQ = "rq5"
@@ -87,24 +88,23 @@ def _runs_of(ds: str):
 def layout():
     return html.Div([
         rq_header("How do hyperparameters move the needle?",
-                  "Runs grouped by the resolved value of a card-declared "
-                  "inference parameter (defaults fill the blanks; illegal "
-                  "values are flagged, never dropped). Only models that "
-                  "actually vary the parameter are offered. A controlled "
-                  "sweep compares runs that differ in this parameter alone; "
-                  "the envelope shows the best run per value. Each row is "
-                  "tested on its own over the documents its values share — "
-                  "paired blocks, so a Friedman test for three or more values "
-                  "and the paired test for two."),
+                  "Runs grouped by the value of one inference parameter "
+                  "declared in the model cards (defaults fill the blanks). A "
+                  "controlled sweep compares runs that differ in this "
+                  "parameter alone; each row of the table is tested over the "
+                  "documents its values share."),
         ui.filter_row([
             ui.control("Parameter", dcc.Dropdown(
                 id=f"{RQ}-param", clearable=False,
-                className="dash-dropdown"), 230),
+                className="dash-dropdown"), 260),
+            ui.control("Datasets", dcc.Dropdown(
+                id=f"{RQ}-ds", multi=True, className="dash-dropdown"), 300),
+            metric_control(RQ),
+        ]),
+        ui.more([
             ui.control("Models", dcc.Dropdown(
                 id=f"{RQ}-model", multi=True, placeholder="all models that vary it",
                 className="dash-dropdown"), 320),
-            ui.control("Datasets", dcc.Dropdown(
-                id=f"{RQ}-ds", multi=True, className="dash-dropdown"), 300),
             ui.control("Runs per value", dcc.RadioItems(
                 id=f"{RQ}-mode", value="controlled", className="kp-check kp-inline",
                 options=[{"label": " controlled sweep", "value": "controlled",
@@ -113,9 +113,9 @@ def layout():
                          {"label": " best-run envelope", "value": "envelope",
                           "title": "the best run at each value, whatever else "
                                    "differs (descriptive)"}]), 300),
-            *metric_controls(RQ),
+            *gold_controls(RQ),
         ]),
-        figure_block(RQ, height=440),
+        figure_block(RQ, height=420),
     ])
 
 
@@ -184,8 +184,7 @@ def register(app):
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
         Input(f"{RQ}-param", "value"), Input(f"{RQ}-model", "value"),
         Input(f"{RQ}-ds", "value"), Input(f"{RQ}-mode", "value"),
-        Input(f"{RQ}-measure", "value"),
-        Input(f"{RQ}-k", "value"), Input(f"{RQ}-prmu", "value"),
+        Input(f"{RQ}-metric", "value"), Input(f"{RQ}-prmu", "value"),
         Input(f"{RQ}-ann", "value"), *stats_inputs(),
         Input("catalog-version", "data"),
         State({"type": "fig-sig", "rq": RQ}, "data"),
@@ -197,9 +196,10 @@ def register(app):
         sig = gate(visible, inputs, last_sig)
         return (*_update(*inputs), sig)
 
-    def _update(param, models_sel, ds_sel, mode, measure, k, prmu_sel, ann_choice,
+    def _update(param, models_sel, ds_sel, mode, metric, prmu_sel, ann_choice,
                 *stat_vals):
         from ...figures import to_plotly
+        measure, k = split_metric(metric)
         empty = to_plotly({"kind": "bar", "series": []})
         var = _models_with_variation()
         if not param or not ds_sel:
@@ -412,9 +412,9 @@ def register(app):
         # next); a series whose datasets share fewer than two values is
         # drawn once per dataset instead
         series = []
-        numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                      for v in all_vals.values())
-        mslot = db.color_seq("model", sorted(models))
+        # values are ordered categories, evenly spaced: 512, 1024 and 128k
+        # on a linear axis put two of three points on top of each other
+        xpos = {vj: i for i, vj in enumerate(col_order)}
         by_series: dict[tuple, list[str]] = {}
         for (ds, m, sig) in cells:
             by_series.setdefault((m, sig), []).append(ds)
@@ -434,17 +434,25 @@ def register(app):
         split_any = any(len(p_[3]) == 1 and len(by_series[(p_[0], p_[1])]) > 1
                         for p_ in plots)
         within: dict[str, int] = {}
+        # series side by side inside each value's slot, so their whiskers
+        # never sit on top of each other
+        n_pl = len(plots)
+        step = 0.36 / max(1, n_pl - 1) if n_pl > 1 else 0.0
         for i, (m, sig, name, dss, vals) in enumerate(plots):
+            dodge = (i - (n_pl - 1) / 2) * step
             j = within.get(m, 0)
             within[m] = j + 1
             n_m = sum(1 for p_ in plots if p_[0] == m)
-            base = slot_color(mslot.get(m, i) % 8)
+            base = model_color(m)
+            archs = {fixed_of.get(m, {}).get(sig, (None, None))[0]} - {None}
+            shape, marker = arch_shape(next(iter(archs))) if len(archs) == 1 \
+                else ("circle", "o")
             xs, ys, hv, err = [], [], [], []
             for vj in vals:
                 per_ds = [(d, cells[(d, m, sig)][vj]) for d in dss]
                 mean = sum(c["mean"] for _d, c in per_ds) / len(per_ds)
                 ci = cfg.macro_ci([c["vals"] for _d, c in per_ds])
-                xs.append(all_vals[vj] if numeric else param_value_str(all_vals[vj]))
+                xs.append(round(xpos[vj] + dodge, 3))
                 ys.append(round(mean, 4))
                 err.append(ci)
                 hv.append(f"{name}<br>{param} = "
@@ -455,22 +463,21 @@ def register(app):
                           + "<br>".join(f"{d}: {c['mean']:.3f} (n={c['n']})"
                                         for d, c in per_ds))
             if xs:
-                mi = sorted(models).index(m) if m in models else i
                 series.append({"name": name, "x": xs, "y": ys,
                                "hover": hv, "err": err,
-                               "mode": "lines+markers", "width": 2,
+                               "mode": "lines+markers", "width": 1.8,
                                "dash": DASHES[j % len(DASHES)] if n_m > 1 else "solid",
-                               "mpl_marker": "os^Dv<>p"[mi % 8],
-                               "shape": ["circle", "square", "triangle-up",
-                                         "diamond", "triangle-down",
-                                         "triangle-left", "triangle-right",
-                                         "pentagon"][mi % 8],
-                               "color": shade(base, 0.5 * j / max(1, n_m - 1))
+                               "mpl_marker": marker, "shape": shape,
+                               "legendgroup": m,
+                               "color": shade(base, 0.55 * j / max(1, n_m - 1))
                                if n_m > 1 else base})
 
+        # the card's range only when one model is drawn: two models declare
+        # different ranges for the same name (a 1 024 vs a 128 k window)
         spec_p = None
-        for m in models:
-            spec_p = spec_p or idx.model(m).inference_specs.get(param)
+        drawn_models = {p_[0] for p_ in plots}
+        if len(drawn_models) == 1:
+            spec_p = idx.model(next(iter(drawn_models))).inference_specs.get(param)
         rng = []
         if spec_p:
             if spec_p.min is not None:
@@ -479,11 +486,18 @@ def register(app):
                 rng.append(f"max {fmt_num(spec_p.max)}")
             if spec_p.default is not None:
                 rng.append(f"default {fmt_num(spec_p.default)}")
+        drawn = sorted({p_[0] for p_ in plots},
+                       key=lambda m: natural_key(idx.model(m).name))
         spec = {
-            **({"kind": "line"} if numeric else {"kind": "bar", "barmode": "group"}),
-            "size": "2col",
+            "kind": "line", "size": "2col",
             "xlabel": f"{param}" + (f"  ({' · '.join(rng)})" if rng else ""),
+            "xticks": {"vals": list(range(len(col_order))),
+                       "text": [param_value_str(all_vals[vj]) for vj in col_order]},
+            "xrange": [-0.4, len(col_order) - 0.6],
             "ylabel": mlab, "series": series,
+            "legend_items": [{"name": idx.model(m).name, "color": model_color(m),
+                              "group": m, "shape": "circle", "mpl_marker": "o",
+                              "line": True} for m in drawn],
             "name": f"hyperparam-{param}",
             "caption": (f"Effect of “{param}” on {mlab}"
                         + (", best observed run at each value (an upper "
@@ -524,8 +538,12 @@ def register(app):
             "Means are over the documents every value of the row shares; bold "
             "marks the highest (descriptive — the test asks whether the value "
             "matters at all).", className="muted small", style={"marginBottom": "6px"})
+        n_sig = sum(1 for pj in p_adj if pj is not None and pj < cfg.alpha)
         return (to_plotly(spec), spec, spec["caption"],
-                html.Div([note, ui.table(headers, trs,
-                                         num_cols=set(range(2, len(headers))),
-                                         nowrap_cols={0, 1}),
+                html.Div([note, ui.fold(ui.table(headers, trs,
+                                                 num_cols=set(range(2, len(headers))),
+                                                 nowrap_cols={0, 1}),
+                                        len(trs),
+                                        f"Table · {len(trs)} rows · {n_sig} "
+                                        f"significant at p<{cfg.alpha:g}"),
                           stats_note(cfg, "multi", tested)]))

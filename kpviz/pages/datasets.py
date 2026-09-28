@@ -16,8 +16,8 @@ from .. import db, scanner, ui
 from ..figures import MUTED, PATTERNS, to_plotly
 from ..metrics import memo
 from ..textproc import fix_text
-from ..naming import (group_key, natural_key, order_splits, parse_group_key,
-                      run_labels, run_rows, split_color,
+from ..naming import (group_key, limit_str, natural_key, order_splits,
+                      parse_group_key, run_labels, run_rows, split_color,
                       split_rank, tokenizer_label)
 from ..util import declared_langs, human_count, mean_sd
 
@@ -93,21 +93,19 @@ def _group_series(data: dict[tuple[str, str], dict], cats: list,
 def layout():
     return html.Div([
         html.H2("Datasets", className="page-title"),
-        html.P("Collection statistics derived at scan time — split sizes, "
-               "length distributions against model context windows, PRMU "
-               "portions, POS patterns and per-document quality flags. The "
-               "browser reads documents straight from your files through the "
-               "byte-offset index.", className="page-desc"),
+        html.P("What each collection contains: splits, lengths, how much of "
+               "the gold occurs in the text, and every document, read from "
+               "your files.", className="page-desc"),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id="ds-pick", options=[], clearable=False,
                 placeholder="scan first…", className="dash-dropdown"), 210),
-            ui.control("Annotation sets", dcc.Dropdown(
-                id="ds-ann", clearable=False, className="dash-dropdown"), 210),
             ui.control("Split", dcc.Dropdown(
                 id="ds-split", clearable=False, className="dash-dropdown"), 150),
-            ui.control("Tokenizer", dcc.Dropdown(
-                id="ds-tok", clearable=False, className="dash-dropdown"), 260),
+            ui.control("Annotation sets", dcc.Dropdown(
+                id="ds-ann", clearable=False, className="dash-dropdown"), 200),
+            ui.control("Length in", dcc.Dropdown(
+                id="ds-tok", clearable=False, className="dash-dropdown"), 230),
         ]),
         ui.loading(html.Div(id="ds-body")),
         # the browser lives outside ds-body: changing the split, annotation or
@@ -148,22 +146,31 @@ def layout():
 
 # ---------------------------------------------------------------------------
 
-def _hist_bins(rows, nbins=24):
-    vals = [r[0] for r in rows if r[0] is not None]
-    if not vals:
-        return [], {}
-    lo, hi = min(vals), max(vals)
-    if hi <= lo:
-        hi = lo + 1
-    w = (hi - lo) / nbins
+def _hist_bins(inner_sql: str, args: list, nbins: int = 24):
+    """Per-group histogram of `inner_sql`'s (v, g) rows, binned in DuckDB —
+    a training split of millions of documents is never fetched row by row.
+    The range stops at the 99.5th percentile (the last bin holds the longest
+    0.5 %), so one 40 000-word outlier does not squeeze every other document
+    into the first bar. Returns (centers, {group: counts}, clipped?)."""
+    got = db.q1(f"""SELECT min(v), quantile_cont(v, 0.995), max(v)
+                    FROM ({inner_sql}) WHERE v IS NOT NULL""", *args)
+    if not got or got[0] is None:
+        return [], {}, False
+    # lengths are whole numbers: bins are whole numbers of words or tokens
+    # (a 0.6-word bin is empty every other time and draws a comb)
+    import math
+    lo, top = int(got[0]), int(got[2])
+    hi = max(lo, int(math.ceil(float(got[1]))))
+    w = max(1, math.ceil((hi - lo + 1) / nbins))
+    nbins = max(1, math.ceil((hi - lo + 1) / w))
     groups: dict[str, list[int]] = {}
-    for v, g in rows:
-        if v is None:
-            continue
-        b = min(nbins - 1, int((v - lo) / w))
-        groups.setdefault(str(g), [0] * nbins)[b] += 1
-    centers = [round(lo + (i + 0.5) * w, 1) for i in range(nbins)]
-    return centers, groups
+    for g, b, n in db.q(f"""SELECT g, least({nbins - 1}, greatest(0,
+                                   floor((v - ?) / ?)))::INTEGER AS b, count(*)
+                            FROM ({inner_sql}) WHERE v IS NOT NULL
+                            GROUP BY 1, 2""", lo, w, *args):
+        groups.setdefault(str(g), [0] * nbins)[b] += int(n)
+    centers = [round(lo + (i + 0.5) * w - 0.5, 1) for i in range(nbins)]
+    return centers, groups, top > lo + nbins * w - 1
 
 
 def _body(ds: str, ann: str, split: str | None, tok: str | None):
@@ -252,35 +259,48 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
     tok = tok or WORDS_TOK
     approx = None
     if tok == WORDS_TOK:
-        rows = db.q("SELECT n_words, coalesce(split,'?') FROM documents WHERE dataset=?", ds)
+        inner = ("SELECT n_words AS v, coalesce(split,'?') AS g FROM documents "
+                 "WHERE dataset=?")
+        inner_args = [ds]
         xlabel, title, uv = "document length (words)", "Document length", []
     else:
-        rows = db.q("""SELECT t.n_tokens, coalesce(d.split,'?')
-                       FROM doc_tokens t JOIN documents d USING (dataset, doc_id)
-                       WHERE t.dataset=? AND t.tokenizer=?""", ds, tok)
+        inner = ("""SELECT t.n_tokens AS v, coalesce(d.split,'?') AS g
+                    FROM doc_tokens t JOIN documents d USING (dataset, doc_id)
+                    WHERE t.dataset=? AND t.tokenizer=?""")
+        inner_args = [ds, tok]
         approx = db.q1("SELECT bool_or(approx) FROM doc_tokens WHERE dataset=? AND tokenizer=?",
                        ds, tok)
         xlabel = (f"document length ({tokenizer_label(tok)}"
                   + (" tokens, approximate)" if approx and approx[0]
                      else " tokens)"))
-        title = "Document length — against the context limits of the models that ran here"
-        vlines = []
+        title = "Document length and the models' input windows"
+        # the input window of every model that counts in this tokenizer —
+        # its card default, and any other value its runs used here — whether
+        # or not the model ran on this dataset
+        wins: dict[int, list[str]] = {}
+        resolved = {}
         for m, rj in db.q("SELECT DISTINCT model, resolved FROM runs WHERE dataset=?", ds):
+            resolved.setdefault(m, []).append(json.loads(rj or "{}"))
+        for m in sorted(set(idx.models) | set(resolved)):
             mc = idx.model(m)
             for p in mc.context_params():
                 if p.tokenizer != tok or "input" not in p.name:
                     continue
-                res = json.loads(rj or "{}").get(p.name) or {}
-                v = res.get("value") or p.default
-                if v:
-                    vlines.append({"x": v, "label": f"{mc.name} · {v}",
-                                   "color": MUTED, "dash": True})
-        seen, uv = set(), []
-        for v in vlines:
-            if v["x"] not in seen:
-                seen.add(v["x"])
-                uv.append(v)
-    centers, groups = _hist_bins(rows)
+                vals = {p.default} | {(r.get(p.name) or {}).get("value")
+                                      for r in resolved.get(m, [])}
+                for v in vals:
+                    try:
+                        v = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0 and mc.name not in wins.setdefault(v, []):
+                        wins[v].append(mc.name)
+        uv = [{"x": v, "label": f"{limit_str(v)} · " + ", ".join(names[:2])
+               + (f" +{len(names) - 2}" if len(names) > 2 else ""),
+               "color": MUTED, "dash": True} for v, names in sorted(wins.items())]
+    centers, groups, clipped = _hist_bins(inner, inner_args)
+    if clipped:
+        xlabel += " (the last bin also holds the longest 0.5 %)"
     if centers:
         span = max(centers)
         inside = [v for v in uv if v["x"] <= span * 1.35][:4]
@@ -288,26 +308,29 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         # each split is normalised to its own 100%: collections are wildly
         # unbalanced (1.3 M training vs 100 k testing), and the question here
         # is whether the *shapes* differ, not which split is bigger
+        # one outline per split (a frequency polygon), not 24 × 3 bars: the
+        # shapes are compared, and three thin lines read at a glance
         series = []
         for sp in order_splits(groups):
             ys = groups[sp]
             tot = sum(ys) or 1
             series.append({
-                "name": sp, "x": centers,
-                "y": [100.0 * y / tot for y in ys],
+                "name": sp, "x": centers, "mode": "lines", "width": 1.8,
+                "y": [round(100.0 * y / tot, 2) for y in ys],
                 "color": split_color(sp),
                 "hover": [f"{sp}<br>~{c:g} · {y} docs ({100.0 * y / tot:.1f}%)"
                           for c, y in zip(centers, ys)]})
-        spec = {"kind": "bar", "xlabel": xlabel,
-                "ylabel": "% of the split's documents", "barmode": "group",
+        spec = {"kind": "line", "xlabel": xlabel,
+                "ylabel": "% of the split's documents",
                 "series": series, "vlines": inside, "size": "2col",
                 "name": f"doc-length-{ds}",
                 "caption": (f"Document length distribution of {ds} per split, "
                             + ("in words" if tok == WORDS_TOK
                                else f"in {tokenizer_label(tok)} tokens")
                             + (" (approximate)" if approx and approx[0] else "")
-                            + "; dashed lines mark the input windows of the "
-                            "models evaluated on it"
+                            + ("; dashed lines mark the input windows of the "
+                               "models that count in this tokenizer"
+                               if tok != WORDS_TOK else "")
                             + (" (beyond the axis: " + "; ".join(
                                 v["label"] for v in beyond) + ")" if beyond else "")
                             + ".")}
@@ -466,11 +489,15 @@ def register(app):
         if not ds:
             return [], None, [], None, [], None
         # "(each)" is the default: every annotation set gets its own row/series
-        anns = [{"label": "(each, kept separate)", "value": "(each)"}] + [
+        anns = [{"label": "each set", "value": "(each)"}] + [
             {"label": a, "value": a} for a in _annotators(ds)]
-        splits = ["(all)"] + _splits(ds)
-        toks = [WORDS_TOK] + [r[0] for r in db.q(
-            "SELECT DISTINCT tokenizer FROM doc_tokens WHERE dataset=? ORDER BY 1", ds)]
+        splits = ([{"label": "all splits", "value": "(all)"}]
+                  + [{"label": s_, "value": s_} for s_ in order_splits(_splits(ds))])
+        toks = [{"label": "words", "value": WORDS_TOK}] + [
+            {"label": f"{tokenizer_label(t)} tokens", "value": t}
+            for t in (r[0] for r in db.q(
+                "SELECT DISTINCT tokenizer FROM doc_tokens WHERE dataset=? "
+                "ORDER BY 1", ds))]
         return (anns, "(each)", splits, "(all)", toks, WORDS_TOK)
 
     @app.callback(Output("ds-body", "children"),
@@ -524,7 +551,7 @@ def register(app):
         # natural order (kp20k_testing_2 before _10) over *every* match, in
         # SQL, paged — sorting the first 50 000 unordered ids made the "first
         # 25" arbitrary on large collections
-        per = 25
+        per = 12
         total = db.q1(f"SELECT count(*) FROM documents WHERE {where}", *args)[0]
         if not total:
             return html.Div("no matching documents", className="muted small"), 0

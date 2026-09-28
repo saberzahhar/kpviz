@@ -9,7 +9,7 @@ from dash.exceptions import PreventUpdate
 from .. import db, scanner, ui
 from ..figures import to_plotly
 from ..metrics import run_scores
-from ..naming import natural_key, shade, slot_color, window_str
+from ..naming import natural_key, window_str
 from ..util import fmt_num, human_cost, human_count
 
 
@@ -23,9 +23,8 @@ def _model_options():
 def layout():
     return html.Div([
         html.H2("Models", className="page-title"),
-        html.P("Model cards with their declared inference-parameter schema, "
-               "every run found in the tree (validated against the card), and "
-               "a quality glance across datasets.", className="page-desc"),
+        html.P("A model card, its runs (checked against the card) and how "
+               "they score on each dataset.", className="page-desc"),
         ui.filter_row([
             ui.control("Model", dcc.Dropdown(
                 id="md-pick", options=[], clearable=False,
@@ -99,13 +98,19 @@ def _runs_table(idx, model):
             docs,
             " · ".join(cost_txt) or "—",
         ])
-    return ui.table(["Dataset", "Architecture", "Run", "Parameters",
-                     "Quality check", "Documents", "Total cost"],
-                    trs, num_cols={5})
+    n_bad = sum(1 for r in rows if json.loads(r[4] or "[]"))
+    n_ds = len({r[0] for r in rows})
+    return ui.fold(ui.table(["Dataset", "Architecture", "Run", "Parameters",
+                             "Quality check", "Documents", "Total cost"],
+                            trs, num_cols={5}),
+                   len(trs), f"{len(trs)} runs on {n_ds} dataset"
+                   f"{'s' if n_ds > 1 else ''}"
+                   + (f" · {n_bad} with illegal parameters" if n_bad else
+                      " · all valid") + " — show the table")
 
 
 def _quality_glance(model):
-    from ..naming import group_key, run_labels, run_rows
+    from ..naming import group_key, parse_group_key, run_labels, run_rows
     runs = db.q("SELECT DISTINCT dataset, arch, run_id FROM runs WHERE model=?",
                 model)
     if not runs:
@@ -120,8 +125,10 @@ def _quality_glance(model):
             lab = lab[len(name):].strip(" ·")
         return lab.strip("()") or rid[:10]
 
-    series_by_run: dict[str, dict] = {}
-    datasets = sorted({r[0] for r in runs})
+    from ..naming import encode_runs
+    enc = encode_runs(idx, [r for r in run_rows() if r["model"] == model])
+    by_run: dict[str, dict] = {}
+    datasets = sorted({r[0] for r in runs}, key=natural_key)
     for ds in datasets:
         anns = [r[0] for r in db.q(
             "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? ORDER BY 1", ds)]
@@ -131,30 +138,41 @@ def _quality_glance(model):
         keys = [(model, a, rid) for d2, a, rid in runs if d2 == ds]
         sc = run_scores(ds, keys, ann, "f1", "O")
         for (m, a, rid), v in sc.items():
-            series_by_run.setdefault(short_label(a, rid), {})[ds] = \
-                (round(v["mean"], 3) if v["mean"] is not None else None)
-    if not series_by_run:
+            if v["mean"] is not None:
+                by_run.setdefault(group_key(m, a, rid), {})[ds] = round(v["mean"], 3)
+    if not by_run:
         return None
-    series = []
-    # one model's runs, in label order: up to 8 get the categorical slots,
-    # more get one hue in steps of lightness (a wrapped palette gave two
-    # runs the same colour)
-    ordered = sorted(series_by_run.items(), key=lambda kv: natural_key(kv[0]))
+    # a dot per run and dataset, dodged sideways inside the dataset's slot:
+    # position carries the score, the model's hue (lighter = another run)
+    # and the architecture's shape carry identity — no rainbow of bars
+    ordered = sorted(by_run, key=lambda k: natural_key(enc.get(k, {}).get("label", k)))
     n = len(ordered)
-    for i, (lab, per_ds) in enumerate(ordered):
-        color = (slot_color(i) if n <= 8
-                 else shade(slot_color(0), 0.75 * i / max(1, n - 1)))
-        series.append({"name": lab, "x": datasets,
-                       "y": [per_ds.get(d) for d in datasets], "color": color})
-    spec = {"kind": "bar", "xlabel": "dataset",
-            "ylabel": "F1@O (all annotation sets, or the only one)",
-            "series": series, "size": "2col", "name": f"quality-{model}",
+    width = min(0.7, 0.09 * n)
+    series = []
+    for i, k in enumerate(ordered):
+        e = enc.get(k, {})
+        per_ds = by_run[k]
+        off = (i - (n - 1) / 2) * (width / max(1, n - 1)) if n > 1 else 0.0
+        lab = short_label(*parse_group_key(k)[1:])
+        xs = [j + off for j, d in enumerate(datasets) if d in per_ds]
+        ys = [per_ds[d] for d in datasets if d in per_ds]
+        series.append({"name": lab, "x": xs, "y": ys, "mode": "markers",
+                       "color": e.get("color"), "shape": e.get("shape", "circle"),
+                       "mpl_marker": e.get("mpl_marker", "o"), "size": 9,
+                       "hover": [f"{lab}<br>{d}: F1@O = {per_ds[d]:.3f}"
+                                 for d in datasets if d in per_ds]})
+    spec = {"kind": "scatter", "xlabel": "dataset",
+            "ylabel": "F1@O", "series": series, "size": "2col",
+            "xticks": {"vals": list(range(len(datasets))), "text": datasets},
+            "xrange": [-0.6, len(datasets) - 0.4],
+            "legend": "right" if n > 6 else "top",
+            "name": f"quality-{model}",
             "caption": (f"F1@O of every run of {name} per dataset, against the "
                         "union of the dataset's annotation sets (or its only "
                         "one), macro-averaged over documents.")}
     return ui.exportable("md-quality", spec,
-                         ui.graph("md-quality", to_plotly(spec), 300),
-                         title="Quality glance — F1@O per dataset and run")
+                         ui.graph("md-quality", to_plotly(spec), 320),
+                         title="F1@O per dataset — one dot per run")
 
 
 def _body(model):
@@ -198,12 +216,14 @@ def _body(model):
 
     bibtex = refs.get("bibtex")
     bib_card = ui.card([
-        html.Div(bibtex, className="mono-block"),
         html.Div([dcc.Clipboard(content=bibtex, title="copy BibTeX",
                                 className="btn small",
                                 style={"display": "inline-flex"}),
                   html.Span("copy BibTeX", className="small muted")],
-                 className="flex", style={"marginTop": "8px"}),
+                 className="flex"),
+        html.Details([html.Summary("show the entry"),
+                      html.Div(bibtex, className="mono-block")],
+                     className="fold"),
     ], title="Reference") if bibtex else None
 
     return html.Div([

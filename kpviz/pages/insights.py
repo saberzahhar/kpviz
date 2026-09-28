@@ -20,10 +20,9 @@ TABS = [
 def layout():
     return html.Div([
         html.H2("Insights", className="page-title"),
-        html.P("Five research questions, each a modular workbench: choose the "
-               "slice, read the figure, then copy the LaTeX or download the "
-               "PGF/PDF/PNG — captions are auto-written from the exact "
-               "configuration and stay editable.", className="page-desc"),
+        html.P("Five research questions. Pick a slice, read the figure, export "
+               "it: captions are written from the exact configuration.",
+               className="page-desc"),
         html.Div(id="ins-banner", className="ins-banner", role="status",
                  style={"display": "none"}),
         html.Div([html.Button(t, id=f"tab-{key}", role="tab",
@@ -32,11 +31,14 @@ def layout():
                   for key, t, _ in TABS], className="rq-tabs", role="tablist"),
         # one inference procedure for every workbench: daggers, intervals,
         # captions and exported tables all read these, so a paper cannot mix
-        # thresholds, tests or corrections
-        html.Div([
-            html.Div("Statistics", className="stats-bar-title",
-                     title="Applies to every workbench, its captions and its "
-                           "exported tables"),
+        # thresholds, tests or corrections. Folded: the defaults are right
+        # for most papers, and the summary says what is in force.
+        html.Details([
+            html.Summary(["Statistics", html.Span(id="stats-sum",
+                                                  className="stats-sum")],
+                         title="Applies to every workbench, its captions and "
+                               "its exported tables"),
+            html.Div([
             html.Div([
             ui.control("Significance level", dcc.Slider(
                 id="ins-alpha", min=0, max=len(ALPHAS) - 1, step=None,
@@ -69,7 +71,8 @@ def layout():
                 value=RESAMPLES, options=[
                     {"label": f"{n:,}", "value": n}
                     for n in (1000, 5000, 10000)]), 110),
-        ], className="stats-bar filter-row"),
+            ], className="more-body"),
+        ], className="more-opts stats-fold"),
         _guide(),
         *[html.Div(mod.layout(), id=f"panel-{key}",
                    style={"display": "block" if key == "rq4" else "none"})
@@ -150,6 +153,24 @@ def register(app):
         else:
             return "", {"display": "none"}
         return msg, {"display": "block"}
+
+    # what is in force, in one line, without a server round trip
+    app.clientside_callback(
+        """function (a, fam, adj, ci, n) {
+            var alphas = %s;
+            var fams = {rank: "rank tests", mean: "mean tests",
+                        resample: "resampling tests"};
+            var adjs = {holm: "Holm", bonferroni: "Bonferroni", bh: "BH",
+                        none: "no correction"};
+            var cis = {t: "95 %% t intervals", bootstrap: "95 %% bootstrap intervals",
+                       none: "no intervals"};
+            return " · p < " + alphas[a] + " · " + (fams[fam] || fam) + " · "
+                   + (adjs[adj] || adj) + " · " + (cis[ci] || ci);
+        }""" % [alpha_str(a) for a in ALPHAS],
+        Output("stats-sum", "children"),
+        Input("ins-alpha", "value"), Input("ins-family", "value"),
+        Input("ins-adjust", "value"), Input("ins-ci", "value"),
+        Input("ins-resamples", "value"))
 
     # RQ4 tests nothing (it plots intervals only): the test controls say so
     app.clientside_callback(
