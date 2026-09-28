@@ -10,16 +10,17 @@ from __future__ import annotations
 import json
 
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import MUTED, PALETTE, PATTERNS, to_plotly
-from ..naming import (natural_key, order_splits, slot_color, split_color,
-                      split_rank, tokenizer_label)
-from ..util import fmt_num, human_count, mean_sd
-
-# P green · R yellow · M orange · U red
-PRMU_COLORS = {"P": "#008300", "R": "#eda100", "M": "#eb6834", "U": "#e34948"}
-PRMU_NAMES = {"P": "Present", "R": "Reordered", "M": "Mixed", "U": "Unseen"}
+from ..figures import MUTED, PATTERNS, to_plotly
+from ..metrics import memo
+from ..textproc import fix_text
+from ..naming import (PRMU_COLORS, PRMU_NAMES, group_key,
+                      limit_str, natural_key, order_splits, parse_group_key,
+                      run_labels, run_rows, split_color, split_rank,
+                      tokenizer_label)
+from ..util import declared_langs, human_count, mean_sd
 WORDS_TOK = "words"
 COMBINED = "@combined"
 # splits carry their own fixed hue everywhere in the app (naming.SPLIT_COLORS);
@@ -30,20 +31,21 @@ PANEL_H = 330          # every distribution panel gets the same box
 
 
 def _datasets():
-    return [r[0] for r in db.q("SELECT DISTINCT dataset FROM documents ORDER BY 1")]
+    return memo("ds_datasets", lambda: [r[0] for r in db.q(
+        "SELECT DISTINCT dataset FROM documents ORDER BY 1")])
 
 
 def _annotators(ds: str) -> list[str]:
     """Real annotation sets, never the synthetic union."""
-    return [r[0] for r in db.q(
+    return memo(("ds_annotators", ds), lambda: [r[0] for r in db.q(
         "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? AND ann_key<>? "
-        "ORDER BY 1", ds, COMBINED)]
+        "ORDER BY 1", ds, COMBINED)])
 
 
 def _splits(ds: str) -> list[str]:
-    return [r[0] for r in db.q(
+    return memo(("ds_splits", ds), lambda: [r[0] for r in db.q(
         "SELECT DISTINCT coalesce(split,'?') FROM documents WHERE dataset=? "
-        "ORDER BY 1", ds)]
+        "ORDER BY 1", ds)])
 
 
 def _group_series(data: dict[tuple[str, str], dict], cats: list,
@@ -85,46 +87,92 @@ def _group_series(data: dict[tuple[str, str], dict], cats: list,
 
 def layout():
     return html.Div([
-        html.H2("Datasets", className="page-title"),
-        html.P("Collection statistics derived at scan time — split sizes, "
-               "length distributions against model context windows, PRMU "
-               "portions, POS patterns and per-document quality flags. The "
-               "browser reads documents straight from your files through the "
-               "byte-offset index.", className="page-desc"),
+        html.H1("Datasets", className="page-title"),
+        html.P(["What each collection contains — splits, lengths, how much of "
+                "the gold occurs in the text — and every document, read from "
+                "your files. ",
+                html.A("Browse the documents ↓", href="#ds-browser")],
+               className="page-desc"),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id="ds-pick", options=[], clearable=False,
                 placeholder="scan first…", className="dash-dropdown"), 210),
-            ui.control("Annotation sets", dcc.Dropdown(
-                id="ds-ann", clearable=False, className="dash-dropdown"), 210),
             ui.control("Split", dcc.Dropdown(
-                id="ds-split", clearable=False, className="dash-dropdown"), 150),
-            ui.control("Tokenizer", dcc.Dropdown(
-                id="ds-tok", clearable=False, className="dash-dropdown"), 260),
+                id="ds-split", clearable=False, searchable=False,
+                className="dash-dropdown"), 150),
+            ui.control("Annotation sets", dcc.Dropdown(
+                id="ds-ann", clearable=False, searchable=False,
+                className="dash-dropdown"), 200),
+            ui.control("Length in", dcc.Dropdown(
+                id="ds-tok", clearable=False, searchable=False,
+                className="dash-dropdown"), 230),
         ]),
-        html.Div(id="ds-body"),
-        html.Div(id="ds-doc-view"),
+        ui.loading(html.Div(id="ds-body")),
+        # the browser lives outside ds-body: changing the split, annotation or
+        # tokenizer re-renders the statistics, not the search you typed. The
+        # opened document appears right under the list (and scrolls into
+        # view), then the explanation of a run's score on it.
+        ui.card([
+            html.Div([
+                ui.control("Search document ids", dcc.Input(
+                    id="ds-search", type="search", debounce=True,
+                    placeholder="e.g. C-41", className="text-input"), 240),
+                ui.control("Quality flags (all must apply)", dcc.Dropdown(
+                    id="ds-flagged", multi=True, options=[],
+                    placeholder="any document", className="dash-dropdown"), 380),
+            ], className="flex browser-controls"),
+            dcc.Store(id="ds-page", data=0),
+            html.Div(id="ds-doc-list"),
+            html.Div(id="ds-doc-view"),
+        ], title="Documents", id="ds-browser"),
+        dcc.Store(id="ds-doc-id"),
+        # why a run scored what it did on the open document
+        html.Div(ui.card([
+            ui.filter_row([
+                ui.control("Run", dcc.Dropdown(
+                    id="ds-explain-run", options=[], placeholder="open a document, "
+                    "then pick one of the runs that predicted it",
+                    className="dash-dropdown"), 460),
+                ui.control("Annotation set", dcc.Dropdown(
+                    id="ds-explain-ann", options=[], clearable=False,
+                    searchable=False, className="dash-dropdown"), 200),
+            ]),
+            ui.loading(html.Div(id="ds-explain")),
+        ], title="Why this run scored what it did on this document"),
+            id="ds-explain-card", style={"display": "none"}),
     ], className="page")
 
 
 # ---------------------------------------------------------------------------
 
-def _hist_bins(rows, nbins=24):
-    vals = [r[0] for r in rows if r[0] is not None]
-    if not vals:
-        return [], {}
-    lo, hi = min(vals), max(vals)
-    if hi <= lo:
-        hi = lo + 1
-    w = (hi - lo) / nbins
+def _hist_bins(inner_sql: str, args: list, nbins: int | None = None):
+    """Per-group histogram of `inner_sql`'s (v, g) rows, binned in DuckDB —
+    a training split of millions of documents is never fetched row by row.
+    The range stops at the 99.5th percentile (the last bin holds the longest
+    0.5 %), so one 40 000-word outlier does not squeeze every other document
+    into the first bar. Returns (centers, {group: counts}, clipped?)."""
+    got = db.q1(f"""SELECT min(v), quantile_cont(v, 0.995), max(v), count(v)
+                    FROM ({inner_sql}) WHERE v IS NOT NULL""", *args)
+    if not got or got[0] is None:
+        return [], {}, False
+    if nbins is None:
+        # about √n bins, 8 to 24: 24 bins over 60 documents draw noise
+        nbins = int(min(24, max(8, round(float(got[3]) ** 0.5))))
+    # lengths are whole numbers: bins are whole numbers of words or tokens
+    # (a 0.6-word bin is empty every other time and draws a comb)
+    import math
+    lo, top = int(got[0]), int(got[2])
+    hi = max(lo, int(math.ceil(float(got[1]))))
+    w = max(1, math.ceil((hi - lo + 1) / nbins))
+    nbins = max(1, math.ceil((hi - lo + 1) / w))
     groups: dict[str, list[int]] = {}
-    for v, g in rows:
-        if v is None:
-            continue
-        b = min(nbins - 1, int((v - lo) / w))
-        groups.setdefault(str(g), [0] * nbins)[b] += 1
-    centers = [round(lo + (i + 0.5) * w, 1) for i in range(nbins)]
-    return centers, groups
+    for g, b, n in db.q(f"""SELECT g, least({nbins - 1}, greatest(0,
+                                   floor((v - ?) / ?)))::INTEGER AS b, count(*)
+                            FROM ({inner_sql}) WHERE v IS NOT NULL
+                            GROUP BY 1, 2""", lo, w, *args):
+        groups.setdefault(str(g), [0] * nbins)[b] += int(n)
+    centers = [round(lo + (i + 0.5) * w - 0.5, 1) for i in range(nbins)]
+    return centers, groups, top > lo + nbins * w - 1
 
 
 def _body(ds: str, ann: str, split: str | None, tok: str | None):
@@ -152,24 +200,25 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         f"""SELECT ann_key, sum(n), sum(words_sum),
                    sum(CASE WHEN prmu='P' THEN n ELSE 0 END)
             FROM gold_agg WHERE {agg_where} GROUP BY 1""", *agg_args)}
-    n_gold = sum(v[0] or 0 for v in per_ann.values())
-    words_sum = sum(v[1] or 0 for v in per_ann.values())
-    n_present = sum(v[2] or 0 for v in per_ann.values())
 
     def _by_ann(fmt):
         return " · ".join(f"{a} {fmt(per_ann[a])}" for a in anns if a in per_ann)
 
+    # the identifying facts as chips; the schema (sections, annotation sets,
+    # metadata) as one line of text — colour is kept for the data
+    schema = [("sections", ", ".join(card.sections)),
+              ("annotation sets", ", ".join(card.annotations)),
+              ("metadata", ", ".join(m for m in card.metadata_spec if m != "split"))]
     header = ui.card([
         html.Div([html.B(card.description or ds)], style={"marginBottom": "9px"}),
         ui.meta_row([
             ui.meta_chip("domain", card.domain) if card.domain else None,
             ui.meta_chip("sub-domain", card.subdomain) if card.subdomain else None,
-            *[ui.meta_chip("lang", l) for l in card.languages],
-            *[ui.meta_chip("section", sec) for sec in card.sections],
-            *[ui.meta_chip("annotation", a) for a in card.annotations],
-            *[ui.meta_chip("metadata", m) for m in card.metadata_spec
-              if m != "split"],
+            ui.meta_chip("lang", " · ".join(card.languages))
+            if card.languages else None,
         ]),
+        html.Div(" · ".join(f"{k}: {v}" for k, v in schema if v),
+                 className="schema-line muted small"),
     ])
 
     # Three of the four tiles are per-document facts, so they are computed
@@ -203,47 +252,62 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                                 sorted(((r[0], r[1]) for r in split_rows),
                                        key=lambda t: split_rank(t[0])))),
         ui.stat_tile("Unique keyphrases", human_count(n_unique),
-                     ("union of " + ", ".join(anns)) if len(anns) > 1
-                     else "distinct surface forms"),
+                     (f"distinct stemmed forms, union of {len(anns)} "
+                      "annotation sets: " + ", ".join(anns))
+                     if len(anns) > 1 else "distinct stemmed forms"),
         ui.stat_tile("Keyphrases per document", mean_sd(n_kp_doc, 1), basis),
         ui.stat_tile("Present (P) per document",
                      mean_sd(p_share, 1, pct=True),
-                     "share of a document's gold occurring in order"),
+                     "share of a document's gold occurring verbatim (contiguous, stemmed)"),
     ])
 
     charts = []
     # ---- document length panel — "words" (default) or a model tokenizer ----
     tok = tok or WORDS_TOK
+    approx = None
     if tok == WORDS_TOK:
-        rows = db.q("SELECT n_words, coalesce(split,'?') FROM documents WHERE dataset=?", ds)
+        inner = ("SELECT n_words AS v, coalesce(split,'?') AS g FROM documents "
+                 "WHERE dataset=?")
+        inner_args = [ds]
         xlabel, title, uv = "document length (words)", "Document length", []
     else:
-        rows = db.q("""SELECT t.n_tokens, coalesce(d.split,'?')
-                       FROM doc_tokens t JOIN documents d USING (dataset, doc_id)
-                       WHERE t.dataset=? AND t.tokenizer=?""", ds, tok)
+        inner = ("""SELECT t.n_tokens AS v, coalesce(d.split,'?') AS g
+                    FROM doc_tokens t JOIN documents d USING (dataset, doc_id)
+                    WHERE t.dataset=? AND t.tokenizer=?""")
+        inner_args = [ds, tok]
         approx = db.q1("SELECT bool_or(approx) FROM doc_tokens WHERE dataset=? AND tokenizer=?",
                        ds, tok)
         xlabel = (f"document length ({tokenizer_label(tok)}"
                   + (" tokens, approximate)" if approx and approx[0]
                      else " tokens)"))
-        title = "Document length — against the context limits of the models that ran here"
-        vlines = []
+        title = "Document length and the models' input windows"
+        # the input window of every model that counts in this tokenizer —
+        # its card default, and any other value its runs used here — whether
+        # or not the model ran on this dataset
+        wins: dict[int, list[str]] = {}
+        resolved = {}
         for m, rj in db.q("SELECT DISTINCT model, resolved FROM runs WHERE dataset=?", ds):
+            resolved.setdefault(m, []).append(json.loads(rj or "{}"))
+        for m in sorted(set(idx.models) | set(resolved)):
             mc = idx.model(m)
             for p in mc.context_params():
                 if p.tokenizer != tok or "input" not in p.name:
                     continue
-                res = json.loads(rj or "{}").get(p.name) or {}
-                v = res.get("value") or p.default
-                if v:
-                    vlines.append({"x": v, "label": f"{mc.name} · {v}",
-                                   "color": MUTED, "dash": True})
-        seen, uv = set(), []
-        for v in vlines:
-            if v["x"] not in seen:
-                seen.add(v["x"])
-                uv.append(v)
-    centers, groups = _hist_bins(rows)
+                vals = {p.default} | {(r.get(p.name) or {}).get("value")
+                                      for r in resolved.get(m, [])}
+                for v in vals:
+                    try:
+                        v = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0 and mc.name not in wins.setdefault(v, []):
+                        wins[v].append(mc.name)
+        uv = [{"x": v, "label": f"{limit_str(v)} · " + ", ".join(names[:2])
+               + (f" +{len(names) - 2}" if len(names) > 2 else ""),
+               "color": MUTED, "dash": True} for v, names in sorted(wins.items())]
+    centers, groups, clipped = _hist_bins(inner, inner_args)
+    if clipped:
+        xlabel += " (the last bin also holds the longest 0.5 %)"
     if centers:
         span = max(centers)
         inside = [v for v in uv if v["x"] <= span * 1.35][:4]
@@ -251,26 +315,42 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         # each split is normalised to its own 100%: collections are wildly
         # unbalanced (1.3 M training vs 100 k testing), and the question here
         # is whether the *shapes* differ, not which split is bigger
+        # one outline per split (a frequency polygon), not 24 × 3 bars: the
+        # shapes are compared, and three thin lines read at a glance
         series = []
         for sp in order_splits(groups):
             ys = groups[sp]
             tot = sum(ys) or 1
             series.append({
-                "name": sp, "x": centers,
-                "y": [100.0 * y / tot for y in ys],
+                "name": sp, "x": centers, "mode": "lines", "width": 1.8,
+                "y": [round(100.0 * y / tot, 2) for y in ys],
                 "color": split_color(sp),
                 "hover": [f"{sp}<br>~{c:g} · {y} docs ({100.0 * y / tot:.1f}%)"
                           for c, y in zip(centers, ys)]})
-        spec = {"kind": "bar", "xlabel": xlabel,
-                "ylabel": "% of the split's documents", "barmode": "group",
-                "series": series, "vlines": inside}
+        spec = {"kind": "line", "xlabel": xlabel,
+                "ylabel": "% of the split's documents",
+                "series": series, "vlines": inside, "size": "2col",
+                "name": f"doc-length-{ds}",
+                "caption": (f"Document length distribution of {ds} per split, "
+                            + ("in words" if tok == WORDS_TOK
+                               else f"in {tokenizer_label(tok)} tokens")
+                            + (" (approximate)" if approx and approx[0] else "")
+                            + ("; dashed lines mark the input windows of the "
+                               "models that count in this tokenizer"
+                               if tok != WORDS_TOK else "")
+                            + (" (beyond the axis: " + "; ".join(
+                                v["label"] for v in beyond) + ")" if beyond else "")
+                            + ".")}
         note = (html.Div("beyond the axis: " + " · ".join(
             v["label"] for v in beyond), className="muted small")
             if beyond else None)
-        charts.append(ui.card([ui.graph("ds-g-len", to_plotly(spec), PANEL_H),
-                               note], title=title))
+        charts.append(ui.exportable(
+            "ds-len", spec, html.Div([ui.graph("ds-g-len", to_plotly(spec), PANEL_H),
+                                      note]), title=title))
 
-    # ---- PRMU pies: one row per annotator, one pie per split ---------------
+    # ---- PRMU: one aligned 100 % bar per (annotation set, split) -----------
+    # (aligned bars, not pies: the P share of two splits is compared on a
+    # common baseline instead of by angle)
     rows = db.q(f"""SELECT ann_key, coalesce(split,'?'), prmu, sum(n)
                     FROM gold_agg WHERE {agg_where} GROUP BY 1,2,3""", *agg_args)
     if rows:
@@ -280,22 +360,43 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         rows_used = [a for a in anns if any((a, sp) in cell for sp in splits)]
         cols_used = [sp for sp in order_splits(splits)
                      if any((a, sp) in cell for a in rows_used)]
-        panels, order = [], ["P", "R", "M", "U"]
+        order = ["P", "R", "M", "U"]
+        cats, tots = [], {}
         for a in rows_used:
             for sp in cols_used:
                 c = cell.get((a, sp), {})
+                if not sum(c.values()):
+                    continue
+                lab = f"{a} · {sp}" if len(rows_used) > 1 else sp
+                cats.append(lab)
+                tots[lab] = c
+        series = []
+        for pr in order:
+            ys, hv = [], []
+            for lab in cats:
+                c = tots[lab]
                 tot = sum(c.values())
-                panels.append({
-                    "title": (f"{sp} · {human_count(tot)}" if tot
-                              else f"{sp} · none"),
-                    "labels": [f"{pr} — {PRMU_NAMES[pr]}" for pr in order],
-                    "values": [c.get(pr, 0) for pr in order],
-                    "colors": [PRMU_COLORS[pr] for pr in order]})
-        spec = {"kind": "pie_grid", "panels": panels, "ncols": len(cols_used),
-                "row_titles": rows_used, "size": "2col"}
-        charts.append(ui.card(
-            [ui.graph("ds-g-prmu", to_plotly(spec),
-                      max(250, 200 * len(rows_used) + 76))],
+                ys.append(round(100.0 * c.get(pr, 0) / tot, 2))
+                hv.append(f"{lab}<br>{pr} — {PRMU_NAMES[pr]}: "
+                          f"{human_count(c.get(pr, 0))} of {human_count(tot)} "
+                          f"({100.0 * c.get(pr, 0) / tot:.1f}%)")
+            series.append({"name": f"{pr} — {PRMU_NAMES[pr]}",
+                           "x": ys, "y": list(cats), "hover": hv,
+                           "color": PRMU_COLORS[pr]})
+        spec = {"kind": "bar", "barmode": "stack", "orientation": "h",
+                "xlabel": "% of the gold keyphrases", "xrange": [0, 100],
+                "series": series, "size": "2col",
+                "aspect": min(1.2, 0.18 + 0.07 * len(cats)),
+                "name": f"prmu-{ds}",
+                "caption": (f"PRMU classes of the gold keyphrases of {ds} per "
+                            "annotation set and split (Boudin & Gallina, 2021, "
+                            "on stemmed tokens: P = the keyphrase occurs "
+                            "contiguously in the document, R = all its words "
+                            "occur but not as that sequence, M = some occur, "
+                            "U = none do).")}
+        charts.append(ui.exportable(
+            "ds-prmu", spec,
+            ui.graph("ds-g-prmu", to_plotly(spec), max(200, 44 * len(cats) + 110)),
             title="Keyphrase PRMU distribution"))
 
     # ---- keyphrase length + POS tags, split-coloured ------------------------
@@ -309,21 +410,25 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
             d = data.setdefault((a, sp), {})
             d[key] = d.get(key, 0) + n
         cats = sorted({k for d in data.values() for k in d}, key=natural_key)
-        # keyphrase length lives in spaCy word tokens; the tokenizer selector
-        # drives the *document* length panel, so name the unit honestly
+        # keyphrase length is in words; the tokenizer selector drives the
+        # *document* length panel only
         spec = {"kind": "bar", "barmode": "group",
                 "xlabel": f"length ({WORDS_TOK})",
                 "ylabel": "% of the group's gold", "yrange": [0, 100],
-                "series": _group_series(data, cats, anns, splits)}
-        c1 = ui.card([ui.graph("ds-g-kplen", to_plotly(spec), PANEL_H)],
-                     title="Keyphrase length", style={"minWidth": 0})
+                "series": _group_series(data, cats, anns, splits),
+                "size": "1col", "name": f"kp-length-{ds}",
+                "caption": (f"Length of the gold keyphrases of {ds} in words, per annotation set and split.")}
+        c1 = ui.exportable("ds-kplen", spec,
+                           ui.graph("ds-g-kplen", to_plotly(spec), PANEL_H),
+                           title="Keyphrase length", style={"minWidth": 0})
     rows = db.q(f"""SELECT g.ann_key, coalesce(d.split,'?'), k.pos, count(*)
                     FROM gold g
                     JOIN documents d USING (dataset, doc_id)
                     JOIN keyphrases k ON k.kp = g.display
+                     AND k.lang = left(coalesce(g.lang, 'en'), 2)
                     WHERE g.dataset=? AND g.ann_key IN ({ann_sql})
                       {'AND d.split=?' if use_split else ''}
-                      AND k.pos IS NOT NULL
+                      AND k.pos IS NOT NULL AND k.pos <> ''
                     GROUP BY 1,2,3""", *agg_args)
     if rows:
         data = {}
@@ -343,65 +448,81 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
             for pos, n in counts.items():
                 d.setdefault(pos if pos in top else "Other", 0)
                 d[pos if pos in top else "Other"] += n
+        # most frequent pattern on top, "Other" (the fold-in) last
         spec = {"kind": "bar", "barmode": "group", "orientation": "h",
                 "xlabel": "% of the group's tagged gold",
-                "series": _group_series(folded, list(reversed(cats)), anns,
-                                        splits, horizontal=True)}
-        c2 = ui.card([ui.graph("ds-g-pos", to_plotly(spec), PANEL_H)],
-                     title="Keyphrase POS tags", style={"minWidth": 0})
+                "series": _group_series(folded, cats, anns,
+                                        splits, horizontal=True),
+                "size": "1col", "name": f"kp-pos-{ds}",
+                "caption": (f"Part-of-speech patterns of the gold keyphrases of "
+                            f"{ds} (spaCy tagger; the {POS_TOP_N} most frequent "
+                            "patterns, the rest as Other), per annotation set "
+                            "and split.")}
+        # per-keyphrase rows exist for evaluation splits (and flagged
+        # documents) under the default gold scope: say which splits this
+        # panel covers when the length panel beside it covers more
+        have = order_splits({sp for _a, sp in data})
+        missing = [sp for sp in order_splits(splits) if sp not in have]
+        note = (html.Div(f"Tagged gold is stored for {', '.join(have)} "
+                         f"(not {', '.join(missing)}); scan with --gold-scope "
+                         "all to include every split.",
+                         className="muted small panel-note")
+                if missing else None)
+        c2 = ui.exportable("ds-pos", spec,
+                           html.Div([ui.graph("ds-g-pos", to_plotly(spec), PANEL_H),
+                                     note]),
+                           title="Keyphrase POS tags", style={"minWidth": 0})
     else:
         c2 = ui.card(html.Div("No POS-tagged keyphrases here yet — install the "
                               "spaCy model for this language and re-scan, or "
                               "widen --gold-scope.", className="muted small"),
                      title="Keyphrase POS tags", style={"minWidth": 0})
     grid1 = html.Div([c for c in (c1, c2) if c], className="grid-2")
-
-    browser = ui.card([
-        html.Div([
-            dcc.Input(id="ds-search", type="text", debounce=True,
-                      placeholder="search document ids…",
-                      style={"border": "1px solid var(--border)",
-                             "borderRadius": "8px", "padding": "7px 11px",
-                             "fontSize": "13px", "width": "260px"}),
-            dcc.Dropdown(id="ds-flagged", multi=True, options=[],
-                         placeholder="data quality flags (all documents)",
-                         className="dash-dropdown",
-                         style={"minWidth": "420px", "flex": "1"}),
-        ], className="flex", style={"marginBottom": "8px"}),
-        html.Div(id="ds-doc-list"),
-    ], title="Document browser")
-
-    return html.Div([header, kpis, *charts, grid1, browser])
+    return html.Div([header, kpis, *charts, grid1])
 
 
 # ---------------------------------------------------------------------------
 
 def register(app):
     @app.callback(Output("ds-pick", "options"), Output("ds-pick", "value"),
-                  Input("catalog-version", "data"), State("ds-pick", "value"))
-    def refresh_datasets(_v, current):
+                  State("vis-datasets", "data"), Input("shown-datasets", "data"),
+                  Input("catalog-version", "data"),
+                  State("ds-pick", "options"), State("ds-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_datasets(visible, _shown, _v, cur_opts, current):
+        """Only while the page is on screen; a hidden page catches up when
+        shown (the catalog version is an input)."""
+        if not visible:
+            raise PreventUpdate
         ds = _datasets()
+        if cur_opts == ds and current in ds:
+            raise PreventUpdate
         value = current if current in ds else (ds[0] if ds else None)
         return ds, value
 
     @app.callback(Output("ds-ann", "options"), Output("ds-ann", "value"),
                   Output("ds-split", "options"), Output("ds-split", "value"),
                   Output("ds-tok", "options"), Output("ds-tok", "value"),
-                  Input("ds-pick", "value"))
+                  Input("ds-pick", "value"), prevent_initial_call=True)
     def set_options(ds):
         if not ds:
             return [], None, [], None, [], None
         # "(each)" is the default: every annotation set gets its own row/series
-        anns = [{"label": "(each, kept separate)", "value": "(each)"}] + [
+        anns = [{"label": "each set", "value": "(each)"}] + [
             {"label": a, "value": a} for a in _annotators(ds)]
-        splits = ["(all)"] + _splits(ds)
-        toks = [WORDS_TOK] + [r[0] for r in db.q(
-            "SELECT DISTINCT tokenizer FROM doc_tokens WHERE dataset=? ORDER BY 1", ds)]
+        splits = ([{"label": "all splits", "value": "(all)"}]
+                  + [{"label": s_, "value": s_} for s_ in order_splits(_splits(ds))])
+        toks = [{"label": "words", "value": WORDS_TOK}] + [
+            {"label": f"{tokenizer_label(t)} tokens", "value": t}
+            for t in (r[0] for r in db.q(
+                "SELECT DISTINCT tokenizer FROM doc_tokens WHERE dataset=? "
+                "ORDER BY 1", ds))]
         return (anns, "(each)", splits, "(all)", toks, WORDS_TOK)
 
     @app.callback(Output("ds-body", "children"),
                   Input("ds-pick", "value"), Input("ds-ann", "value"),
-                  Input("ds-split", "value"), Input("ds-tok", "value"))
+                  Input("ds-split", "value"), Input("ds-tok", "value"),
+                  prevent_initial_call=True)
     def body(ds, ann, split, tok):
         if not ds:
             return ui.empty_state("No datasets in the catalog — run a scan on "
@@ -410,7 +531,8 @@ def register(app):
             return ui.empty_state("No annotations derived for this dataset yet.")
         return _body(ds, ann, split, tok)
 
-    @app.callback(Output("ds-flagged", "options"), Input("ds-pick", "value"))
+    @app.callback(Output("ds-flagged", "options"), Input("ds-pick", "value"),
+                  prevent_initial_call=True)
     def flag_options(ds):
         if not ds:
             return []
@@ -418,12 +540,21 @@ def register(app):
             """SELECT f.fl, count(*) FROM documents, UNNEST(flags) AS f(fl)
                 WHERE dataset=? GROUP BY 1 ORDER BY 2 DESC""", ds)]
 
-    @app.callback(Output("ds-doc-list", "children"),
+    @app.callback(Output("ds-doc-list", "children"), Output("ds-page", "data"),
                   Input("ds-pick", "value"), Input("ds-search", "value"),
-                  Input("ds-flagged", "value"), Input("ds-split", "value"))
-    def doc_list(ds, q, flagged, split):
+                  Input("ds-flagged", "value"), Input("ds-split", "value"),
+                  Input({"type": "ds-pager", "dir": ALL}, "n_clicks"),
+                  State("ds-page", "data"),
+                  prevent_initial_call=True)
+    def doc_list(ds, q, flagged, split, _pager, page):
         if not ds:
-            return None
+            return None, 0
+        trig = ctx.triggered_id
+        page = int(page or 0)
+        if isinstance(trig, dict) and trig.get("type") == "ds-pager":
+            page = max(0, page + (1 if trig.get("dir") == "next" else -1))
+        else:
+            page = 0                      # a new filter starts at the top
         where, args = "dataset=?", [ds]
         if q:
             where += " AND doc_id ILIKE ?"
@@ -436,11 +567,24 @@ def register(app):
         if split and split != "(all)":
             where += " AND coalesce(split,'?')=?"
             args.append(split)
+        # natural order (kp20k_testing_2 before _10) over *every* match, in
+        # SQL, paged — sorting the first 50 000 unordered ids made the "first
+        # 25" arbitrary on large collections
+        per = 15
+        total = db.q1(f"SELECT count(*) FROM documents WHERE {where}", *args)[0]
+        if not total:
+            return html.Div(["No document matches these filters. ",
+                             html.Span("Clear the search or the flags.",
+                                       className="muted")],
+                            className="small empty-inline"), 0
+        page = min(page, (total - 1) // per)
         rows = db.q(f"""SELECT doc_id, coalesce(split,'?'), n_words, flags
-                        FROM documents WHERE {where} ORDER BY doc_id LIMIT 15""",
-                    *args)
-        if not rows:
-            return html.Div("no matching documents", className="muted small")
+                        FROM documents WHERE {where}
+                        ORDER BY regexp_replace(doc_id, '\\d+$', ''),
+                                 TRY_CAST(regexp_extract(doc_id, '(\\d+)$', 1)
+                                          AS BIGINT) NULLS FIRST,
+                                 doc_id
+                        LIMIT {per} OFFSET {page * per}""", *args)
         table_rows, ids = [], []
         for doc_id, sp, nw, flags in rows:
             ids.append(doc_id)
@@ -448,61 +592,269 @@ def register(app):
                 html.Code(doc_id), sp, human_count(nw),
                 html.Span([ui.tag_chip(f) for f in (flags or [])[:3]])
                 if flags else html.Span("—", className="muted")])
-        return ui.table(["Document", "Split", "Words", "Flags"], table_rows,
-                        num_cols={2}, row_ids=ids, table_id="ds-doc")
+        first = page * per + 1
+        pager = html.Span([
+            html.Button("‹ Previous", id={"type": "ds-pager", "dir": "prev"},
+                        className="btn small", disabled=page == 0),
+            html.Button("Next ›", id={"type": "ds-pager", "dir": "next"},
+                        className="btn small", disabled=first + len(rows) > total,
+                        style={"marginLeft": "6px"}),
+        ], style={"marginLeft": "10px"})
+        return html.Div([
+            html.Div([f"{first:,}–{first + len(rows) - 1:,} of {total:,} "
+                      "documents", pager],
+                     className="muted small", style={"marginBottom": "4px"}),
+            ui.table(["Document", "Split", "Words", "Flags"], table_rows,
+                     num_cols={2}, row_ids=ids, table_id="ds-doc")]), page
 
-    @app.callback(Output("ds-doc-view", "children"),
+    @app.callback(Output("ds-explain-run", "options"), Output("ds-explain-run", "value"),
+                  Output("ds-explain-ann", "options"), Output("ds-explain-ann", "value"),
+                  Output("ds-explain-card", "style"),
+                  Input("ds-doc-id", "data"), State("ds-pick", "value"),
+                  prevent_initial_call=True)
+    def explain_options(doc_id, ds):
+        if not doc_id or not ds:
+            return [], None, [], None, {"display": "none"}
+        idx = scanner.cards()
+        rows = [r for r in run_rows([ds])]
+        labels = run_labels(idx, rows)
+        have = {tuple(r) for r in db.q(
+            """SELECT DISTINCT model, arch, run_id FROM matches
+               WHERE dataset=? AND doc_id=?""", ds, doc_id)}
+        opts = [{"label": labels.get(group_key(*k), k[0]), "value": group_key(*k)}
+                for k in sorted(have, key=lambda k: natural_key(
+                    labels.get(group_key(*k), k[0])))]
+        anns = [r[0] for r in db.q(
+            """SELECT DISTINCT ann_key FROM gold WHERE dataset=? AND doc_id=?
+               ORDER BY 1""", ds, doc_id)]
+        ann = "@combined" if "@combined" in anns else (anns[0] if anns else None)
+        style = {"display": "block"} if opts else {"display": "none"}
+        return (opts, opts[0]["value"] if opts else None, anns, ann, style)
+
+    @app.callback(Output("ds-explain", "children"),
+                  Input("ds-explain-run", "value"), Input("ds-explain-ann", "value"),
+                  State("ds-doc-id", "data"), State("ds-pick", "value"),
+                  prevent_initial_call=True)
+    def explain(run_key, ann, doc_id, ds):
+        if not run_key or not ann or not doc_id or not ds:
+            return None
+        return _explain(ds, doc_id, parse_group_key(run_key), ann)
+
+    @app.callback(Output("ds-doc-view", "children"), Output("ds-doc-id", "data"),
                   Input({"type": "ds-doc-row", "key": ALL}, "n_clicks"),
-                  State("ds-pick", "value"),
+                  Input("ds-pick", "value"),
                   prevent_initial_call=True)
     def doc_view(clicks, ds):
+        """The opened document belongs to one dataset: switching the dataset
+        closes it (and its explanation) instead of leaving another
+        collection's document under the new charts."""
+        if ctx.triggered_id == "ds-pick":
+            return None, None
         if not any(c for c in clicks if c):
-            return no_update
+            return no_update, no_update
         doc_id = ctx.triggered_id["key"]
+        return _doc_card(ds, doc_id), doc_id
+
+    def _doc_card(ds, doc_id):
         row = db.q1("""SELECT file_id, byte_off, byte_len, split, flags, ann_counts
                        FROM documents WHERE dataset=? AND doc_id=?""", ds, doc_id)
         if not row:
             return None
-        obj = db.read_line(int(row[0]), row[1], row[2]) or {}
-        secs = []
-        for s in obj.get("sections", []):
-            secs.append(html.Div([
-                html.Div(f"{s.get('field')} · {','.join(s.get('language') or [])}",
-                         className="doc-field"),
-                html.Div(s.get("content", ""), className="doc-text"),
-            ], className="doc-section"))
-        gold_rows = db.q("""SELECT g.ann_key, g.display, g.prmu, k.pos, g.n_words
+        obj = db.read_line(int(row[0]), row[1], row[2])
+        src_note = None
+        if obj is None:
+            src_note = ("the source line cannot be read — the file is missing "
+                        "or changed since the last scan; rescan to refresh")
+            obj = {}
+        elif str(obj.get("_id")) != str(doc_id) and not str(doc_id).startswith("@"):
+            src_note = ("the source file changed since the last scan (this "
+                        "offset now holds another document); rescan to refresh")
+            obj = {}
+        gold_rows = db.q("""SELECT g.ann_key, coalesce(g.surface, g.display),
+                                   g.prmu, k.pos, g.n_words, g.lang
                             FROM gold g LEFT JOIN keyphrases k ON k.kp=g.display
+                              AND k.lang = left(coalesce(g.lang, 'en'), 2)
                             WHERE g.dataset=? AND g.doc_id=?
                               AND g.ann_key <> '@combined'
                             ORDER BY g.ann_key, g.kp_idx""", ds, doc_id)
+        # present gold, marked where the scorer finds it (every occurrence)
+        present = list(dict.fromkeys(r[1] for r in gold_rows if r[2] == "P"))
+        card_langs = scanner.cards().dataset(ds).languages
+        secs = []
+        for s in obj.get("sections", []):
+            text = fix_text(s.get("content", ""))
+            langs = declared_langs(s) or card_langs or ["en"]
+            secs.append(html.Div([
+                html.Div(f"{s.get('field')} · "
+                         f"{', '.join(declared_langs(s)) or 'language from the card'}",
+                         className="doc-field"),
+                html.Div(_marked(text, present, langs[0]), className="doc-text",
+                         tabIndex=0, role="region",
+                         **{"aria-label": f"{s.get('field')} text"}),
+            ], className="doc-section"))
         by_ann: dict[str, list] = {}
-        for ak, disp, prmu, pos, nw in gold_rows:
+        for ak, disp, prmu, pos, nw, _lang in gold_rows:
+            c = prmu or "U"
             by_ann.setdefault(ak, []).append(
-                html.Span([html.Span(className=f"prmu-dot prmu-{prmu or 'U'}"),
+                html.Span([html.Span(c, className=f"prmu-chip prmu-{c}",
+                                     title=PRMU_NAMES.get(c, "?")),
                            disp, html.Span(pos or "", className="muted small")],
                           className="kp-gold",
-                          title=f"{PRMU_NAMES.get(prmu, '?')}"))
+                          title=f"{PRMU_NAMES.get(c, '?')}"
+                                + (f" · {pos}" if pos else "")))
         ann_blocks = [html.Div([html.Div(ak, className="doc-field"),
                                 html.Div(chips)], className="doc-section")
                       for ak, chips in by_ann.items()]
-        if not ann_blocks:
+        if ann_blocks:
+            ann_blocks.insert(0, _prmu_key(bool(present)))
+        else:
             counts = json.loads(row[5] or "{}")
-            note = ("no annotations on this document" if not counts else
-                    "gold instances are stored for eval splits and flagged "
-                    "documents (run with --gold-scope all to browse all "
-                    "training gold) — counts: "
+            note = ("No annotations on this document." if not counts else
+                    "Gold keyphrases are stored for evaluation splits and "
+                    "flagged documents (scan with --gold-scope all to browse "
+                    "training gold). Counts: "
                     + ", ".join(f"{k}: {v}" for k, v in counts.items()))
             ann_blocks = [html.Div(note, className="muted small")]
         flags = row[4] or []
-        return ui.card([
-            html.Div([html.B(doc_id), html.Span(f"  ·  split {row[3]}",
-                                                className="muted small"),
-                      html.Span([ui.tag_chip(f) for f in flags],
-                                style={"marginLeft": "10px"})],
-                     style={"marginBottom": "10px"}),
+        return html.Div([
+            html.H3([doc_id, html.Span(f"  ·  split {row[3]}",
+                                       className="muted small")],
+                    className="doc-title"),
+            html.Span([ui.tag_chip(f) for f in flags]) if flags else None,
+            (html.Div(src_note, className="ins-banner", role="status")
+             if src_note else None),
             html.Div([html.Div(secs, className="grow"),
-                      html.Div(ann_blocks, style={"width": "360px",
-                                                  "flexShrink": "0"})],
-                     className="flex", style={"alignItems": "flex-start"}),
-        ], title="Document")
+                      html.Div(ann_blocks, className="doc-anns")],
+                     className="flex doc-view", style={"alignItems": "flex-start"}),
+        ], className="doc-open")
+
+
+def _prmu_key(marked: bool):
+    """What the letters (and the marks in the text) mean — visible, not a
+    tooltip."""
+    return html.Div([
+        *[html.Span([html.Span(c, className=f"prmu-chip prmu-{c}"),
+                     f" {PRMU_NAMES[c]}"], className="prmu-key-item")
+          for c in "PRMU"],
+        html.Div("Marked in the text: every occurrence of a present keyphrase"
+                 if marked else "No present keyphrase occurs in this text",
+                 className="muted small"),
+    ], className="prmu-key")
+
+
+def _marked(text: str, phrases: list[str], lang: str | None):
+    """The text with each present-gold occurrence in a <mark>."""
+    from ..highlight import present_spans
+    try:
+        spans = present_spans(text, phrases, lang)
+    except Exception:                  # never lose the text over a highlight
+        spans = []
+    if not spans:
+        return text
+    out, at = [], 0
+    for a, b, ix in spans:
+        if a > at:
+            out.append(text[at:a])
+        out.append(html.Mark(text[a:b], className="kp-mark",
+                             title=" · ".join(phrases[i] for i in ix)))
+        at = b
+    out.append(text[at:])
+    return out
+
+
+def _explain(ds: str, doc_id: str, key: tuple, ann: str):
+    """A run's predictions on one document, as the scorer saw them: ranked,
+    normalised and de-duplicated, each marked with the gold keyphrase it
+    matched (or none), then the gold it missed — the evidence behind every
+    P/R/F1 number for this (run, document)."""
+    from ..derive import _uniq_stems
+    from ..textproc import PhraseCache
+    model, arch, run_id = key
+    m = db.q1("""SELECT pred_ranks, gold_idxs, n_uniq, n_gold FROM matches
+                 WHERE dataset=? AND model=? AND arch=? AND run_id=?
+                   AND doc_id=? AND ann_key=?""", ds, model, arch, run_id,
+              doc_id, ann)
+    p = db.q1("""SELECT file_id, byte_off, byte_len FROM preds
+                 WHERE dataset=? AND model=? AND arch=? AND run_id=? AND doc_id=?""",
+              ds, model, arch, run_id, doc_id)
+    if not m or not p:
+        return html.Div("this run has no scored line for this document "
+                        "and annotation set", className="muted small")
+    line = db.read_line(int(p[0]), p[1], p[2])
+    if line is None or str(line.get("_id")) != str(doc_id):
+        return html.Div("the prediction file changed since the last scan — "
+                        "rescan to explain this run", className="ins-banner")
+    raw = [fix_text(str(x)) for x in (line.get("inferences") or [])]
+    lang = (scanner.cards().dataset(ds).languages[:1] or ["en"])[0]
+    cache = PhraseCache(max_size=4096)
+    an = [cache.analyze(x, lang, persist=False) for x in raw]
+    uniq, first = _uniq_stems(an)
+    ranks, gidx = list(m[0] or []), list(m[1] or [])
+    hit = dict(zip(ranks, gidx))
+    gold = db.q("""SELECT kp_idx, coalesce(surface, display), prmu FROM gold
+                   WHERE dataset=? AND doc_id=? AND ann_key=? ORDER BY kp_idx""",
+                ds, doc_id, ann)
+    gname = {g[0]: g[1] for g in gold}
+    first_of = {}
+    for i, a in enumerate(an):
+        first_of.setdefault(a["sstr"], i)
+    rank_of_raw = {fi: r for r, fi in enumerate(first)}
+    items = []
+    for i, (x, a) in enumerate(zip(raw, an)):
+        r = rank_of_raw.get(i)
+        if r is None:
+            why = ("no word token" if not a["sstr"] else
+                   f"duplicate of #{rank_of_raw.get(first_of[a['sstr']], 0) + 1}")
+            items.append(html.Li([html.Span(x, className="muted"),
+                                  html.Span(f"  — {why}", className="muted small")],
+                                 className="pred dup"))
+            continue
+        g = hit.get(r)
+        mark = "✓" if g is not None else "✗"
+        items.append(html.Li([
+            html.Span(f"#{r + 1} ", className="muted small"),
+            html.Span(mark, className="ok" if g is not None else "bad",
+                      title="matches a gold keyphrase" if g is not None
+                      else "matches no gold keyphrase"),
+            " ", html.Span(x),
+            html.Span(f"  → {gname.get(g, g)}" if g is not None else "",
+                      className="muted small"),
+            html.Span(f"  [{a['sstr']}]", className="muted small mono"),
+        ], className="pred"))
+    missed = [g for g in gold if g[0] not in set(gidx)]
+    n_uniq, n_gold = int(m[2] or 0), int(m[3] or 0)
+
+    def tile(k):
+        """P, R and F1 at one cut-off, the same arithmetic as the scorer."""
+        cut = n_gold if k == "O" else (max(n_uniq, 1) if k == "M" else int(k))
+        tp = sum(1 for r in ranks if r < cut)
+        dp = min(cut, n_uniq) if n_uniq else 0
+        p_ = tp / dp if dp else 0.0
+        r_ = tp / n_gold if n_gold else 0.0
+        f_ = 2 * p_ * r_ / (p_ + r_) if p_ + r_ else 0.0
+        return html.Div([
+            html.Div(f"F1@{k}", className="score-cut",
+                     title={"O": f"cut at the number of gold keyphrases ({n_gold})",
+                            "M": "every prediction"}.get(k, f"top {k}")),
+            html.Div(f"{f_:.2f}", className="score-f1", title="F1"),
+            html.Div(f"P {p_:.2f} · R {r_:.2f}", className="muted small"),
+        ], className="score-tile")
+    return html.Div([
+        html.Div([tile(k) for k in ("5", "10", "O", "M")], className="score-tiles",
+                 **{"aria-label": "F1 at each cut-off, with precision and recall"}),
+        html.Div(f"{len(raw)} predictions → {n_uniq} unique after normalisation "
+                 f"and stemming · {len(ranks)} of {n_gold} gold keyphrases matched",
+                 className="muted small", style={"margin": "6px 0 10px"}),
+        html.Div([
+            html.Div([html.Div("Ranked predictions", className="doc-field"),
+                      html.Ol(items, className="pred-list")], className="grow"),
+            html.Div([html.Div(f"Missed gold ({len(missed)})", className="doc-field"),
+                      html.Div([html.Span([html.Span(pr or "U",
+                                                     className=f"prmu-chip prmu-{pr or 'U'}"),
+                                           name], className="kp-gold",
+                                          title=PRMU_NAMES.get(pr or "U", "?"))
+                                for _i, name, pr in missed]
+                               or [html.Span("none", className="muted small")])],
+                     className="doc-anns"),
+        ], className="flex doc-view", style={"alignItems": "flex-start"}),
+    ])

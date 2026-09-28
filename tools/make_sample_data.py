@@ -8,6 +8,14 @@ documents consistent with the real inference ids, extra model cards in the
 same schema, multiple runs per model with controlled quality/cost knobs,
 and a scores.jsonl with labelled leakage pairs.
 
+When --src does not exist, it is synthesised first with
+tools/make_sample_src.py, so a fresh clone needs no external inputs.
+
+The tree deliberately exercises every spelling the data contract accepts:
+JSONC comments in a card, `language`/`languages`, `dataset_a`/`dataset_A`,
+slash and ISO-8601 batch timestamps, a run folder without its run card, an
+undeclared architecture (`n.a`) and a run with illegal parameters.
+
 Usage: python tools/make_sample_data.py [--src sample_src] [--out sample_data]
 """
 from __future__ import annotations
@@ -187,9 +195,11 @@ def emit_run(out: Path, ds: str, model: str, arch: str, run_id: str,
             out_toks.append(otok)
         wall = sum(doc_times) * (1.15 if cost_mode != "api" else 4.0)
         t1 = t + timedelta(seconds=wall)
+        fmt = ("%Y-%m-%dT%H:%M:%S.%f+00:00" if cost_mode == "api"
+               else "%Y/%m/%d %H:%M:%S")
         meta = {"batch_idx": bi,
-                "start_timestamp": t.strftime("%Y/%m/%d %H:%M:%S"),
-                "end_timestamp": t1.strftime("%Y/%m/%d %H:%M:%S")}
+                "start_timestamp": t.strftime(fmt),
+                "end_timestamp": t1.strftime(fmt)}
         if cost_mode == "rented":
             meta["costs"] = {"time": round(wall, 4)}
         elif cost_mode == "local":
@@ -210,6 +220,10 @@ def main():
     ap.add_argument("--out", default="sample_data")
     a = ap.parse_args()
     src, out = Path(a.src), Path(a.out)
+    if not (src / "document.kp20k.json").exists():
+        import subprocess
+        gen = Path(__file__).resolve().parent / "make_sample_src.py"
+        subprocess.run([sys.executable, str(gen), str(src)], check=True)
     if out.exists():
         shutil.rmtree(out)
     (out / "documents").mkdir(parents=True)
@@ -378,8 +392,10 @@ def main():
     for i in range(25):
         a = RNG.choice(kp20k_docs)
         b = RNG.choice(bio_docs)
-        leak_pairs.append({"dataset_A": "kp20k", "dataset_B": "kpbiomed",
-                           "doc_id_A": a["_id"], "doc_id_B": b["_id"],
+        # README spelling (lower-case keys); the near-duplicates above use
+        # the older upper-case spelling — both are part of the contract
+        leak_pairs.append({"dataset_a": "kp20k", "dataset_b": "kpbiomed",
+                           "doc_id_a": a["_id"], "doc_id_b": b["_id"],
                            "score": round(RNG.uniform(0.55, 0.85), 5)})
     with open(out / "insights" / "scores.jsonl", "w", encoding="utf-8") as f:
         for p in leak_pairs:
@@ -491,6 +507,9 @@ def main():
                  docs, lambda d, _dist=dist: predict(d, recall=0.48, extra=2,
                                                      noise=0.55, distractors=_dist),
                  "none", t0 + timedelta(days=6), speed=0.5)
+    # a run folder whose run card is missing (flagged missing:run, still scored)
+    (out / "inferences" / "kptimes" / "llama3.370BInstruct" / "n.a" /
+     "ab1a2c4366c3" / "run_ab1a2c4366c3.json").unlink()
 
     # semeval2010 (long docs -> truncation RQ) + talnarchives (french)
     # stem-aware window membership (same matching the evaluator uses)

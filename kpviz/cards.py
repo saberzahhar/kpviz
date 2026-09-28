@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import load_json
+from .util import declared_langs, load_jsonc
 
 UNKNOWN_TOKENS = {"n.a", "na", "n/a", "none", "unknown", "null", "-", ""}
 
@@ -62,9 +62,14 @@ class ParamSpec:
     def numeric(self) -> bool:
         return self.type in ("int", "float", "context_window")
 
+    KNOWN_TYPES = ("int", "float", "context_window", "bool", "str", "set")
+
     def check(self, value) -> str | None:
-        """Return a human-readable violation, or None if the value is legal."""
+        """Return a human-readable violation, or None if the value is legal.
+        An undeclared type fails closed: nothing can be checked against it."""
         t = self.type
+        if t not in self.KNOWN_TYPES:
+            return f"parameter type {t!r} is not one KPViz can check"
         if t in ("int", "context_window"):
             if not isinstance(value, int) or isinstance(value, bool):
                 return f"expected int, got {type(value).__name__}"
@@ -87,6 +92,10 @@ class ParamSpec:
                 if bad:
                     return f"illegal members {bad!r}"
         if self.numeric and isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value != value or value in (float("inf"), float("-inf")):
+                return f"{value} is not a finite number"
+            if self.values and value not in self.values:
+                return f"value {value!r} not in allowed set"
             if self.min is not None and value < self.min:
                 return f"{value} < min {self.min}"
             if self.max is not None and value > self.max:
@@ -128,16 +137,16 @@ class DatasetCard:
         return self.raw.get("metadata", {}) or {}
 
     def section_langs(self, fieldname: str) -> list[str]:
-        return (self.sections.get(fieldname) or {}).get("languages", []) or []
+        return declared_langs(self.sections.get(fieldname))
 
     def ann_langs(self, ann_key: str) -> list[str]:
-        return (self.annotations.get(ann_key) or {}).get("languages", []) or []
+        return declared_langs(self.annotations.get(ann_key))
 
     @property
     def languages(self) -> list[str]:
         seen: dict[str, None] = {}
         for spec in list(self.sections.values()) + list(self.annotations.values()):
-            for l in spec.get("languages", []) or []:
+            for l in declared_langs(spec if isinstance(spec, dict) else None):
                 seen.setdefault(l)
         return list(seen)
 
@@ -233,15 +242,35 @@ class ModelCard:
                                        "problem": problem})
                 resolved[name] = {"value": v, "source": "given"}
             elif spec.default is not None:
+                # a card default is a value like any other: an illegal one
+                # is flagged, never silently fed into analysis
+                problem = spec.check(spec.default)
+                if problem:
+                    violations.append({"param": name, "value": spec.default,
+                                       "problem": f"card default: {problem}"})
                 resolved[name] = {"value": spec.default, "source": "default"}
             else:
                 resolved[name] = {"value": None, "source": "missing"}
         for name, v in params.items():
             if name not in specs:
                 resolved[name] = {"value": v, "source": "given"}
+                if name in KPVIZ_RUN_PARAMS:
+                    problem = KPVIZ_RUN_PARAMS[name].check(v)
+                    if problem:
+                        violations.append({"param": name, "value": v,
+                                           "problem": problem})
+                    continue
                 violations.append({"param": name, "value": v,
                                    "problem": "not declared in model card"})
         return resolved, violations
+
+
+# run parameters KPViz itself understands, whatever the model card declares
+KPVIZ_RUN_PARAMS = {
+    # tokens of the input window the document cannot use (prompt, few-shot
+    # examples, special tokens) — subtracted from the window in RQ3
+    "reserved_tokens": ParamSpec(name="reserved_tokens", type="int", min=0),
+}
 
 
 @dataclass
@@ -355,6 +384,9 @@ class CardIndex:
         self.archs: dict[str, ArchCard] = {}
         self._model_alias: dict[str, str] = {}
         self._arch_alias: dict[str, str] = {}
+        # cards that exist but could not be read: {"file", "error"} — shown
+        # on the Overview instead of silently becoming "no card"
+        self.errors: list[dict] = []
 
     def _build_aliases(self):
         self._model_alias = {}
@@ -381,7 +413,7 @@ class CardIndex:
             for p in sorted(docs.glob("document.*.json")):
                 m = _DOC_CARD.match(p.name)
                 if m:
-                    idx.datasets[m["ds"]] = DatasetCard(m["ds"], p, _safe(p))
+                    idx.datasets[m["ds"]] = DatasetCard(m["ds"], p, _safe(p, idx.errors))
             # collections without a card still deserve an entry
             for p in sorted(docs.glob("document.*.jsonl")):
                 m = _DOC_COLL.match(p.name)
@@ -392,13 +424,13 @@ class CardIndex:
             for p in sorted(models.glob("model.*.json")):
                 m = _MODEL_CARD.match(p.name)
                 if m:
-                    idx.models[m["m"]] = ModelCard(m["m"], p, _safe(p))
+                    idx.models[m["m"]] = ModelCard(m["m"], p, _safe(p, idx.errors))
         archs = root / "architectures"
         if archs.is_dir():
             for p in sorted(archs.glob("architecture.*.json")):
                 m = _ARCH_CARD.match(p.name)
                 if m:
-                    idx.archs[m["a"]] = ArchCard(m["a"], p, _safe(p))
+                    idx.archs[m["a"]] = ArchCard(m["a"], p, _safe(p, idx.errors))
         idx._build_aliases()
         return idx
 
@@ -423,9 +455,20 @@ class CardIndex:
         return self.datasets.get(token) or DatasetCard(token, None, {})
 
 
-def _safe(p: Path) -> dict:
+def _safe(p: Path, errors: list | None = None) -> dict:
+    """A card as a dict. JSONC comments are accepted; anything else that fails
+    to parse is recorded (file, line, column) and the card treated as absent."""
     try:
-        d = load_json(p)
-        return d if isinstance(d, dict) else {}
-    except Exception:
+        d = load_jsonc(p)
+    except Exception as e:
+        if errors is not None:
+            where = (f"line {e.lineno}, column {e.colno}: {e.msg}"
+                     if hasattr(e, "lineno") else f"{type(e).__name__}: {e}")
+            errors.append({"file": f"{p.parent.name}/{p.name}", "error": where})
         return {}
+    if not isinstance(d, dict):
+        if errors is not None:
+            errors.append({"file": f"{p.parent.name}/{p.name}",
+                           "error": "top level is not a JSON object"})
+        return {}
+    return d

@@ -25,7 +25,7 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--gold-scope", choices=["eval", "all"], default="eval")
-    ap.add_argument("--token-scope", choices=["eval", "all"], default="eval")
+    ap.add_argument("--token-scope", choices=["eval", "all"], default="all")
     ap.add_argument("--hash", choices=["auto", "always"], default="auto")
     a = ap.parse_args()
 
@@ -49,6 +49,8 @@ def main() -> int:
         print("\nSCAN FAILED\n" + snap["error"])
         return 1
     print(f"\nscan complete in {time.time() - t0:.1f}s")
+    if snap.get("skipped"):
+        print("nothing changed — catalog left as it was")
     for s in snap["steps"]:
         if s["t_start"] and s["t_end"]:
             print(f"  {s['key']:<12} {s['t_end'] - s['t_start']:8.2f}s  "

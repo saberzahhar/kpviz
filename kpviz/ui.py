@@ -38,6 +38,28 @@ _TAG_KINDS = [("illegal parameter", "t-illegal"), ("missing", "t-missing"),
               ("lang_mismatch", "t-lang")]
 
 
+# what each issue tag means and what KPViz did about it (chip tooltip)
+TAG_HELP = {
+    "duplicate_docs": "the run predicts some documents more than once; the "
+                      "first line (lowest batch, then byte offset) is scored, "
+                      "the others ignored",
+    "duplicate_doc_ids": "the collection repeats document ids; the first "
+                         "line is kept, the others ignored",
+    "gold_duplicates": "gold keyphrases identical to an earlier one of the "
+                       "same annotation set after stemming; counted once",
+    "gold_empty": "gold keyphrases with no word token; dropped (they can "
+                  "never be matched)",
+    "unscored": "predicted documents with no stored gold (a training split, "
+                "or no annotation); they enter no score",
+    "unresolved_ids": "predicted document ids absent from the collection",
+    "incomplete": "share of the evaluation split this run predicts; its "
+                  "means are over the predicted documents only",
+    "multi_split": "the run predicts documents of several splits",
+    "malformed_lines": "lines that are not valid JSON (skipped)",
+    "missing_id": "lines without an _id",
+}
+
+
 def tag_chip(tag: str):
     key, _, value = str(tag).partition(":")
     kind = next((cls for prefix, cls in _TAG_KINDS
@@ -45,7 +67,9 @@ def tag_chip(tag: str):
     parts = [html.Span(key, className="tag-k")]
     if value:
         parts.append(html.Span(value, className="tag-v"))
-    return html.Span(parts, className=f"tag {kind}", title=tag)
+    help_ = TAG_HELP.get(key)
+    return html.Span(parts, className=f"tag {kind}",
+                     title=f"{tag} — {help_}" if help_ else tag)
 
 
 # ---- metadata chips ------------------------------------------------------
@@ -80,22 +104,42 @@ def meta_row(chips: list):
     return html.Div([c for c in chips if c is not None], className="mtag-row")
 
 
+class Wide:
+    """A table cell that fills the rest of its row: one sentence ("no
+    window: nothing to split") instead of a run of dashes."""
+
+    def __init__(self, child):
+        self.child = child
+
+
 def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
-          row_ids: list | None = None, table_id: str | None = None):
+          row_ids: list | None = None, table_id: str | None = None,
+          nowrap_cols: set[int] | None = None):
     num_cols = num_cols or set()
+    nowrap = nowrap_cols or set()
     head = html.Thead(html.Tr([
         html.Th(h, className="num" if i in num_cols else "")
         for i, h in enumerate(headers)]))
     body_rows = []
+    clickable = row_ids is not None and table_id is not None
     for ri, row in enumerate(rows):
-        tds = [html.Td(c if isinstance(c, (str, int, float)) or c is None
-                       else c, className="num" if ci in num_cols else "")
-               for ci, c in enumerate(row)]
-        kw = {}
-        if row_ids is not None and table_id is not None:
-            kw = {"id": {"type": f"{table_id}-row", "key": str(row_ids[ri])},
-                  "className": "row-click", "n_clicks": 0}
-        body_rows.append(html.Tr(tds, **kw))
+        cells = list(row)
+        if clickable and cells:
+            # the first cell holds a real button (keyboard, screen readers);
+            # the row stays a table row, and a click anywhere on it presses
+            # that button (assets/keys.js)
+            cells[0] = html.Button(cells[0], className="row-open", n_clicks=0,
+                                   id={"type": f"{table_id}-row",
+                                       "key": str(row_ids[ri])})
+        tds = []
+        for ci, c in enumerate(cells):
+            if isinstance(c, Wide):
+                tds.append(html.Td(c.child, colSpan=len(headers) - ci,
+                                   className="wide"))
+                break
+            tds.append(html.Td(c, className=("num" if ci in num_cols else "")
+                               + (" nowrap" if ci in nowrap else "")))
+        body_rows.append(html.Tr(tds, className="row-click" if clickable else None))
     # headers never wrap (they read as one phrase), so a wide table scrolls
     # inside its card instead of stretching the page
     return html.Div(html.Table([head, html.Tbody(body_rows)],
@@ -103,9 +147,14 @@ def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
 
 
 def control(label: str, component, width: int | None = None):
+    """A labelled control. The label is a real <label> bound to the input
+    when the component has a plain id (screen readers announce it)."""
     style = {"minWidth": f"{width}px"} if width else {}
-    return html.Div([html.Div(label, className="control-label"), component],
-                    className="control", style=style)
+    cid = getattr(component, "id", None)
+    lab = (html.Label(label, htmlFor=cid, className="control-label")
+           if isinstance(cid, str) else
+           html.Div(label, className="control-label"))
+    return html.Div([lab, component], className="control", style=style)
 
 
 def filter_row(controls: list):
@@ -119,53 +168,165 @@ def section(title: str, note: str | None = None):
     return out
 
 
-def graph(id, figure=None, height: int = 420, config: dict | None = None):
+def loading(child):
+    """Spinner overlay for real work only: shown after 400 ms, over the
+    previous content (kept visible, dimmed) rather than instead of it."""
+    return dcc.Loading(child, delay_show=400, type="dot", color="#2a78d6",
+                       overlay_style={"visibility": "visible",
+                                      "opacity": 0.55})
+
+
+def graph(id, figure=None, height: int = 420, config: dict | None = None,
+          grow: bool = False):
+    """A graph `height` px tall; with grow=True that is a minimum, and a
+    figure that sets its own height (a dumbbell with 22 runs) gets it."""
     from .figures import plotly_config
     return dcc.Graph(id=id, figure=figure or {},
                      config=config or plotly_config(),
-                     style={"height": f"{height}px"})
+                     style=({"minHeight": f"{height}px"} if grow
+                            else {"height": f"{height}px"}))
 
 
-def export_bar(rq: str):
-    """One export bar per insight: stores + buttons + clipboards.
+def export_bar(rq: str, spec: dict | None = None, caption: str | None = None,
+               primary: bool = True):
+    """One export bar per figure: the three exports people use (Download
+    PDF, Download PNG, Copy LaTeX) in view, with a status line that answers
+    every click at once; the caption, the paper and layout options, the
+    .pgf, the bundle, the LaTeX table and the print-size preview folded
+    under "Caption & export options".
 
-    The figure/table spec is written to {'type':'fig-spec','rq':rq} by the
-    RQ callback; global callbacks in appfactory handle rendering/downloads."""
-    def b(what, label, primary=False):
+    Exports use the figure as computed (the publication specification),
+    not the on-screen zoom or hidden legend entries. The caption box is the
+    generated caption until someone edits it; an edited caption is never
+    overwritten by a recomputed figure (appfactory keeps it and offers the
+    new one). The spec is written to {'type':'fig-spec','rq':rq} by the
+    workbench callback — or given here for a figure drawn once."""
+    clip_fig = clip_tab = hint = ""
+    if spec:
+        from .export import snippets
+        clip_fig, clip_tab, hint = snippets(spec)
+
+    def b(what, label, primary=False, title=None):
         return html.Button(label, id={"type": "exp-btn", "rq": rq, "what": what},
                            className="btn small" + (" primary" if primary else ""),
-                           n_clicks=0)
+                           n_clicks=0, title=title)
+
+    def opt(kind, label, options, value, width):
+        # remembered per browser: a paper keeps its venue across sessions
+        return html.Div([
+            html.Span(label, className="exp-opt-label"),
+            dcc.Dropdown(id={"type": f"exp-{kind}", "rq": rq}, options=options,
+                         value=value, clearable=False, searchable=False,
+                         persistence=True, persistence_type="local",
+                         className="dash-dropdown exp-dd")],
+            className="exp-opt", style={"minWidth": f"{width}px"})
+
+    def clip(kind, title):
+        # the label is drawn by CSS on the clipboard itself (::after), so a
+        # click anywhere on the button copies
+        return dcc.Clipboard(title=title, id={"type": f"exp-clip-{kind}", "rq": rq},
+                             content=clip_fig if kind == "fig" else clip_tab,
+                             className=f"btn small clip-btn clip-{kind}",
+                             style={"display": "inline-flex"})
+
+    from .figures import VENUES
     return html.Div([
-        dcc.Store(id={"type": "fig-spec", "rq": rq}),
+        # data only when there is a spec: an explicit data=None makes Dash
+        # fire the export callbacks of every workbench at page load
+        dcc.Store(id={"type": "fig-spec", "rq": rq},
+                  **({"data": spec} if spec else {})),
+        dcc.Store(id={"type": "cap-base", "rq": rq}),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
         html.Div([
-            dcc.Clipboard(title="copy LaTeX (figure environment)",
-                          id={"type": "exp-clip-fig", "rq": rq},
-                          content="", className="btn small",
-                          style={"display": "inline-flex"}),
-            html.Span("LaTeX figure", className="small muted",
-                      style={"marginRight": "10px", "marginLeft": "-2px"}),
-            dcc.Clipboard(title="copy LaTeX (booktabs table)",
-                          id={"type": "exp-clip-tab", "rq": rq},
-                          content="", className="btn small",
-                          style={"display": "inline-flex"}),
-            html.Span("LaTeX table", className="small muted",
-                      style={"marginRight": "10px", "marginLeft": "-2px"}),
-            b("pdf", "PDF", primary=True), b("png", "PNG"),
-            b("pgf", ".pgf"), b("zip", "Bundle"),
-            html.Span(id={"type": "exp-hint", "rq": rq}, className="hint"),
-        ], className="export-bar"),
-    ])
+            b("pdf", "Download PDF", primary=primary,
+              title="vector PDF at the paper's size, from the figure as "
+                    "computed (not the on-screen zoom)"),
+            b("png", "Download PNG", title="300 dpi PNG"),
+            clip("fig", "copy the LaTeX figure environment"),
+            html.Span(id={"type": "exp-status", "rq": rq}, className="exp-status",
+                      role="status", **{"aria-live": "polite"}),
+        ], id={"type": "exp-row", "rq": rq}, className="export-bar"),
+        html.Details([
+            html.Summary("Caption & export options"),
+            html.Div([
+                html.Span("Caption", className="exp-opt-label"),
+                html.Span(id={"type": "cap-note", "rq": rq}, className="cap-note",
+                          role="status", **{"aria-live": "polite"}),
+                html.Button("Restore the generated caption",
+                            id={"type": "cap-reset", "rq": rq},
+                            className="btn small ghost", n_clicks=0),
+            ], className="cap-head"),
+            caption_editor(rq, caption or ""),
+            html.Div([
+                opt("venue", "Paper", [{"label": v["label"], "value": k}
+                                       for k, v in VENUES.items()], "generic", 250),
+                opt("span", "Width", [{"label": "as designed", "value": "auto"},
+                                      {"label": "one column", "value": "col"},
+                                      {"label": "full text width", "value": "full"}],
+                    "auto", 150),
+                opt("height", "Height", [{"label": "compact", "value": "compact"},
+                                         {"label": "standard", "value": "std"},
+                                         {"label": "tall", "value": "tall"}],
+                    "std", 115),
+                opt("legend", "Legend", [{"label": "auto", "value": "auto"},
+                                         {"label": "above", "value": "top"},
+                                         {"label": "right", "value": "right"},
+                                         {"label": "none (in caption)", "value": "none"}],
+                    "auto", 150),
+                opt("cells", "Table cells", [
+                    {"label": "value", "value": "value"},
+                    {"label": "value [CI]", "value": "ci"},
+                    {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
+            ], className="exp-opts"),
+            html.Div([
+                clip("tab", "copy the booktabs table"),
+                b("pgf", "Download .pgf", title="PGF picture, typeset by your paper"),
+                b("zip", "Download all formats",
+                  title="PDF + PGF + PNG + .tex + data + provenance"),
+                html.Button("Print-size preview", id={"type": "exp-prev", "rq": rq},
+                            className="btn small ghost", n_clicks=0,
+                            title="Show the exported figure at its printed size"),
+            ], className="export-bar"),
+            html.Div(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
+        ], className="exp-more"),
+        loading(html.Div(id={"type": "exp-preview", "rq": rq},
+                         className="exp-preview")),
+    ], id={"type": "exp-wrap", "rq": rq}, className="exp-wrap")
+
+
+def exportable(key: str, spec: dict, graph_component, title: str | None = None,
+               **card_kw):
+    """A card holding a figure drawn once (not by a workbench callback) with
+    its export bar (caption and options folded; its PDF button is not the
+    page's primary action)."""
+    return card([graph_component,
+                 export_bar(key, spec, caption=spec.get("caption", ""),
+                            primary=False)],
+                title=title, **card_kw)
 
 
 def caption_editor(rq: str, initial: str = ""):
-    """dcc.Textarea has no debounce; the callback it drives only builds two
-    LaTeX strings (the TeX engine probe is cached and no figure is rendered),
-    so per-keystroke cost is negligible. Figure rendering happens only on an
-    explicit download click, behind a cache."""
+    """Editable caption. The LaTeX snippets are rebuilt when it loses focus
+    (n_blur), not on every keystroke; downloads read its current value."""
     return html.Div(dcc.Textarea(
         id={"type": "caption", "rq": rq}, value=initial,
-        placeholder="Caption used in exports…"), className="caption-box")
+        placeholder="Caption used in exports…"),
+        className="caption-box")
+
+
+def more(children, label: str = "Filters & settings", open_: bool = False):
+    """Secondary controls, folded: the page shows what most people change."""
+    return html.Details([html.Summary(label),
+                         html.Div(children, className="more-body")],
+                        className="more-opts", open=open_)
+
+
+def fold(child, n_rows: int, label: str, limit: int = 8):
+    """A long table (or list) folded behind a one-line summary; short ones
+    are shown as they are."""
+    if n_rows <= limit:
+        return child
+    return html.Details([html.Summary(label), child], className="fold")
 
 
 def empty_state(msg: str):

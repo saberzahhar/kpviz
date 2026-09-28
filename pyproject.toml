@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kpviz"
+dynamic = ["version"]
+description = "Evaluate keyphrase extraction and generation models on your own machine, and put the figures in your paper."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Saber Zahhar" },
+  { name = "Christophe Rodrigues" },
+  { name = "Nédra Mellouli" },
+  { name = "Nicolas Travers" },
+]
+keywords = ["keyphrase extraction", "keyphrase generation", "evaluation",
+            "digital libraries", "reproducibility", "visual analytics"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Web Environment",
+  "Framework :: Dash",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Visualization",
+  "Topic :: Text Processing :: Linguistic",
+]
+# the supported ranges; constraints.txt pins the versions the suite last ran with
+dependencies = [
+  "dash>=2.17,<5",
+  "plotly>=5.20,<8",
+  "duckdb>=1.1,<2",          # one-statement scoring uses list lambdas + fetchnumpy
+  "numpy>=1.24",             # per-document score arrays, rank tests, binning
+  "matplotlib>=3.8",         # exports: PDF, PGF, PNG
+  "PyStemmer>=2.2",          # the C stemmer (snowballstemmer is the fallback)
+  "snowballstemmer>=2.2",
+  "orjson>=3.9",             # faster JSONL parsing in the scan workers
+  # exact tokenizers for context windows (flagged approximations otherwise)
+  "tokenizers>=0.15",
+  "tiktoken>=0.6",
+  # part-of-speech patterns of the gold (the panel explains itself when missing)
+  "spacy>=3.8,<3.9",
+  "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+  "fr_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "scipy>=1.11",             # the statistics tests compare every kernel with SciPy
+  "pyflakes>=3.2",           # the CI static check
+  "psutil>=5.9",             # tools/bench/scan_profile.py
+]
+
+[project.scripts]
+kpviz = "kpviz.cli:run"
+
+[project.urls]
+Homepage = "https://github.com/saberzahhar/kpviz"
+Paper = "https://doi.org/10.1145/3805696.3846518"
+Archive = "https://doi.org/10.5281/zenodo.22789345"
+Demo = "https://youtu.be/WS2iCDfloYM"
+Issues = "https://github.com/saberzahhar/kpviz/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "kpviz.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["kpviz*"]
+
+[tool.setuptools.package-data]
+kpviz = ["assets/*.css", "assets/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

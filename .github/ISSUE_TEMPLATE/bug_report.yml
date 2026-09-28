@@ -1,0 +1,46 @@
+name: Bug report
+description: Something is wrong, slow or unclear.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. A report that can be reproduced gets fixed first:
+        `tools/synth_tree.py --cards YOUR_CARDS --out tree` builds a small
+        tree around your own cards, without your documents.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: The command you ran, the page and the controls you used.
+      placeholder: |
+        1. kpviz --data tree
+        2. Insights → RQ3, dataset semeval2010
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Console output
+      description: Everything the terminal printed, from the start.
+      render: text
+  - type: textarea
+    id: overview
+    attributes:
+      label: Overview page
+      description: The "Needs attention" table and the "Engine" line (a screenshot is fine).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`kpviz --version`, your Python version and operating system"
+      placeholder: kpviz 1.0.0 · Python 3.11 · Ubuntu 24.04
+    validations:
+      required: true

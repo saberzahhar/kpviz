@@ -1,17 +1,19 @@
 """Display names, distinguishing-hyperparameter labels and visual encoding.
 
-The rules (see the dataviz method):
-  * color follows the entity, never its rank — assignments are persisted;
-  * one model on screen -> hue/shape/size carry its *differing* hyper-
-    parameters (up to three dimensions, ordered by cardinality);
-  * several models -> hue carries the domain/family group, shape the model,
-    size the parameter count; labels show the model name plus only the
-    hyperparameters that differ between its displayed runs.
+One visual identity on every page (see the dataviz method):
+  * hue = the model, from a slot persisted per catalog (colour follows the
+    entity, never its rank or the page: a model is the same colour on the
+    Models page, in every workbench and in every export);
+  * shape = the architecture it ran on (persisted slot as well);
+  * a model's runs are lightness steps of its hue (and dash patterns for
+    lines), in the natural order of their labels;
+  * labels show the model name plus only the hyperparameters that differ
+    between its displayed runs; legends list models and architectures, not
+    runs (a run is named on hover and, selectively, next to its mark).
 """
 from __future__ import annotations
 
 import json
-import math
 import re
 
 from . import db
@@ -53,14 +55,65 @@ def slot_color(i: int) -> str:
     return PALETTE[i] if 0 <= i < len(PALETTE) else OTHER_GRAY
 
 
+DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+
+
+def shade(hex_color: str, t: float) -> str:
+    """`hex_color` mixed with white by t ∈ [0, 1) (0 = unchanged): one hue,
+    several lightness steps."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    mix = lambda c: round(c + (255 - c) * max(0.0, min(0.9, t)))  # noqa: E731
+    return f"#{mix(r):02x}{mix(g):02x}{mix(b):02x}"
+
+
+def assign_all_slots(idx) -> None:
+    """Colour slots for every model and shape slots for every architecture
+    of the catalog, in sorted order, once per scan: a figure's encoding then
+    never depends on which page was opened first (pages only read slots)."""
+    rows = db.q("SELECT DISTINCT model, arch FROM runs ORDER BY 1, 2")
+    db.color_seq("model", sorted({r[0] for r in rows}))
+    db.color_seq("arch", sorted({r[1] for r in rows}))
+
+
+def model_color(model: str) -> str:
+    """The model's hue — the same on every page and in every export."""
+    return slot_color(db.color_seq("model", [model]).get(model, 99))
+
+
+def arch_shape(arch: str) -> tuple[str, str]:
+    """(Plotly symbol, Matplotlib marker) of an architecture."""
+    i = db.color_seq("arch", [arch]).get(arch, 0) % len(PLOTLY_SHAPES)
+    return PLOTLY_SHAPES[i], MPL_SHAPES[i]
+
+
+# ---- PRMU: green → yellow → orange → red, by how much of the phrase the
+# document holds (P verbatim … U none of it). Validated as a set: lightness
+# band, chroma floor, colour-vision separation of neighbours (worst ΔE 13.5)
+# and normal-vision separation. Every chip also prints its letter, so the
+# class never rests on the colour alone (assets/kpviz.css mirrors these
+# values; a test keeps the two in step).
+PRMU_COLORS = {"P": "#2e9158", "R": "#d7ad1d", "M": "#d6601a", "U": "#a82424"}
+# ---- conditions compared inside one run (all documents vs. a subset, all
+# gold vs. the gold inside the window): neutral greys, darker = the subset
+# under test, so hue keeps meaning "which model" on every figure
+CONDITION = {"context": "#c2c1ba", "kept": "#8a8983", "focus": "#4d4c47"}
+
+PRMU_NAMES = {"P": "Present", "R": "Reordered", "M": "Mixed", "U": "Unseen"}
+
+
 # ---- splits: one colour and one order, everywhere ------------------------
 # A split means the same thing on every page, so it gets a fixed hue and a
 # fixed reading order (the pipeline order: you train, you tune, you test).
+# Validated as a categorical set on the light surface: lightness band,
+# chroma floor, colour-vision separation (worst pair ΔE 13.8, protan) and
+# 3:1 contrast all pass.
+_TRAIN, _VALID, _TEST = "#1a9e8f", "#c2761c", "#5b50c8"
 SPLIT_COLORS = {
-    "training": "#3AA6A0", "train": "#3AA6A0",
-    "validation": "#9B7EDE", "valid": "#9B7EDE", "val": "#9B7EDE",
-    "dev": "#9B7EDE", "development": "#9B7EDE",
-    "testing": "#5B8DEF", "test": "#5B8DEF", "eval": "#5B8DEF",
+    "training": _TRAIN, "train": _TRAIN,
+    "validation": _VALID, "valid": _VALID, "val": _VALID,
+    "dev": _VALID, "development": _VALID,
+    "testing": _TEST, "test": _TEST, "eval": _TEST,
 }
 _SPLIT_RANK = {
     "training": 0, "train": 0,
@@ -110,11 +163,14 @@ def limit_str(v: int | float | None) -> str:
     return str(v)
 
 
-def window_str(tokz: str | None, limit, is_default: bool = False) -> str:
-    """"512 (bart-base)" · "128k (o200k)" · "1024 (bart-base, default)"."""
+def window_str(tokz: str | None, limit, is_default: bool = False,
+               reserved: int = 0) -> str:
+    """"512 (bart-base)" · "128k (o200k)" · "1024 (bart-base, default)" ·
+    "1022 (bart-base, 2 reserved)" — `limit` is what the document can use."""
     if limit is None:
         return "—"
-    inner = tokenizer_label(tokz) + (", default" if is_default else "")
+    inner = (tokenizer_label(tokz) + (", default" if is_default else "")
+             + (f", {reserved:,} reserved" if reserved else ""))
     return f"{limit_str(limit)} ({inner})"
 
 
@@ -221,76 +277,72 @@ def run_labels(idx: CardIndex, runs: list[dict]) -> dict[str, str]:
     return labels
 
 
-def _size_from_params(n_params: int | None) -> float:
-    """Marker size (px area-ish) from parameter count, log-scaled."""
-    if not n_params:
-        return 10.0
-    return 8.0 + 2.6 * max(0.0, math.log10(n_params) - 7)  # 10M->8, 100B->18.4
-
-
 def encode_runs(idx: CardIndex, runs: list[dict]) -> dict[str, dict]:
-    """Visual encoding {group_key: {color, mpl_marker, shape, size, label,
-    color_dim, shape_dim, size_dim}} following the single-/multi-model rules."""
+    """{group_key: {color, dash, shape, mpl_marker, size, label, model,
+    model_name, arch}} — hue = model, shape = architecture, runs of one model
+    = lightness steps of its hue (and dash patterns for lines)."""
     uniq: dict[str, dict] = {}
     for r in runs:
         uniq.setdefault(group_key(r["model"], r["arch"], r["run_id"]), r)
     labels = run_labels(idx, list(uniq.values()))
-    models = sorted({r["model"] for r in uniq.values()})
-    out: dict[str, dict] = {}
-
-    if len(models) == 1 and len(uniq) > 1:
-        # one model: encode its differing hyperparameters
-        rs = list(uniq.values())
-        diffs = distinct_params([r["resolved"] for r in rs])
-        dims = diffs[:3]
-
-        def pval(r, p):
-            info = r["resolved"].get(p) or {}
-            return json.dumps(info.get("value"), sort_keys=True, default=str)
-
-        val_order = {p: sorted({pval(r, p) for r in rs}) for p in dims}
-        seq = db.color_seq("run", sorted(uniq.keys()))
-        for k, r in uniq.items():
-            ci = (val_order[dims[0]].index(pval(r, dims[0]))
-                  if dims else seq[k] % len(PALETTE))
-            si = (val_order[dims[1]].index(pval(r, dims[1]))
-                  if len(dims) > 1 else 0)
-            zi = (val_order[dims[2]].index(pval(r, dims[2]))
-                  if len(dims) > 2 else 0)
-            nz = len(val_order[dims[2]]) if len(dims) > 2 else 1
-            out[k] = {
-                "color": slot_color(ci % len(PALETTE)),
-                "shape": PLOTLY_SHAPES[si % len(PLOTLY_SHAPES)],
-                "mpl_marker": MPL_SHAPES[si % len(MPL_SHAPES)],
-                "size": 10.0 + (6.0 * zi / max(1, nz - 1) if nz > 1 else 0.0),
-                "label": labels[k],
-                "color_dim": dims[0] if dims else "run",
-                "shape_dim": dims[1] if len(dims) > 1 else None,
-                "size_dim": dims[2] if len(dims) > 2 else None,
-            }
-        return out
-
-    # several models: hue = domain/family group, shape = model, size = #params
-    def group_of(model: str) -> str:
-        card = idx.model(model)
-        if card.domains:
-            return card.domains[0].get("domain") or "Other"
-        return card.family_top or "Other"
-
-    groups = sorted({group_of(m) for m in models})
-    gseq = db.color_seq("group", groups)
-    mseq = db.color_seq("model", models)
+    mslot = db.color_seq("model", sorted({r["model"] for r in uniq.values()}))
+    aslot = db.color_seq("arch", sorted({r["arch"] for r in uniq.values()}))
+    by_model: dict[str, list[str]] = {}
     for k, r in uniq.items():
-        g = group_of(r["model"])
-        card = idx.model(r["model"])
+        by_model.setdefault(r["model"], []).append(k)
+    rank: dict[str, tuple[int, int]] = {}
+    for ks in by_model.values():
+        ks.sort(key=lambda k: natural_key(labels[k]))
+        for i, k in enumerate(ks):
+            rank[k] = (i, len(ks))
+    out: dict[str, dict] = {}
+    for k, r in uniq.items():
+        i, n = rank[k]
+        base = slot_color(mslot.get(r["model"], 99))
+        si = aslot.get(r["arch"], 0) % len(PLOTLY_SHAPES)
         out[k] = {
-            "color": slot_color(gseq[g] % len(PALETTE)),
-            "shape": PLOTLY_SHAPES[mseq[r["model"]] % len(PLOTLY_SHAPES)],
-            "mpl_marker": MPL_SHAPES[mseq[r["model"]] % len(MPL_SHAPES)],
-            "size": _size_from_params(card.n_parameters),
-            "label": labels[k],
-            "color_dim": "domain" if any(idx.model(m).domains for m in models) else "family",
-            "shape_dim": "model",
-            "size_dim": "#parameters",
+            # darkest first; the lightest step stays readable on white
+            "color": shade(base, 0.55 * i / max(1, n - 1)) if n > 1 else base,
+            "base": base,
+            "dash": DASHES[i % len(DASHES)] if n > 1 else "solid",
+            "shape": PLOTLY_SHAPES[si], "mpl_marker": MPL_SHAPES[si],
+            "size": 10.0, "label": labels[k], "model": r["model"],
+            "model_name": idx.model(r["model"]).name, "arch": r["arch"],
         }
     return out
+
+
+def arch_label(idx, token: str) -> str:
+    """How an architecture is named to a reader: its card's name ("OpenAI
+    API"), never the folder token; a run declared without one ("n.a") is
+    "no architecture"."""
+    from .cards import is_unknown_token
+    if is_unknown_token(token):
+        return "no architecture"
+    card = idx.arch(token) if idx is not None else None
+    return card.name if card is not None and card.known else token
+
+
+def legend_items(enc: dict[str, dict], keys=None, lines: bool = False,
+                 arch_names=None) -> list[dict]:
+    """Legend entries for an encoding: one per model (its hue) and, when
+    the marks come from several architectures, one per architecture (its
+    shape, in grey), each block under its own title so the legend teaches
+    the encoding. `keys` restricts to the runs actually drawn; `arch_names`
+    (a card index) gives architectures their card names."""
+    vals = [enc[k] for k in (keys if keys is not None else enc) if k in enc]
+    models: dict[str, dict] = {}
+    for e in sorted(vals, key=lambda e: natural_key(e["model_name"])):
+        models.setdefault(e["model"], {
+            "name": e["model_name"], "color": e["base"], "group": e["model"],
+            "shape": "circle", "mpl_marker": "o", "line": lines,
+            "block": "model (colour)"})
+    items = list(models.values())
+    archs = {e["arch"]: (e["shape"], e["mpl_marker"]) for e in vals}
+    if len(archs) > 1 and not lines:
+        for a in sorted(archs, key=natural_key):
+            items.append({"name": arch_label(arch_names, a), "color": OTHER_GRAY,
+                          "group": f"arch:{a}", "shape": archs[a][0],
+                          "mpl_marker": archs[a][1], "line": False,
+                          "block": "architecture (shape)"})
+    return items

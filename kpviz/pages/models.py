@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 
 from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import to_plotly, PALETTE
+from ..figures import to_plotly
 from ..metrics import run_scores
-from ..naming import natural_key, slot_color, window_str
-from ..util import fmt_num, human_cost, human_count
+from ..naming import arch_label, natural_key, window_str
+from ..util import UNIT_HEAD, fmt_num, human_cost, human_count
 
 
 def _model_options():
@@ -21,16 +22,15 @@ def _model_options():
 
 def layout():
     return html.Div([
-        html.H2("Models", className="page-title"),
-        html.P("Model cards with their declared inference-parameter schema, "
-               "every run found in the tree (validated against the card), and "
-               "a quality glance across datasets.", className="page-desc"),
+        html.H1("Models", className="page-title"),
+        html.P("A model card, its runs (checked against the card) and how "
+               "they score on each dataset.", className="page-desc"),
         ui.filter_row([
             ui.control("Model", dcc.Dropdown(
                 id="md-pick", options=[], clearable=False,
                 placeholder="scan first…", className="dash-dropdown"), 280),
         ]),
-        html.Div(id="md-body"),
+        ui.loading(html.Div(id="md-body")),
     ], className="page")
 
 
@@ -58,53 +58,89 @@ def _spec_table(mcard):
 
 
 def _runs_table(idx, model):
-    from ..naming import group_key, run_labels, run_rows
+    """The runs of one model: only the parameters that *vary* between them
+    are chips (the constants are said once, above), each run is named by
+    its label (the hash is its tooltip), costs get a column per unit."""
+    from ..naming import (distinct_params, group_key, param_value_str,
+                          run_labels, run_rows, short_run)
     rows = db.q("""SELECT dataset, arch, run_id, resolved, violations, n_docs,
-                          expected_docs, coverage, costs, wall_s
+                          expected_docs, coverage, costs, tags
                    FROM runs WHERE model=?""", model)
     if not rows:
         return html.Div("no runs found for this model", className="muted small")
+    labels = run_labels(idx, [r for r in run_rows() if r["model"] == model])
     # run ids are content hashes, so ordering by them is arbitrary noise: order
     # by what the reader sees — dataset, then the run's own label, naturally
     # (num_beams=1, 4, 10 — not 1, 10, 4)
-    labels = run_labels(idx, [r for r in run_rows() if r["model"] == model])
     rows = sorted(rows, key=lambda r: (
         natural_key(r[0]),
         natural_key(labels.get(group_key(model, r[1], r[2]), r[2]))))
+    resolved = [json.loads(r[3] or "{}") for r in rows]
+    varying = set(distinct_params(resolved))
+    given = [{k: v["value"] for k, v in res.items()
+              if isinstance(v, dict) and v.get("source") == "given"}
+             for res in resolved]
+    # the same given value in every run: said once, not on every row
+    common = {k: v for k, v in (given[0] if given else {}).items()
+              if k not in varying and all(g.get(k) == v for g in given)}
+    units = [u for u in ("usd", "kwh", "time")
+             if any((json.loads(r[8] or "{}").get(u) or {}).get("known")
+                    for r in rows)]
     trs = []
-    for ds, arch, rid, resj, vj, nd, ed, cov, cj, wall in rows:
-        res = json.loads(resj or "{}")
-        given = {k: v["value"] for k, v in res.items()
-                 if isinstance(v, dict) and v.get("source") == "given"}
-        given = dict(sorted(given.items(), key=lambda kv: natural_key(kv[0])))
-        chips = [ui.chip(f"{k}={fmt_num(v) if not isinstance(v, (list, str)) else (v if len(str(v)) < 14 else str(v)[:12] + '…')}",
-                         "mono") for k, v in list(given.items())[:4]]
-        if len(given) > 4:
-            chips.append(ui.chip(f"+{len(given) - 4}"))
+    for (ds, arch, rid, _resj, vj, nd, ed, cov, cj, tj), res in zip(rows, resolved):
+        vary = sorted((p for p in varying if (res.get(p) or {}).get("value") is not None),
+                      key=natural_key)
+        # on a model's own page a run is what sets it apart from the others
+        # (its varying parameters); the content hash is the tooltip
+        run_cell = html.Span([ui.chip(f"{p}={param_value_str(res[p]['value'])}", "mono")
+                              for p in vary] or [html.Code(short_run(rid))],
+                             className="chips", title=f"run id {rid}")
         viol = json.loads(vj or "[]")
+        tags = json.loads(tj or "[]")
+        if viol:
+            check = ui.badge(f"{len(viol)} illegal", "bad")
+        elif "missing:run" in tags or "unreadable:run card" in tags:
+            check = html.Span(ui.badge("defaults assumed", "warn"),
+                              title="no readable run_*.json: the model card's "
+                                    "defaults stand in for the parameters")
+        else:
+            check = html.Span(ui.badge("matches card", "ok"),
+                              title="every parameter is one the model card "
+                                    "declares, within its constraints")
         costs = json.loads(cj or "{}")
-        cost_txt = [human_cost(unit, (costs.get(unit) or {}).get("total"))
-                    for unit in ("usd", "kwh", "time")
-                    if (costs.get(unit) or {}).get("known")]
-        # documents and coverage answer the same question — how much of the
-        # collection this run actually produced — so they share one cell
         docs = html.Span([human_count(nd),
                           html.Span(f" ({ui.pct(cov, 0)})", className="muted")
-                          if cov is not None else ""])
+                          if cov is not None else ""],
+                         title=(f"{nd:,} of {ed:,} documents of the evaluation "
+                                "split" if ed else f"{nd:,} documents"))
         trs.append([
-            ds, arch or "—", html.Code(rid[:12]),
-            html.Span(chips),
-            ui.badge(f"{len(viol)} illegal", "bad") if viol else ui.badge("valid", "ok"),
-            docs,
-            " · ".join(cost_txt) or "—",
+            ds, run_cell, arch_label(idx, arch), check, docs,
+            *[human_cost(u, (costs.get(u) or {}).get("total"))
+              if (costs.get(u) or {}).get("known") else "—" for u in units],
         ])
-    return ui.table(["Dataset", "Architecture", "Run", "Parameters",
-                     "Quality check", "Documents", "Total cost"],
-                    trs, num_cols={5})
+    n_bad = sum(1 for r in rows if json.loads(r[4] or "[]"))
+    n_ds = len({r[0] for r in rows})
+    heads = ["Dataset", "Run", "Architecture", "Check", "Documents"] + \
+        [UNIT_HEAD[u] for u in units]
+    table = ui.table(heads, trs, num_cols={4, *range(5, 5 + len(units))},
+                     nowrap_cols={3, 4, *range(5, 5 + len(units))})
+    constants = (html.Div([html.Span("Same in every run: ", className="muted small"),
+                           *[ui.chip(f"{k}={param_value_str(v)}", "mono")
+                             for k, v in sorted(common.items(),
+                                                key=lambda kv: natural_key(kv[0]))]],
+                          className="chips", style={"marginBottom": "8px"})
+                 if common else None)
+    summary = (f"{len(trs)} runs on {n_ds} dataset{'s' if n_ds > 1 else ''}"
+               + (f" · {n_bad} with illegal parameters" if n_bad else
+                  " · all match the card"))
+    return html.Div([html.Div(summary, className="muted small",
+                              style={"marginBottom": "6px"}),
+                     constants, ui.fold(table, len(trs), "Show the runs", limit=12)])
+
 
 
 def _quality_glance(model):
-    from ..naming import group_key, run_labels, run_rows
+    from ..naming import group_key, parse_group_key, run_labels, run_rows
     runs = db.q("SELECT DISTINCT dataset, arch, run_id FROM runs WHERE model=?",
                 model)
     if not runs:
@@ -119,8 +155,10 @@ def _quality_glance(model):
             lab = lab[len(name):].strip(" ·")
         return lab.strip("()") or rid[:10]
 
-    series_by_run: dict[str, dict] = {}
-    datasets = sorted({r[0] for r in runs})
+    from ..naming import encode_runs
+    enc = encode_runs(idx, [r for r in run_rows() if r["model"] == model])
+    by_run: dict[str, dict] = {}
+    datasets = sorted({r[0] for r in runs}, key=natural_key)
     for ds in datasets:
         anns = [r[0] for r in db.q(
             "SELECT DISTINCT ann_key FROM gold_agg WHERE dataset=? ORDER BY 1", ds)]
@@ -130,20 +168,52 @@ def _quality_glance(model):
         keys = [(model, a, rid) for d2, a, rid in runs if d2 == ds]
         sc = run_scores(ds, keys, ann, "f1", "O")
         for (m, a, rid), v in sc.items():
-            series_by_run.setdefault(short_label(a, rid), {})[ds] = \
-                (round(v["mean"], 3) if v["mean"] is not None else None)
-    if not series_by_run:
+            if v["mean"] is not None:
+                by_run.setdefault(group_key(m, a, rid), {})[ds] = round(v["mean"], 3)
+    if not by_run:
         return None
+    # a dot per run and dataset, dodged sideways inside the dataset's slot:
+    # position carries the score, the model's hue (lighter = another run)
+    # and the architecture's shape carry identity — no rainbow of bars
+    ordered = sorted(by_run, key=lambda k: natural_key(enc.get(k, {}).get("label", k)))
+    n = len(ordered)
+    width = min(0.7, 0.09 * n)
     series = []
-    for i, (lab, per_ds) in enumerate(
-            sorted(series_by_run.items(), key=lambda kv: natural_key(kv[0]))):
-        series.append({"name": lab, "x": datasets,
-                       "y": [per_ds.get(d) for d in datasets],
-                       "color": slot_color(i)})
-    spec = {"kind": "bar", "xlabel": "dataset", "ylabel": "F1@O (combined gold)",
-            "series": series}
-    return ui.card([ui.graph("md-quality", to_plotly(spec), 300)],
-                   title="Quality glance — F1@O per dataset and run")
+    for i, k in enumerate(ordered):
+        e = enc.get(k, {})
+        per_ds = by_run[k]
+        off = (i - (n - 1) / 2) * (width / max(1, n - 1)) if n > 1 else 0.0
+        lab = short_label(*parse_group_key(k)[1:])
+        xs = [j + off for j, d in enumerate(datasets) if d in per_ds]
+        ys = [per_ds[d] for d in datasets if d in per_ds]
+        series.append({"name": lab, "x": xs, "y": ys, "mode": "markers",
+                       "color": e.get("color"), "shape": e.get("shape", "circle"),
+                       "mpl_marker": e.get("mpl_marker", "o"), "size": 10,
+                       "edge": e.get("base"),
+                       "hover": [f"{lab}<br>{d}: F1@O = {per_ds[d]:.3f}"
+                                 for d in datasets if d in per_ds]})
+    top = max(max(s_["y"]) for s_ in series)
+    spec = {"kind": "scatter", "xlabel": "dataset",
+            "ylabel": "F1@O", "series": series, "size": "2col",
+            # from zero, so a 0.03 gap looks like 0.03 on every model's page
+            "yrange": [0, min(1.0, round(top * 1.15 + 0.005, 2)) or 1.0],
+            "xticks": {"vals": list(range(len(datasets))), "text": datasets},
+            "xrange": [-0.6, len(datasets) - 0.4],
+            "legend": "right" if n > 6 else "top",
+            "name": f"quality-{model}",
+            "caption": (f"F1@O of every run of {name} per dataset, against the "
+                        "union of the dataset's annotation sets (or its only "
+                        "one), macro-averaged over documents.")}
+    n_runs = len(ordered)
+    return ui.exportable(
+        "md-quality", spec,
+        html.Div([html.Div(f"{n_runs} run{'s' if n_runs > 1 else ''} of {name} on "
+                           f"{len(datasets)} dataset{'s' if len(datasets) > 1 else ''} · "
+                           "macro-averaged over documents · colour = run, "
+                           "shape = architecture", className="rq-head"),
+                  ui.graph("md-quality", to_plotly(spec), 320)],
+                 role="figure", **{"aria-label": f"F1@O of every run of {name}"}),
+        title="How it scores — F1@O per dataset")
 
 
 def _body(model):
@@ -161,13 +231,11 @@ def _body(model):
             ui.meta_chip("backend", mcard.backend) if mcard.backend else None,
             ui.meta_chip("params", human_count(mcard.n_parameters))
             if mcard.n_parameters else None,
-            *[ui.meta_chip("can", c) for c, on in caps.items() if on],
-            *[ui.meta_chip("lang", l) for l in mcard.languages],
-            *[ui.meta_chip("trained on", sup) for sup in mcard.supervision],
-            *[ui.meta_chip("domain", d.get("domain")) for d in mcard.domains
-              if d.get("domain")],
-            *[ui.meta_chip("sub-domain", d.get("sub-domain"))
-              for d in mcard.domains if d.get("sub-domain")],
+            _joined("can", [c for c, on in caps.items() if on]),
+            _joined("lang", mcard.languages),
+            _joined("trained on", mcard.supervision),
+            _joined("domain", [d.get("domain") for d in mcard.domains]),
+            _joined("sub-domain", [d.get("sub-domain") for d in mcard.domains]),
             *[ui.meta_chip("context", window_str(ps.tokenizer, ps.default, True))
               for ps in mcard.context_params() if "input" in ps.name
               and ps.default],
@@ -187,34 +255,49 @@ def _body(model):
 
     bibtex = refs.get("bibtex")
     bib_card = ui.card([
-        html.Div(bibtex, className="mono-block"),
-        html.Div([dcc.Clipboard(content=bibtex, title="copy BibTeX",
-                                className="btn small",
-                                style={"display": "inline-flex"}),
-                  html.Span("copy BibTeX", className="small muted")],
-                 className="flex", style={"marginTop": "8px"}),
+        dcc.Clipboard(content=bibtex, title="copy the BibTeX entry",
+                      className="btn small clip-btn clip-bib",
+                      style={"display": "inline-flex"}),
+        html.Details([html.Summary("Show the entry"),
+                      html.Div(bibtex, className="mono-block")],
+                     className="fold"),
     ], title="Reference") if bibtex else None
 
+    # what the reader came for first: who it is, how it scores, which runs
+    # say so; the schema and the reference are for checking
     return html.Div([
         header,
-        ui.card(_spec_table(mcard), title="Inference parameter schema"),
-        ui.card(_runs_table(scanner.cards(), model),
-                title="Runs found in the tree"),
         _quality_glance(model),
+        ui.card(_runs_table(idx, model), title="Runs"),
+        ui.card(_spec_table(mcard), title="Inference parameters (from the card)"),
         bib_card,
     ])
 
 
+def _joined(key, values):
+    """One chip per kind of fact: "lang en · fr · de", not three chips."""
+    vals = list(dict.fromkeys(str(v) for v in values if v))
+    return ui.meta_chip(key, " · ".join(vals)) if vals else None
+
+
 def register(app):
     @app.callback(Output("md-pick", "options"), Output("md-pick", "value"),
-                  Input("catalog-version", "data"), State("md-pick", "value"))
-    def refresh_models(_v, current):
+                  State("vis-models", "data"), Input("shown-models", "data"),
+                  Input("catalog-version", "data"),
+                  State("md-pick", "options"), State("md-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_models(visible, _shown, _v, cur_opts, current):
+        if not visible:
+            raise PreventUpdate
         opts = _model_options()
+        if cur_opts == opts and current:
+            raise PreventUpdate
         vals = {o["value"] for o in opts}
         value = current if current in vals else (opts[0]["value"] if opts else None)
         return opts, value
 
-    @app.callback(Output("md-body", "children"), Input("md-pick", "value"))
+    @app.callback(Output("md-body", "children"), Input("md-pick", "value"),
+                  prevent_initial_call=True)
     def body(model):
         if not model:
             return ui.empty_state("No models found — add model cards and scan.")

@@ -7,4 +7,4 @@ Dash app with entity explorers and five research-question workbenches with
 publication-grade LaTeX / PGF / PDF / PNG export.
 """
 
-__version__ = "1.5.0"
+__version__ = "1.0.0"

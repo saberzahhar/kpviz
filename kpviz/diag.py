@@ -16,7 +16,8 @@ _LEVEL_OK, _LEVEL_WARN, _LEVEL_INFO = "ok", "warn", "info"
 
 def _probe_stemmer():
     try:
-        import Stemmer  # noqa: F401
+        import importlib
+        importlib.import_module("Stemmer")
         return "PyStemmer (C)", _LEVEL_OK, ""
     except Exception:
         pass
@@ -59,9 +60,12 @@ def _probe_tokenizers():
 
 
 def _probe_tex():
-    for eng in ("lualatex", "xelatex", "pdflatex"):
-        if shutil.which(eng):
-            return f"{eng} available", _LEVEL_OK, "probed lazily on first export"
+    # same order as the export probe (pdflatex first), so the banner names
+    # the engine exports will actually try first
+    found = [eng for eng in ("pdflatex", "xelatex", "lualatex") if shutil.which(eng)]
+    if found:
+        return (", ".join(found), _LEVEL_OK,
+                "checked with a representative figure in the background at start-up")
     return ("none", _LEVEL_INFO,
             "PDF/PNG still export via Matplotlib; .pgf disabled")
 
@@ -87,7 +91,14 @@ def backends() -> dict:
 
 def print_banner(st) -> None:
     """Startup diagnostics on stdout (never during a scan)."""
-    b = backends()
+    from .db import mark_missing_optional_modules
+    b = dict(backends())
+    marked = mark_missing_optional_modules()
+    if marked:
+        b["optional"] = {"value": f"{', '.join(marked)} not installed — marked "
+                                  "absent for this process (faster DuckDB "
+                                  "queries; restart after installing them)",
+                         "level": "info", "note": ""}
     width = max(len(k) for k in b)
     for name, info in b.items():
         mark = {"ok": "·", "warn": "!", "info": "·"}[info["level"]]

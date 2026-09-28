@@ -9,7 +9,9 @@ This module turns those observations into per-run cost totals for every
 unit the architecture prices, without ever inventing data:
 
   * a variable is summed at its *declared* level when fully observed there,
-    falling back to the other level (flagged) when not;
+    else at the other level if *that* one is complete (flagged); only when
+    no level is complete is the best-covered one used, flagged partial —
+    and a partial total never enters a Pareto frontier (RQ4);
   * wall-clock time may be derived from batch timestamps as a last resort
     (flagged `derived_from_timestamps`);
   * a unit whose needed variables are simply not observed anywhere yields
@@ -52,17 +54,22 @@ def resolve_var_totals(arch: ArchCard,
         order = (["document", "batch"] if declared == "document"
                  else ["batch", "document"] if declared == "batch"
                  else (["document", "batch"] if d_n else ["batch", "document"]))
-        for lv in order:
-            cov = d_cov if lv == "document" else b_cov
-            s = d_sum if lv == "document" else b_sum
-            n = d_n if lv == "document" else b_n
-            if n > 0:
-                total, level = s, lv
-                if declared and lv != declared:
-                    flags.append(FLAG_FALLBACK_LEVEL)
-                if cov < 0.999:
-                    flags.append(FLAG_PARTIAL)
-                break
+        # the first *complete* level in preference order; only when no level
+        # is complete, the best-covered one (flagged partial). One document
+        # of ten reporting 2 s must not win over a complete batch total of 20 s
+        levels = [(lv, (d_cov, d_sum, d_n) if lv == "document" else (b_cov, b_sum, b_n))
+                  for lv in order]
+        seen = [(lv, c) for lv, c in levels if c[2] > 0]
+        pick = next(((lv, c) for lv, c in seen if c[0] >= 0.999), None)
+        if pick is None and seen:
+            pick = max(seen, key=lambda t: t[1][0])      # stable: order wins ties
+        if pick is not None:
+            lv, (cov, s, _n) = pick
+            total, level = s, lv
+            if declared and lv != declared:
+                flags.append(FLAG_FALLBACK_LEVEL)
+            if cov < 0.999:
+                flags.append(FLAG_PARTIAL)
         # last resort for wall time: derive it from batch timestamps
         if total is None and var == "time" and wall_from_timestamps:
             total, level = wall_from_timestamps, "batch"

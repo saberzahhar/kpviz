@@ -4,11 +4,13 @@ from __future__ import annotations
 import json
 
 from dash import Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
 from ..costs import cost_formula
+from ..naming import group_key, run_labels, run_rows
 from ..textproc import tokenizer_inner
-from ..util import fmt_num, human_cost, human_count, human_duration
+from ..util import UNIT_HEAD, human_cost, human_count
 
 
 def _canon(idx, token: str) -> str:
@@ -46,11 +48,10 @@ def _arch_options():
 
 def layout():
     return html.Div([
-        html.H2("Architectures", className="page-title"),
-        html.P("Where inference physically ran. Each card declares raw cost "
-               "variables (with a document or batch level) and linear rate "
-               "models per cost unit; run costs are resolved against these — "
-               "never invented.", className="page-desc"),
+        html.H1("Architectures", className="page-title"),
+        html.P("Where inference ran: the cost variables each card declares, "
+               "the rates that price them, and what its runs cost.",
+               className="page-desc"),
         ui.filter_row([
             ui.control("Architecture", dcc.Dropdown(
                 id="ar-pick", options=[], clearable=False,
@@ -70,11 +71,11 @@ def _body(token):
             ui.card([ui.badge("unresolved architecture", "warn"),
                      html.Span(f"  “{token}” matches no architectures/architecture.*.json "
                                "card. Runs under it stay fully usable for quality "
-                               "analysis; every cost is treated as unknown (drawn "
-                               "as dashed performance-only lines).",
+                               "analysis; every cost is unknown (Insights → Quality "
+                               "vs. cost lists them beside the figure).",
                                className="muted small")]),
             ui.card(ui.table(["Dataset", "Model", "Run"],
-                             [[d, idx.model(m).name, html.Code(r[:12])]
+                             [[d, idx.model(m).name, html.Code(r[:12], title=r)]
                               for d, m, r in runs]),
                     title=f"Runs on this token · {len(runs)}") if runs else None,
         ])
@@ -116,24 +117,21 @@ def _body(token):
             unit = html.Code(f"{unit}[{tokenizer_inner(spec['tokenizer'])}]")
         var_rows.append([html.Code(var), unit,
                          ui.badge(spec.get("level", "?"),
-                                  "info" if spec.get("level") == "document" else "warn"),
+                                  "info" if spec.get("level") == "document" else "gray"),
                          spec.get("description", "—")])
     vars_card = ui.card(ui.table(
         ["Variable", "Unit", "Level", "Description"], var_rows),
         title="Raw cost variables (declare-before-use)")
 
-    rate_rows = [[html.Code(unit), html.Code(cost_formula(ac, unit))]
-                 for unit in ac.cost_units]
-    rates_card = ui.card(ui.table(["Cost unit", "Linear model"], rate_rows),
-                         title="Rates — cost models")
-
     toks = _tokens_of(idx, token)
-    runs = db.q(f"""SELECT dataset, model, run_id, n_docs, costs, wall_s
+    runs = db.q(f"""SELECT dataset, model, arch, run_id, n_docs, costs
                     FROM runs WHERE arch IN ({','.join('?' * len(toks))})
                     ORDER BY dataset, model""", *toks)
+    labels = run_labels(idx, [r for r in run_rows() if r["arch"] in toks])
     totals: dict[str, float] = {}
     trs = []
-    for ds, m, rid, nd, cj, wall in runs:
+    example = None             # the largest priced run, as a worked example
+    for ds, m, a, rid, nd, cj in runs:
         costs = json.loads(cj or "{}")
         cells = []
         for unit in ac.cost_units:
@@ -141,36 +139,68 @@ def _body(token):
             if c and c.get("known"):
                 totals[unit] = totals.get(unit, 0.0) + (c["total"] or 0)
                 cells.append(human_cost(unit, c["total"]))
+                if nd and (example is None or nd > example[2]):
+                    example = (labels.get(group_key(m, a, rid), idx.model(m).name),
+                               ds, nd, unit, c["total"])
             else:
                 cells.append("—")
-        trs.append([ds, idx.model(m).name, html.Code(rid[:12]),
+        trs.append([ds, html.Span(labels.get(group_key(m, a, rid), idx.model(m).name),
+                                  title=f"run id {rid}"),
                     human_count(nd), *cells])
+
+    rate_rows = [[UNIT_HEAD.get(unit, unit), html.Code(cost_formula(ac, unit))]
+                 for unit in ac.cost_units]
+    worked = None
+    if example:
+        lab, ds, nd, unit, tot = example
+        worked = html.Div([
+            html.Span("Worked example: ", className="muted"),
+            f"{lab} on {ds} predicted {nd:,} documents → "
+            f"{human_cost(unit, tot)} in all, "
+            f"{human_cost(unit, tot * 1000 / nd)} per 1,000 documents."],
+            className="small worked")
+    rates_card = ui.card([ui.table(["Cost", "Linear model"], rate_rows), worked],
+                         title="Rates: how a run is priced")
+
     tiles = []
     for unit, tot in totals.items():
-        label = {"usd": "Total spend (USD)", "kwh": "Total energy (kWh)",
+        label = {"usd": "Total spend", "kwh": "Total energy",
                  "time": "Total wall time"}.get(unit, unit)
-        val = human_cost(unit, tot)
-        tiles.append(ui.stat_tile(label, val, f"across {len(runs)} runs"))
-    runs_card = ui.card(ui.table(
-        ["Dataset", "Model", "Run", "Documents", *ac.cost_units], trs,
-        num_cols=set(range(3, 4 + len(ac.cost_units)))),
-        title=f"Runs on this architecture · {len(runs)}") if runs else None
+        tiles.append(ui.stat_tile(label, human_cost(unit, tot),
+                                  f"across {len(runs)} run{'s' if len(runs) > 1 else ''}"))
+    n_m = len({m for _d, m, *_r in runs})
+    n_d = len({d for d, *_r in runs})
+    runs_card = ui.card([
+        html.Div(f"{len(trs)} run{'s' if len(trs) > 1 else ''} of {n_m} "
+                 f"model{'s' if n_m > 1 else ''} on {n_d} "
+                 f"dataset{'s' if n_d > 1 else ''}", className="muted small",
+                 style={"marginBottom": "6px"}),
+        ui.fold(ui.table(["Dataset", "Run", "Documents",
+                          *[UNIT_HEAD.get(u, u) for u in ac.cost_units]], trs,
+                         num_cols=set(range(2, 3 + len(ac.cost_units)))),
+                len(trs), "Show the runs", limit=12)],
+        title="Runs on this architecture") if runs else None
 
     return html.Div([header, ui.kpi_row(tiles) if tiles else None,
-                     html.Div([vars_card, rates_card], className="grid-2"),
-                     runs_card])
+                     runs_card,
+                     html.Div([rates_card, vars_card], className="grid-2")])
 
 
 def register(app):
     @app.callback(Output("ar-pick", "options"), Output("ar-pick", "value"),
-                  Input("catalog-version", "data"), State("ar-pick", "value"))
-    def refresh_archs(_v, current):
+                  State("vis-architectures", "data"), Input("shown-architectures", "data"),
+                  Input("catalog-version", "data"), State("ar-pick", "value"),
+                  prevent_initial_call=True)
+    def refresh_archs(visible, _shown, _v, current):
+        if not visible:
+            raise PreventUpdate
         opts = _arch_options()
         vals = {o["value"] for o in opts}
         value = current if current in vals else (opts[0]["value"] if opts else None)
         return opts, value
 
-    @app.callback(Output("ar-body", "children"), Input("ar-pick", "value"))
+    @app.callback(Output("ar-body", "children"), Input("ar-pick", "value"),
+                  prevent_initial_call=True)
     def body(token):
         if not token:
             return ui.empty_state("No architectures found — add cards and scan.")

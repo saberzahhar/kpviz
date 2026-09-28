@@ -33,6 +33,76 @@ def load_json(path: Path):
         return json.load(f)
 
 
+def strip_jsonc(text: str) -> str:
+    """Remove `//` and `/* */` comments outside JSON strings.
+
+    The README documents cards in JSONC (its architecture example carries a
+    `// usd = …` comment), so a card copied from the documentation must load.
+    Comment characters are replaced by spaces, keeping line/column positions
+    of any later parse error meaningful."""
+    out, i, n = [], 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def load_jsonc(path: Path):
+    """json.load that accepts JSONC comments (cards, run cards, batch meta)."""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        text = f.read()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(strip_jsonc(text))
+
+
+def as_lang_list(value) -> list[str]:
+    """A language declaration as a list: accepts "en", ["en"], None."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value if v]
+
+
+def declared_langs(obj: dict | None) -> list[str]:
+    """Languages declared on a card entry, section or annotation.
+
+    The contract spells it `languages` in cards and `language` in documents;
+    users mix both, so both are accepted everywhere."""
+    if not obj:
+        return []
+    return as_lang_list(obj.get("languages") or obj.get("language"))
+
+
 def line_chunks(path: Path, target: int) -> list[tuple[int, int]]:
     """Split a file into byte ranges of roughly `target` bytes, aligned on
     newline boundaries, so each range holds only whole lines."""
@@ -76,6 +146,10 @@ def human_duration(s: float | None) -> str:
         return f"{m} min {sec:02d} s"
     h, m = divmod(m, 60)
     return f"{h} h {m:02d} min"
+
+
+# a cost unit as a column header (the card's unit tokens are for machines)
+UNIT_HEAD = {"usd": "Cost (USD)", "kwh": "Energy (kWh)", "time": "Time"}
 
 
 def human_cost(unit: str, value) -> str:
@@ -136,6 +210,10 @@ def human_count(n) -> str:
     if n is None:
         return "—"
     n = float(n)
+    if abs(n) >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f} B"
+    if abs(n) >= 100_000_000:
+        return f"{n / 1_000_000:.0f} M"
     if abs(n) >= 1_000_000:
         return f"{n / 1_000_000:.2f} M"
     if abs(n) >= 10_000:
