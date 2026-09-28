@@ -1,7 +1,9 @@
 """Insights — five research-question workbenches with LaTeX/PGF export."""
 from __future__ import annotations
 
-from dash import ClientsideFunction, Input, Output, State, dcc, html
+import json
+
+from dash import MATCH, ClientsideFunction, Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 
 from .. import ui
@@ -9,45 +11,103 @@ from ..stats import ADJUST, ALPHAS, ALPHA_DEFAULT, RESAMPLES, alpha_str
 from .rq import rq1, rq2, rq3, rq4, rq5
 
 TABS = [
-    ("rq1", "Dataset correlation", rq1),
-    ("rq2", "Data quality & bias", rq2),
-    ("rq3", "Extractability & truncation", rq3),
-    ("rq4", "Cost–performance", rq4),
+    ("rq1", "Dataset agreement", rq1),
+    ("rq2", "Data quality", rq2),
+    ("rq3", "Context windows", rq3),
+    ("rq4", "Quality vs. cost", rq4),
     ("rq5", "Hyperparameters", rq5),
 ]
+
+# which Statistics settings each workbench actually uses: the others are
+# disabled (not merely dimmed) on that tab, and the summary says what applies
+APPLIES = {
+    "rq1": {"alpha", "adjust"},                 # own correlation, Fisher-z
+    "rq2": {"alpha", "family", "adjust", "ci", "resamples"},
+    "rq3": {"alpha", "family", "adjust", "ci", "resamples"},
+    "rq4": {"ci", "resamples"},                 # intervals only, no test
+    "rq5": {"alpha", "family", "adjust", "ci", "resamples"},
+}
 
 
 def layout():
     return html.Div([
-        html.H2("Insights", className="page-title"),
-        html.P("Five research questions. Pick a slice, read the figure, export "
-               "it: captions are written from the exact configuration.",
-               className="page-desc"),
+        html.H1("Insights", className="page-title"),
         html.Div(id="ins-banner", className="ins-banner", role="status",
                  style={"display": "none"}),
-        html.Div([html.Button(t, id=f"tab-{key}", role="tab",
+        # the tab strip stays in view while a workbench scrolls; the number
+        # is the paper's research question, so the default (RQ4) explains
+        # itself
+        html.Div([html.Button([html.Span(key.upper(), className="rq-num"), t],
+                              id=f"tab-{key}", role="tab",
                               className="rq-tab" + (" active" if key == "rq4" else ""),
-                              n_clicks=0)
-                  for key, t, _ in TABS], className="rq-tabs", role="tablist"),
-        # one inference procedure for every workbench: daggers, intervals,
-        # captions and exported tables all read these, so a paper cannot mix
-        # thresholds, tests or corrections. Folded: the defaults are right
-        # for most papers, and the summary says what is in force.
-        html.Details([
-            html.Summary(["Statistics", html.Span(id="stats-sum",
-                                                  className="stats-sum")],
-                         title="Applies to every workbench, its captions and "
-                               "its exported tables"),
-            html.Div([
-            html.Div([
-            ui.control("Significance level", dcc.Slider(
-                id="ins-alpha", min=0, max=len(ALPHAS) - 1, step=None,
-                marks={i: f"p<{alpha_str(a)}" for i, a in enumerate(ALPHAS)},
-                value=ALPHAS.index(ALPHA_DEFAULT),
-                included=False), 300),
+                              n_clicks=0, **{"aria-controls": f"panel-{key}"})
+                  for key, t, _ in TABS],
+                 className="rq-tabs", role="tablist",
+                 **{"aria-label": "Research questions"}),
+        _methods(),
+        *[html.Div(mod.layout(), id=f"panel-{key}", role="tabpanel",
+                   **{"aria-labelledby": f"tab-{key}"},
+                   style={"display": "block" if key == "rq4" else "none"})
+          for key, _, mod in TABS],
+    ], className="page")
+
+
+def _methods():
+    """One inference procedure for every workbench — daggers, intervals,
+    captions and exported tables all read it, so a paper cannot mix
+    thresholds, tests or corrections — folded behind a line that says what
+    is in force on this tab, with the reading guide in the same fold."""
+    def item(term, text):
+        return html.Div([html.Dt(term), html.Dd(text)], className="guide-item")
+    guide = html.Div([
+        html.Dl([
+            item("P/R/F1@k", "per document, then macro-averaged: "
+                 "P@k = tp / min(k, #predictions) (no padding), R@k = tp / "
+                 "#gold; @O cuts at the number of gold keyphrases, @M "
+                 "keeps every prediction."),
+            item("PRMU", "on stemmed words (Boudin & Gallina, 2021): "
+                 "Present — the words occur as a contiguous sequence, in "
+                 "order, within one section; Reordered — all occur, not as "
+                 "that sequence; Mixed — some; Unseen — none. A PRMU filter "
+                 "restricts the gold only: every prediction still counts."),
+            item("Matching", "predictions and gold NFKC-normalised, "
+                 "lowercased, split into Unicode words and Snowball-stemmed "
+                 "in their language; predictions de-duplicated keeping rank "
+                 "order, gold de-duplicated per annotation set; a repeated "
+                 "document or prediction line counts once."),
+        ], className="guide-col"),
+        html.Dl([
+            item("Rank-based", "the default for per-document scores "
+                 "(bounded, many ties): does one condition tend to score "
+                 "higher?"),
+            item("Mean-based", "tests the macro-average itself, the number "
+                 "a paper reports; with many documents the t approximation "
+                 "is usually adequate."),
+            item("Resampling", "fewer distributional assumptions: sign-flip "
+                 "permutation (approximate randomisation) and bootstrap, "
+                 "seeded from the data so the p-values are reproducible."),
+            item("Corrections", "a table tests many runs at once: Holm "
+                 "controls the family-wise error, Benjamini–Hochberg the "
+                 "false-discovery rate. Daggers follow the adjusted p."),
+            item("Reading", "a p-value says whether a difference is "
+                 "detectable, not how large it is: read it with the effect "
+                 "size and the interval."),
+        ], className="guide-col"),
+    ], className="guide-body")
+    return html.Details([
+        html.Summary([html.Span("Methods", className="fold-title"),
+                      html.Span(id="stats-sum", className="stats-sum")],
+                     title="Statistics applied to the workbench on screen, its "
+                           "captions and its exported tables"),
+        html.Div([
+            ui.control("Significance level", dcc.RadioItems(
+                id="ins-alpha", value=ALPHAS.index(ALPHA_DEFAULT),
+                options=[{"label": f"p < {alpha_str(a)}", "value": i}
+                         for i, a in enumerate(ALPHAS)],
+                className="segmented", inline=True), 300),
             ui.control("Tests", dcc.Dropdown(
                 id="ins-family", clearable=False, className="dash-dropdown",
-                value="rank", options=[
+                value="rank", searchable=False, options=[
                     {"label": "Rank-based — Wilcoxon · Mann–Whitney · Friedman",
                      "value": "rank"},
                     {"label": "Mean-based — paired t · Welch t · RM-ANOVA",
@@ -56,76 +116,24 @@ def layout():
                      "value": "resample"}]), 330),
             ui.control("Multiple comparisons", dcc.Dropdown(
                 id="ins-adjust", clearable=False, className="dash-dropdown",
-                value="holm",
+                value="holm", searchable=False,
                 options=[{"label": v, "value": k} for k, v in ADJUST.items()]),
                 220),
-            ], id="stats-tests", className="stats-group"),
             ui.control("Intervals", dcc.Dropdown(
                 id="ins-ci", clearable=False, className="dash-dropdown",
-                value="t", options=[
+                value="t", searchable=False, options=[
                     {"label": "95 % Student-t", "value": "t"},
                     {"label": "95 % bootstrap", "value": "bootstrap"},
                     {"label": "none", "value": "none"}]), 160),
             ui.control("Resamples", dcc.Dropdown(
                 id="ins-resamples", clearable=False, className="dash-dropdown",
-                value=RESAMPLES, options=[
+                value=RESAMPLES, searchable=False, options=[
                     {"label": f"{n:,}", "value": n}
                     for n in (1000, 5000, 10000)]), 110),
-            ], className="more-body"),
-        ], className="more-opts stats-fold"),
-        _guide(),
-        *[html.Div(mod.layout(), id=f"panel-{key}",
-                   style={"display": "block" if key == "rq4" else "none"})
-          for key, _, mod in TABS],
-    ], className="page")
-
-
-def _guide():
-    """Conventions and test choice, one click away — what a reviewer asks."""
-    def item(term, text):
-        return html.Div([html.Dt(term), html.Dd(text)], className="guide-item")
-    return html.Details([
-        html.Summary("How to read these results — metrics, tests, intervals"),
-        html.Div([
-            html.Dl([
-                item("P/R/F1@k", "per document, then macro-averaged: "
-                     "P@k = tp / min(k, #predictions) (no padding), R@k = tp / "
-                     "#gold; @O cuts at the number of gold keyphrases, @M "
-                     "keeps every prediction."),
-                item("PRMU", "on stemmed tokens (Boudin & Gallina, 2021): "
-                     "Present — the tokens occur as a contiguous sequence, "
-                     "in order, within one section; Reordered — all occur, "
-                     "not as that sequence; Mixed — some; Unseen — none. A "
-                     "PRMU filter restricts the gold only: every prediction "
-                     "still counts in P@k."),
-                item("Matching", "predictions and gold NFKC-normalised, "
-                     "lowercased, split into Unicode words (letters, digits "
-                     "and combining marks; one token per Chinese or Japanese "
-                     "character), Snowball-stemmed in their language; predictions "
-                     "de-duplicated keeping rank order, gold de-duplicated "
-                     "per annotation set; a repeated document or prediction "
-                     "line counts once (first line)."),
-            ], className="guide-col"),
-            html.Dl([
-                item("Rank-based", "robust default for per-document scores "
-                     "(bounded, many ties); tests whether one condition "
-                     "tends to score higher."),
-                item("Mean-based", "tests the macro-average itself — the "
-                     "number a paper reports; with hundreds of documents the "
-                     "t distribution is accurate."),
-                item("Resampling", "distribution-free: sign-flip "
-                     "permutation (the approximate-randomisation test of "
-                     "the NLP literature) and bootstrap; seeded from the "
-                     "data, so p-values are reproducible."),
-                item("Corrections", "a table tests many runs at once: Holm "
-                     "controls the family-wise error (default), Benjamini–"
-                     "Hochberg the false-discovery rate. Daggers follow "
-                     "the adjusted p; tables show both."),
-                item("Intervals", "95 % for each mean and each difference; "
-                     "effect sizes say how large, p-values only whether."),
-            ], className="guide-col"),
-        ], className="guide-body"),
-    ], className="guide")
+        ], className="more-body"),
+        html.Div(id="stats-scope", className="muted small stats-scope"),
+        guide,
+    ], className="more-opts stats-fold")
 
 
 def register(app):
@@ -154,9 +162,12 @@ def register(app):
             return "", {"display": "none"}
         return msg, {"display": "block"}
 
-    # what is in force, in one line, without a server round trip
+    # what is in force on this tab, in one line, and which settings do not
+    # apply here (disabled, with the reason) — no server round trip
     app.clientside_callback(
-        """function (a, fam, adj, ci, n) {
+        """function (a, fam, adj, ci, n, active) {
+            var applies = %s;
+            var ap = applies[active] || applies.rq2;
             var alphas = %s;
             var fams = {rank: "rank tests", mean: "mean tests",
                         resample: "resampling tests"};
@@ -164,31 +175,51 @@ def register(app):
                         none: "no correction"};
             var cis = {t: "95 %% t intervals", bootstrap: "95 %% bootstrap intervals",
                        none: "no intervals"};
-            return " · p < " + alphas[a] + " · " + (fams[fam] || fam) + " · "
-                   + (adjs[adj] || adj) + " · " + (cis[ci] || ci);
-        }""" % [alpha_str(a) for a in ALPHAS],
-        Output("stats-sum", "children"),
+            var parts = [];
+            if (ap.indexOf("alpha") >= 0) parts.push("p < " + alphas[a]);
+            if (ap.indexOf("family") >= 0) parts.push(fams[fam] || fam);
+            if (active === "rq1") parts.push("correlation tests");
+            if (ap.indexOf("adjust") >= 0) parts.push(adjs[adj] || adj);
+            if (active === "rq1") parts.push("Fisher-z intervals");
+            else if (ap.indexOf("ci") >= 0) parts.push(cis[ci] || ci);
+            if (active === "rq4") parts.push("no hypothesis test");
+            var scope = {
+              rq1: "Dataset agreement uses the correlation method chosen in the workbench and Fisher-z intervals; tests and intervals below do not apply to it.",
+              rq4: "Quality vs. cost plots intervals only: it runs no hypothesis test, so the level, tests and correction do not apply to it."
+            }[active] || "";
+            var alphaOpts = alphas.map(function (v, i) {
+              return {label: "p < " + v, value: i,
+                      disabled: ap.indexOf("alpha") < 0};
+            });
+            return [" · " + parts.join(" · "), scope, alphaOpts,
+                    ap.indexOf("family") < 0, ap.indexOf("adjust") < 0,
+                    ap.indexOf("ci") < 0,
+                    ap.indexOf("resamples") < 0 ||
+                      (ci !== "bootstrap" && fam !== "resample")];
+        }""" % (json.dumps({k: sorted(v) for k, v in APPLIES.items()}),
+                [alpha_str(a) for a in ALPHAS]),
+        Output("stats-sum", "children"), Output("stats-scope", "children"),
+        Output("ins-alpha", "options"), Output("ins-family", "disabled"),
+        Output("ins-adjust", "disabled"), Output("ins-ci", "disabled"),
+        Output("ins-resamples", "disabled"),
         Input("ins-alpha", "value"), Input("ins-family", "value"),
         Input("ins-adjust", "value"), Input("ins-ci", "value"),
-        Input("ins-resamples", "value"))
+        Input("ins-resamples", "value"), Input("ins-active", "data"))
 
-    # RQ4 tests nothing (it plots intervals only): the test controls say so
+    # a workbench with nothing to show hides its (empty) graph: the reason
+    # is in the scope line above it
     app.clientside_callback(
-        """function (active) {
-            var off = active === "rq4";
-            return [{opacity: off ? 0.45 : 1, display: "contents"},
-                    off ? "RQ4 runs no test: only the interval setting applies"
-                        : ""];
+        """function (fig) {
+            var empty = fig && fig.layout && fig.layout.meta === "empty";
+            return empty ? {display: "none"} : {};
         }""",
-        Output("stats-tests", "style"), Output("stats-tests", "title"),
-        Input("ins-active", "data"))
+        Output({"type": "rq-gwrap", "rq": MATCH}, "style"),
+        Input({"type": "rq-graph", "rq": MATCH}, "figure"))
 
-    # tab switches never reach the server: the clicked tab becomes active and
-    # its visibility store (appfactory's route) wakes that workbench only
+    # tab switches never reach the server: the clicked tab writes the URL
+    # hash, and appfactory's route() shows its panel and wakes it alone
     app.clientside_callback(
         ClientsideFunction(namespace="kpviz", function_name="tabs"),
-        [Output("ins-active", "data")]
-        + [Output(f"panel-{k}", "style") for k, _, _ in TABS]
-        + [Output(f"tab-{k}", "className") for k, _, _ in TABS],
+        Output("url", "hash"),
         [Input(f"tab-{k}", "n_clicks") for k, _, _ in TABS],
         prevent_initial_call=True)

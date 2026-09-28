@@ -4,18 +4,33 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
+    name: Python ${{ matrix.python }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
     env:
       KPVIZ_OFFLINE: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
           cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
       - name: TeX (venue classes and fonts the export tests compile against)
         run: |
           sudo apt-get update
@@ -23,9 +38,35 @@ jobs:
             texlive-latex-base texlive-latex-recommended texlive-latex-extra \
             texlive-fonts-recommended texlive-publishers texlive-xetex \
             texlive-luatex lmodern poppler-utils
-      - name: Python dependencies (the tested versions)
+      - name: KPViz and its test dependencies (the tested versions)
         run: pip install -r requirements-dev.txt -c constraints.txt
+      - name: The command line works
+        run: kpviz --version && python app.py --version
       - name: Static check
         run: python -m pyflakes kpviz tests tools app.py
       - name: Tests (no skips allowed for TeX or SciPy on this runner)
         run: python -m pytest tests -q -rs
+
+  package:
+    name: Wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: pip install build && python -m build
+      - name: The wheel carries the app's assets and the command
+        run: |
+          python - <<'EOF'
+          import glob, zipfile
+          names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist()
+          for need in ("kpviz/assets/kpviz.css", "kpviz/assets/route.js",
+                       "kpviz/assets/keys.js", "kpviz/cli.py"):
+              assert need in names, need
+          ep = [n for n in names if n.endswith("entry_points.txt")]
+          assert ep, "no entry points"
+          print("ok:", len(names), "files")
+          EOF

@@ -373,10 +373,11 @@ def gold_controls(prefix: str, include_prmu: bool = True):
 def systems_control(prefix: str, default: str = "model"):
     """One point per model (its best run on the selection) or every run."""
     return ui.control("Systems", dcc.RadioItems(
-        id=f"{prefix}-unit", value=default, className="kp-check kp-inline",
-        options=[{"label": " best run per model", "value": "model",
+        id=f"{prefix}-unit", value=default, className="segmented",
+        inline=True,
+        options=[{"label": "one per model (best run)", "value": "model",
                   "title": "each model's best-scoring run on this selection"},
-                 {"label": " every run", "value": "run"}]), 250)
+                 {"label": "every run", "value": "run"}]), 280)
 
 
 def best_per_model(keys: list[tuple], score) -> list[tuple]:
@@ -449,8 +450,21 @@ def metric_caption(measure: str, k: str, prmu: list[str], ann: str | None,
             f"{CONVENTIONS}.")
 
 
-def prmu_arg(prmu_sel: list[str]):
-    return None if (not prmu_sel or sorted(prmu_sel) == sorted(PRMU)) else prmu_sel
+def prmu_arg(prmu_sel: list[str] | None):
+    """None (no filter) for every class or an uninitialised control; the
+    selection otherwise. An *empty* selection is not "all": callers check
+    `prmu_empty` first and say so instead of scoring."""
+    if prmu_sel is None or sorted(prmu_sel) == sorted(PRMU):
+        return None
+    return list(prmu_sel)
+
+
+def prmu_empty(prmu_sel) -> bool:
+    return prmu_sel is not None and len(prmu_sel) == 0
+
+
+NO_PRMU = ("No keyphrase class is selected. Tick at least one of P, R, M, U "
+           "under Filters & settings.")
 
 
 def selected_runs(values: list[str]) -> list[tuple[str, str, str]]:
@@ -458,26 +472,51 @@ def selected_runs(values: list[str]) -> list[tuple[str, str, str]]:
 
 
 def rq_header(question: str, method: str):
+    """The question in plain words and one sentence of method; details live
+    in the caption and the Methods fold."""
     return html.Div([
-        html.Div(question, className="rq-question"),
-        html.Div(method, className="rq-method"),
+        html.H2(question, className="rq-question"),
+        html.P(method, className="rq-method"),
     ])
 
 
-def figure_block(rq: str, height: int = 470, with_table: bool = True):
-    """Graph + caption editor + export bar + optional table container.
+def figure_block(rq: str, height: int = 470, with_table: bool = True,
+                 title: str | None = None, label: str | None = None):
+    """Scope line + graph + export bar + optional table.
 
-    The graph and table sit under a loading overlay that appears only after
-    300 ms (fast updates never flash a spinner) and keeps the previous
+    The scope line above the graph names what the figure shows (metric,
+    datasets, how many systems, the filters in force), so a screenshot or a
+    projected figure identifies itself; with nothing to show it carries the
+    reason and the graph steps aside. The graph and table sit under a
+    loading overlay that appears only after 400 ms and keeps the previous
     figure readable underneath; the fig-sig store remembers, per browser
     tab, which view is already on screen."""
     kids = [
         dcc.Store(id={"type": "fig-sig", "rq": rq}),
-        ui.loading(ui.graph({"type": "rq-graph", "rq": rq}, height=height,
-                            grow=True)),
+        html.H3(title, className="panel-title") if title else None,
+        html.Div(id={"type": "rq-head", "rq": rq}, className="rq-head"),
+        html.Div(ui.loading(ui.graph({"type": "rq-graph", "rq": rq},
+                                     height=height, grow=True)),
+                 id={"type": "rq-gwrap", "rq": rq}, role="figure",
+                 **{"aria-label": label or title or "figure"}),
         ui.export_bar(rq),
     ]
     if with_table:
         kids.append(ui.loading(html.Div(id={"type": "rq-table", "rq": rq},
-                                        style={"marginTop": "14px"})))
-    return ui.card(kids)
+                                        className="rq-table")))
+    return ui.card([k for k in kids if k is not None])
+
+
+def scope_line(lead: str, *parts) -> html.Div:
+    """"F1@O · 3 datasets · 12 runs on all of them · author gold": what the
+    figure below shows, from the result itself (never from the controls)."""
+    rest = [p for p in parts if p]
+    return html.Div([html.B(lead)] + [html.Span(" · " + str(p)) for p in rest],
+                    className="scope")
+
+
+def empty_result(msg: str, hint: str | None = None) -> html.Div:
+    """Why there is no figure, and what to change — in place of the figure."""
+    return html.Div([html.Div(msg, className="empty-msg"),
+                     html.Div(hint, className="muted small") if hint else None],
+                    className="empty-result", role="status")

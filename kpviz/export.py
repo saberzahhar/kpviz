@@ -653,13 +653,14 @@ def snippets(spec: dict, caption: str | None = None) -> tuple[str, str, str]:
     w, h, pt = geometry(spec)
     size_txt = f"{w:.2f}×{h:.2f} in, {pt:g} pt"
     if status == "probing":
-        hint = (f"{size_txt} · checking TeX… (PNG is ready now; a PDF "
-                "requested before the check ends uses Matplotlib)")
+        hint = (f"Printed at {size_txt} · checking for TeX… (a PDF requested "
+                "before the check ends is drawn by Matplotlib)")
     elif use_pgf:
-        hint = f"{size_txt} · PGF typeset with {eng} · save files to {ref}.*"
+        hint = (f"Printed at {size_txt} · typeset with {eng} in your paper's "
+                f"fonts · the LaTeX snippet expects the files at {ref}.*")
     else:
-        hint = (f"{size_txt} · no working TeX — PDF exports use "
-                "Matplotlib's vector backend")
+        hint = (f"Printed at {size_txt} · PDF drawn by Matplotlib (install "
+                "TeX Live or MiKTeX to typeset figures in your paper's fonts)")
     return fig_tex, tab_tex, hint
 
 

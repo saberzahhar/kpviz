@@ -18,11 +18,12 @@ from dash.exceptions import PreventUpdate
 
 from ... import db, scanner, ui
 from ...metrics import memo, metric_label, paired, run_scores_many
-from ...naming import run_labels, run_rows, window_str
+from ...naming import CONDITION, run_labels, run_rows, window_str
 from ...stats import fmt_effect, p_str, sig_mark
 from ..insights_common import (ann_options, best_per_model,
                                datasets_with_runs, effective_runs, effect_cell,
-                               figure_block, gate, gold_controls,
+                               empty_result, figure_block, gate, gold_controls,
+                               gold_phrase, scope_line,
                                metric_caption, metric_control, models_control,
                                p_cells, p_headers, resolve_ann, rq_header,
                                runs_control, selected_runs, split_metric,
@@ -39,13 +40,12 @@ COND_WIN = "present gold inside the context window"
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("How much does a bounded input window cost?",
-                  "A model with a bounded window never reads the end of a long "
-                  "document. The same predictions are scored against every "
-                  "present keyphrase (class P) and against those that end "
-                  "inside the run's usable window (its own tokenizer); the gap "
-                  "is what the window costs. Below: scores along document "
-                  "length."),
+        rq_header("How does the input window change the eligible gold?",
+                  "The predictions stay fixed; they are scored against every "
+                  "present keyphrase and against those that end inside the "
+                  "run's input window. The gap is how much gold a bounded "
+                  "window puts out of reach — not a re-run of the model on "
+                  "truncated input."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds, value=_longest(ds),
@@ -55,9 +55,13 @@ def layout():
         ]),
         ui.more([*gold_controls(RQ, include_prmu=False), models_control(RQ),
                  runs_control(RQ, 460)]),
-        figure_block(RQ, height=360),
-        html.Div(style={"height": "10px"}),
-        figure_block(RQB, height=400),
+        figure_block(RQ, height=340, title="A · Present gold inside the window",
+                     label="Scores against all present gold and against the "
+                           "gold inside each run's window"),
+        html.Div(style={"height": "12px"}),
+        figure_block(RQB, height=380, title="B · Scores along document length",
+                     label="Scores by document length, with each run's "
+                           "input window"),
     ])
 
 
@@ -155,11 +159,11 @@ def register(app):
     @app.callback(
         Output({"type": "rq-graph", "rq": RQ}, "figure"),
         Output({"type": "fig-spec", "rq": RQ}, "data"),
-        Output({"type": "caption", "rq": RQ}, "value"),
+        Output({"type": "rq-head", "rq": RQ}, "children"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "rq-graph", "rq": RQB}, "figure"),
         Output({"type": "fig-spec", "rq": RQB}, "data"),
-        Output({"type": "caption", "rq": RQB}, "value"),
+        Output({"type": "rq-head", "rq": RQB}, "children"),
         Output({"type": "rq-table", "rq": RQB}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -178,12 +182,13 @@ def register(app):
         return (*_update(*inputs), sig)
 
     def _update(ds, metric, ann_choice, models_sel, runs_sel, unit, *stat_vals):
-        from ...figures import MUTED, to_plotly
+        from ...figures import MUTED, empty_figure, to_plotly
         from ...naming import encode_runs, group_key, legend_items
         measure, k = split_metric(metric)
-        empty = to_plotly({"kind": "bar", "series": []})
         if not ds:
-            return empty, None, "", None, empty, None, "", None
+            msg = empty_result("No dataset with runs yet — scan first.")
+            return (empty_figure(), None, msg, None,
+                    empty_figure(), None, None, None)
         idx = scanner.cards()
         cfg = stats_cfg(*stat_vals)
         alpha = cfg.alpha
@@ -282,7 +287,7 @@ def register(app):
         for (key, lim, present, trunc), st, p, pj in zip(runs_a, st_a, p_raw, p_adj):
             gk = group_key(*key)
             lab = labels.get(gk, key[0])
-            win_txt = window_str(*lim) if lim else "—"
+            win_txt = window_str(*lim) if lim else "no window"
             t = st["test"] or {}
             mark = sig_mark(pj, alpha)
             tm = st["m_win"]
@@ -324,8 +329,15 @@ def register(app):
                                 ci=(t.get("lo"), t.get("hi")))]
             cells += (p_cells(p, pj, cfg, applicable=bool(t))
                       + [effect_cell(t.get("effect"))])
-            table_rows.append([lab, win_txt] + [c[0] for c in cells])
             tex_rows.append([lab, win_txt] + [c[1] for c in cells])
+            if not lim:
+                # a sentence, not five dashes
+                table_rows.append([lab, html.Span(win_txt, className="muted"),
+                                   cells[0][0], ui.Wide(
+                                       "no window: every present keyphrase is "
+                                       "within reach, nothing to compare")])
+            else:
+                table_rows.append([lab, win_txt] + [c[0] for c in cells])
 
         def _n_txt(seen):
             if not seen:
@@ -343,9 +355,9 @@ def register(app):
         # the reference condition recedes (grey), the window condition
         # carries the accent: the eye reads the gap, not two loud bars
         ser = [{"name": name_all, "x": xs, "y": ys_all, "hover": hv_all,
-                "color": "#a3a29b", "err": err_all},
+                "color": CONDITION["context"], "err": err_all},
                {"name": name_win, "x": xs, "y": ys_win, "hover": hv_win,
-                "color": "#2a78d6", "text": marks, "err": err_win}]
+                "color": CONDITION["focus"], "text": marks, "err": err_win}]
         if horiz:
             ser = [dict(sr, x=sr["y"], y=sr["x"]) for sr in ser]
         specA = {
@@ -384,9 +396,27 @@ def register(app):
             ui.fold(ui.table(headers, table_rows,
                              num_cols=set(range(2, len(headers)))),
                     len(table_rows),
-                    f"Table · {len(table_rows)} runs · "
+                    f"Table · {len(table_rows)} "
+                    f"{'models' if unit != 'run' else 'runs'} · "
                     f"{sum(1 for m_ in marks if m_)} significant gaps"),
             stats_note(cfg, "paired", n_tests_a)])
+        # every run with a window scored the same with and without it: say
+        # so, or two identical bars per run read as a bug
+        gaps = [st_["m_win"] - st_["m_all"] for st_ in st_a
+                if st_["m_win"] is not None]
+        no_gap = bool(gaps) and all(abs(g_) < 1e-12 for g_ in gaps)
+        headA = scope_line(
+            f"{mlab} on {ds}, present gold only",
+            f"{len(runs_a)} {'models (best run each)' if unit != 'run' else 'runs'}",
+            f"n = {_n_txt(n_win_seen).strip(' ()').replace('n=', '')} documents "
+            "with present gold in the window" if n_win_seen else None,
+            gold_phrase(ann_choice, [ds]),
+            ("every document fits every window here: no gold is out of reach"
+             if no_gap else None))
+        if not runs_a:
+            headA = empty_result(
+                f"No selected run has present gold with a known position on {ds}.",
+                "Pick another dataset, or clear the model and run filters.")
 
         # ---- panel (b): length-binned curves ------------------------------
         # all gold here on purpose: this panel asks how the *whole* task degrades
@@ -396,6 +426,7 @@ def register(app):
         lens_cache: dict[str, "np.ndarray"] = {}
         runs_b = []
         default_tok = _default_tokenizer(ds)
+        words = None
         for key in keys:
             model, arch, run_id = key
             gk = group_key(*key)
@@ -412,18 +443,22 @@ def register(app):
             # document falls in
             PL = np.zeros(0, dtype=np.int64)
             PS = np.zeros(0, dtype=np.float64)
+            PW = np.zeros(0, dtype=np.int64)
             if per_doc is not None and len(per_doc) and len(lens):
+                if words is None:
+                    words = _doc_words(ds, per_doc.index)
                 L = lens[per_doc.ords]
-                ok = L >= 0
-                PL, PS = L[ok], per_doc.vals[ok]
+                W = words[per_doc.ords]
+                ok = (L >= 0) & (W >= 0)
+                PL, PS, PW = L[ok], per_doc.vals[ok], W[ok]
                 order = np.argsort(PL, kind="stable")
-                PL, PS = PL[order], PS[order]
-            runs_b.append((key, gk, lim, PL, PS))
+                PL, PS, PW = PL[order], PS[order], PW[order]
+            runs_b.append((key, gk, lim, PL, PS, PW))
 
         # documents that fit the window vs documents the model could not
         # have read in full: two independent groups
         def _stats_b(item):
-            _key, _gk, lim, PL, PS = item
+            _key, _gk, lim, PL, PS, _PW = item
             if not lim:
                 return None
             within, over = PS[PL <= lim[1]], PS[PL > lim[1]]
@@ -437,15 +472,16 @@ def register(app):
         pb_adj = cfg.adjust_all(pb_raw)
         n_tests_b = sum(p is not None for p in pb_raw)
         splitB_rows, splitB_tex = [], []
-        for (key, gk, lim, PL, PS), st, p, pj in zip(runs_b, st_b, pb_raw, pb_adj):
+        for (key, gk, lim, PL, PS, PW), st, p, pj in zip(runs_b, st_b, pb_raw, pb_adj):
             model = key[0]
             lab = labels.get(gk, model)
             # a run without a declared window still gets a row — it is
             # stated, not dropped, so the table's run list matches the figure
             if not lim:
                 blank = [value_cell(None)] * 3 + [("—", "—")] * (len(p_headers(cfg)) + 1)
-                splitB_rows.append([lab, html.Span("no window", className="muted")]
-                                   + [c[0] for c in blank])
+                splitB_rows.append([lab, html.Span("no window", className="muted"),
+                                    ui.Wide("reads every document whole: "
+                                            "nothing to split")])
                 splitB_tex.append([lab, "no window"] + [c[1] for c in blank])
             else:
                 t = st["test"] or {}
@@ -460,14 +496,28 @@ def register(app):
                                ci=(t.get("lo"), t.get("hi")))]
                 cells += (p_cells(p, pj, cfg, applicable=bool(t))
                           + [effect_cell(t.get("effect"))])
-                splitB_rows.append([lab, window_str(*lim)] + [c[0] for c in cells])
                 splitB_tex.append([lab, window_str(*lim)] + [c[1] for c in cells])
+                if len(w) and len(o):
+                    splitB_rows.append([lab, window_str(*lim)] + [c[0] for c in cells])
+                else:
+                    # one side is empty: say which, instead of a row of dashes
+                    splitB_rows.append([
+                        lab, window_str(*lim),
+                        cells[0][0] if len(w) else html.Span("none", className="muted"),
+                        cells[1][0] if len(o) else html.Span("none", className="muted"),
+                        ui.Wide("no test: every document is "
+                                + ("longer" if len(o) else "shorter")
+                                + " than the window")])
             n_pairs = len(PL)
             if n_pairs < 4:
                 continue
-            xs_b, ys_b, hv, eb = _length_bins(PL, PS, cfg)
+            # one length unit for every curve: words. Each run's window is
+            # converted with this dataset's measured tokens per word for its
+            # tokenizer (the table above tests with the exact token counts)
+            ow = np.argsort(PW, kind="stable")
+            xs_b, ys_b, hv, eb = _length_bins(PW[ow], PS[ow], cfg)
             for i in range(len(xs_b)):
-                hv[i] = (f"{lab}<br>~{xs_b[i]:.0f} tokens · n={hv[i]}<br>"
+                hv[i] = (f"{lab}<br>~{xs_b[i]:.0f} words · n={hv[i]}<br>"
                          f"{mlab} = {ys_b[i]:.3f} " + _ci_hover(eb[i]))
             e = enc.get(gk, {})
             seriesB.append({"name": lab, "x": xs_b, "y": ys_b,
@@ -476,12 +526,17 @@ def register(app):
                             "mpl_marker": e.get("mpl_marker", "o"),
                             "shape": e.get("shape", "circle"), "width": 2,
                             "dash": e.get("dash", "solid"),
-                            "band": eb if cfg.ci != "none" and len(runs_b) <= 4
+                            # bands for one or two curves only: more overlap
+                            # into grey mud
+                            "band": eb if cfg.ci != "none" and len(runs_b) <= 2
                             else None,
                             "legendgroup": model})
-            if lim and lim[1] not in used_tok:
+            ratio = _tokens_per_word(ds, lim[0]) if lim else None
+            if lim and ratio and lim[1] not in used_tok:
                 used_tok[lim[1]] = 1
-                vlines.append({"x": lim[1], "label": window_str(*lim),
+                vlines.append({"x": lim[1] / ratio,
+                               "label": f"≈{lim[1] / ratio:,.0f} words · "
+                                        + window_str(*lim),
                                "color": MUTED, "dash": True,
                                "shade_beyond": len(keys) == 1})
         xmax = max((max(s["x"]) for s in seriesB if s["x"]), default=0)
@@ -490,25 +545,25 @@ def register(app):
         methods_b = cfg.method_text("indep", n_tests_b)
         specB = {
             "kind": "line", "size": "2col", "xlabel": "document length "
-            "(each run's own tokenizer, equal-count bins)"
+            "(words, bins of about equal size)"
             # the axis label only names the window sizes; which run has which
             # window is spelled out in the caption (a list of run labels
             # overflowed the figure width)
-            + ("  ·  windows beyond axis: " + ", ".join(
-                (f"{x / 1000:.0f}k" if x >= 1000 else f"{x:g}")
-                for x in sorted({v["x"] for v in beyond}))
-               if beyond else ""), "ylabel": mlab,
+            + ("  ·  windows beyond the axis: " + ", ".join(
+                (f"≈{x / 1000:.0f}k" if x >= 1000 else f"≈{x:,.0f}")
+                for x in sorted({v["x"] for v in beyond})) + " words"
+               if beyond else ""), "ylabel": mlab, "hovermode": "x",
             "series": seriesB, "vlines": inside,
             "legend_items": legend_items(enc, [group_key(*key) for key in keys],
                                          lines=True),
             "name": f"length-curve-{ds}",
-            "caption": (f"{mlab} on {ds} across document-length bins "
-                        "(about equal-count bins over each run's own "
-                        "tokenizer counts — runs with different tokenizers "
-                        "are on different length scales; tied lengths share "
-                        "a bin and the longest documents are kept), against "
+            "caption": (f"{mlab} on {ds} across document-length bins in "
+                        "words (about equal-count bins; tied lengths share a "
+                        "bin and the longest documents are kept), against "
                         "all gold keyphrases. Dashed verticals mark each "
-                        "run's usable input window. This is an observational "
+                        "run's usable input window, converted to words with "
+                        f"the measured tokens per word of its tokenizer on "
+                        f"{ds}. This is an observational "
                         "association: longer documents also differ in domain, "
                         "annotation density and difficulty, so the change "
                         "past a window is not by itself a truncation effect. "
@@ -516,7 +571,7 @@ def register(app):
                            + "; ".join(v["label"] for v in beyond) + ". "
                            if beyond else "")
                         + (f"Shaded bands: {ci_txt}. "
-                           if ci_txt and len(runs_b) <= 4 else "")
+                           if ci_txt and len(runs_b) <= 2 else "")
                         + metric_caption(measure, k, None, ann_choice, [ds])),
         }
         headersB = (["Run", "Usable window",
@@ -534,15 +589,27 @@ def register(app):
                                     "their window"),
                             stats_note(cfg, "indep", n_tests_b)])
                   if splitB_rows else
-                  html.Div("no run on this dataset declares a context window, "
+                  html.Div("No run on this dataset declares an input window, "
                            "so no document can be called truncated.",
                            className="muted small"))
         capB = specB["caption"] + (
-            " The table splits each run's documents at its own window and "
-            f"compares the two groups ({methods_b}).")
+            " The table splits each run's documents at its own window, in "
+            f"its own tokens, and compares the two groups ({methods_b}).")
         specB["caption"] = capB
-        return (to_plotly(specA), specA, specA["caption"], tableA,
-                to_plotly(specB), specB, capB, tableB)
+        headB = scope_line(
+            f"{mlab} on {ds}, all gold",
+            f"{len(seriesB)} {'models (best run each)' if unit != 'run' else 'runs'}",
+            "by document length in words",
+            "dashed: each run's window" if vlines else "no run has a window",
+            gold_phrase(ann_choice, [ds]))
+        figA, figB = to_plotly(specA), to_plotly(specB)
+        if not runs_a:
+            figA, specA = empty_figure(), None
+        if not seriesB:
+            figB, specB = empty_figure(), None
+            headB = empty_result(
+                "Too few scored documents with a known length to draw curves.")
+        return (figA, specA, headA, tableA, figB, specB, headB, tableB)
 
 
 def _pmap(fn, items):
@@ -593,6 +660,33 @@ def _doc_lengths(ds: str, tokz: str, per_doc) -> "np.ndarray":
                 arr[o] = n
         return arr, arr.nbytes
     return memo(("rq3_lens", ds, tokz, len(index.ids)), build, sized=True)
+
+
+def _doc_words(ds: str, index) -> "np.ndarray":
+    """Document lengths in words aligned on the shared document index, −1
+    where unknown; memoised per catalog version."""
+    def build():
+        arr = np.full(len(index.ids), -1, dtype=np.int64)
+        got = db.qnp("SELECT doc_id, n_words FROM documents WHERE dataset=?", ds)
+        pos = index.pos
+        for d, n in zip(got["doc_id"].tolist(), got["n_words"].tolist()):
+            o = pos.get(d)
+            if o is not None and n is not None:
+                arr[o] = n
+        return arr, arr.nbytes
+    return memo(("rq3_words", ds, len(index.ids)), build, sized=True)
+
+
+def _tokens_per_word(ds: str, tokz: str) -> float | None:
+    """Measured tokens per word of `tokz` on this dataset (to draw a window
+    given in tokens on a word axis)."""
+    def build():
+        r = db.q1("""SELECT sum(t.n_tokens)::DOUBLE / nullif(sum(d.n_words), 0)
+                     FROM doc_tokens t JOIN documents d USING (dataset, doc_id)
+                     WHERE t.dataset=? AND t.tokenizer=? AND d.n_words > 0""",
+                  ds, tokz)
+        return float(r[0]) if r and r[0] else None
+    return memo(("rq3_tpw", ds, tokz), build)
 
 
 def _length_bins(PL, PS, cfg):

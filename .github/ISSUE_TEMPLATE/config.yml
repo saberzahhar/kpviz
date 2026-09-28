@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: The KPViz paper (JCDL '26)
+    url: https://doi.org/10.1145/3805696.3846518
+    about: How KPViz evaluates runs, and why.
+  - name: Security problem
+    url: https://github.com/saberzahhar/kpviz/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately.

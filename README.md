@@ -1,56 +1,54 @@
 # KPViz
 
-Evaluate keyphrase extraction and generation models on your own machine, and
-put the figures straight into your paper.
+Evaluate keyphrase extraction and generation models on your own data, and
+export the figures and tables for your paper.
 
-KPViz reads a folder of **cards** (datasets, models, architectures) and the
-**runs** produced with them. It scores every run, then serves a web app to
-explore the collections, compare models, answer five research questions with
-proper statistics, and export PDF/PGF/PNG figures and LaTeX tables with
-ready-written captions. Your files are never copied: KPViz keeps an index and
-statistics in DuckDB and reads documents in place.
+KPViz reads a folder of cards (datasets, models, architectures) and the runs
+produced with them, scores every run with the same conventions, and serves a
+local web app to inspect the collections, compare runs, test five research
+questions and export PDF/PGF/PNG figures and LaTeX tables with captions.
+Source files are read in place; an index and derived statistics are kept in
+DuckDB.
 
-**Paper:** Saber Zahhar, Christophe Rodrigues, Nédra Mellouli and Nicolas
-Travers. *KPViz: A Framework for Keyphrase Prediction Experiments.* JCDL '26.
+Paper: Zahhar, Rodrigues, Mellouli, Travers. *KPViz: A Framework for
+Keyphrase Prediction Experiments.* JCDL '26.
 [doi:10.1145/3805696.3846518](https://doi.org/10.1145/3805696.3846518) ·
-[demo video](https://youtu.be/WS2iCDfloYM) ·
-[code + demo data](https://doi.org/10.5281/zenodo.22789345)
+[video](https://youtu.be/WS2iCDfloYM) ·
+[code and demo data](https://doi.org/10.5281/zenodo.22789345)
 
-## Quick start
+## Run
 
 ```bash
 git clone https://github.com/saberzahhar/kpviz && cd kpviz
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-python tools/make_sample_data.py   # optional: a small generated tree in sample_data/
-python app.py                      # serves ./data, else ./sample_data
+./run.sh
 ```
 
-The browser opens on **Overview**. The first scan starts on its own; after
-that, **Scan for changes** re-derives only the files that changed.
+`run.sh` checks for Python 3.11 or newer, creates `.venv`, installs the
+dependencies (again only when they change), generates `sample_data/` if there
+is no `data/`, and opens the app in the browser. Arguments are passed on:
 
-To try the full demo (5 datasets, 7 models, 3 architectures, 75 runs),
-download the tree from [Zenodo](https://doi.org/10.5281/zenodo.22789345) and
-place it as `data/` at the repository root.
+```bash
+./run.sh --data /path/to/data --port 8050
+```
 
-Useful options (`python app.py --help` lists all):
-
-| Option | What it does |
+| Option | Effect |
 |---|---|
-| `--data PATH` | the data tree (default `./data`, else `./sample_data`) |
-| `--state PATH` | where the DuckDB store lives (default `.kpviz/` next to the data) |
-| `--workers N` | scan processes (default: every core) |
-| `--token-scope eval` | count model tokens on evaluation splits only (faster scans of huge training splits; default `all`) |
-| `--gold-scope all` | keep per-keyphrase gold rows for training splits too (default: evaluation splits) |
-| `--offline` | never use the network; uncached tokenizers become flagged approximations |
+| `--data PATH` | data tree (default `./data`, else `./sample_data`) |
+| `--state PATH` | DuckDB store (default `.kpviz/` next to the data) |
+| `--port N`, `--no-browser` | where to serve; do not open a browser |
+| `--workers N` | scan processes (default: all cores) |
+| `--token-scope eval` | model-token counts for evaluation splits only |
+| `--gold-scope all` | per-keyphrase gold rows for training splits too |
+| `--offline` | no network; uncached tokenizers become flagged approximations |
 
-Optional extras: a TeX distribution (PGF figures set in your paper's fonts;
-without it PDF/PNG still work), and `HF_TOKEN` in the environment for gated
-Hugging Face tokenizers (e.g. Llama). For a very large tree, derive it once
-without the UI: `python tools/scan_once.py --data PATH`.
+Manual install: `python -m venv .venv`, activate it, then
+`pip install -r requirements.txt -c constraints.txt` and `kpviz`.
+Optional: a TeX distribution for PGF export, and `HF_TOKEN` for gated
+Hugging Face tokenizers. The full demo tree (5 datasets, 7 models,
+3 architectures, 75 runs) is on
+[Zenodo](https://doi.org/10.5281/zenodo.22789345); place it as `data/`.
 
-## Your data
+## Data layout
 
 Everything is driven by the tree; nothing about your datasets, models or
 costs is hard-coded.
@@ -118,7 +116,7 @@ What KPViz does with them:
   validation) is shown as unknown.
 - **Costs** are the architecture's linear rates applied to the variables the
   runs report, per document or per batch. Nothing is invented: a cost that
-  cannot be resolved is drawn as "unknown", not zero.
+  cannot be resolved is listed as unknown, never drawn as zero.
 - **Tokenizers** are `transformers[<owner>/<repo>]`,
   `transformers[file:/path/tokenizer.json]` or `tiktoken[<encoding>]`
   (`llama3`, `llama-3.3` and similar names resolve to the Llama 3
@@ -132,39 +130,37 @@ What KPViz does with them:
 
 ## The app
 
-- **Overview** — scan with progress and ETA, catalog size, and one table of
-  everything that needs attention.
-- **Datasets** — per split: document lengths (in words or in any declared
-  model's tokens, against the models' input windows), PRMU classes,
-  keyphrase length and part-of-speech patterns; a document browser with the
-  gold, and "why did this run score this?" for any run and document.
-- **Models** and **Architectures** — the cards, their runs (checked against
-  the card), and costs.
-- **Insights** — five workbenches, each a figure, a table and an export:
-  1. Do datasets rank systems the same way? (correlation between benchmarks)
-  2. Does poor input data move the scores? (language mismatch, train–test
-     similarity)
-  3. How much does a bounded input window cost? (present gold inside vs.
-     beyond each model's window, and scores along document length)
-  4. What does a point of quality cost? (Pareto frontier in USD, kWh or time)
-  5. How do hyperparameters move the needle? (controlled sweeps)
+| Page | Content |
+|---|---|
+| Overview | scan progress, catalog, coverage (model × dataset), issues found in the data |
+| Datasets | lengths, PRMU classes, keyphrase length and POS per split; documents with the present gold marked; per-run score explanation |
+| Models, Architectures | cards, runs checked against the card, scores per dataset, costs |
+| Insights | five workbenches, each a figure, a table and an export |
 
-A model keeps one colour everywhere, its runs are lighter shades of it, and
-an architecture keeps one marker shape. Each workbench shows the few controls
-most people change; the rest are under *More options*.
+| | Workbench | Question |
+|---|---|---|
+| RQ1 | Dataset agreement | Do scores on one dataset track scores on another? |
+| RQ2 | Data quality | How do flagged documents change the score? |
+| RQ3 | Context windows | How much gold does a bounded input window put out of reach? |
+| RQ4 | Quality vs. cost | Which runs offer the best quality–cost trade-off? |
+| RQ5 | Hyperparameters | Does a hyperparameter change the score? |
 
-**Statistics** (one setting for all workbenches): rank tests (Wilcoxon,
-Mann–Whitney, Friedman), mean tests (paired t, Welch t, repeated-measures
-ANOVA) or resampling (permutation, bootstrap); Holm, Bonferroni or
-Benjamini–Hochberg correction; 95 % intervals; effect sizes. Verified against
-SciPy; resampled p-values are seeded from the data, so they are reproducible.
+![Quality vs. cost workbench](docs/img/insights.png)
 
-**Export**: PDF, PNG or the LaTeX `figure` snippet in one click; under
-*Caption & export options*, the paper style (article, *ACL, ACM, IEEE, LNCS,
-NeurIPS/ICLR), width, height, legend, PGF, a zip bundle, a booktabs table and
-a print-size preview. Figures are drawn at the venue's real column or text
-width, never rescaled. Captions are written from the exact configuration and
-stay editable.
+- **Encoding.** A model keeps one colour on every page and in every export;
+  its runs are shades of it; an architecture keeps one marker shape. PRMU
+  classes are green, yellow, orange and red (present → unseen).
+- **Interaction.** Hover a series to single it out, click a legend entry to
+  hide it, drag to zoom, double-click to reset. Each workbench has its own
+  URL (`/insights#rq1` … `#rq5`). **P** toggles presentation mode.
+- **Statistics.** One *Methods* setting for all workbenches: rank tests
+  (Wilcoxon, Mann–Whitney, Friedman), mean tests (paired t, Welch t,
+  RM-ANOVA) or resampling (permutation, bootstrap); Holm, Bonferroni or
+  Benjamini–Hochberg; 95 % intervals; effect sizes. Checked against SciPy.
+- **Export.** PDF, PNG, PGF, booktabs table or a zip bundle with
+  provenance, at the real column width of article, *ACL, ACM, IEEE, LNCS
+  or NeurIPS/ICLR. Captions are generated from the configuration and stay
+  editable.
 
 ## How scores are computed
 
@@ -193,33 +189,23 @@ stay editable.
   document predicted twice by a run, keeps its first line; both are counted
   (`duplicate_doc_ids`, `duplicate_docs`).
 
-Every caption states these conventions, so a figure carries its method.
-
-## Scale
-
-A scan runs in parallel on every core and re-derives only what changed. On 4
-cores, 263 000 documents (430 MB) take about 60 s for the documents phase;
-exact model-token counts are the main extra cost on large training splits
-(`--token-scope eval` skips them outside evaluation splits). The UI reads
-precomputed aggregates, so pages stay interactive on millions of documents.
+Every caption states these conventions.
 
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt -c constraints.txt    # the tested versions
-python -m pytest tests -rs                                 # what CI runs on every push
-python tools/bench/profile_scan.py --data TREE --state /tmp/p   # per-function scan profile
-python tools/bench/probe_ui.py http://127.0.0.1:8050      # callbacks and latency of a running app
-python tools/synth_tree.py --cards MY_CARDS --out synth    # synthetic documents and runs around your cards
+pip install -r requirements-dev.txt -c constraints.txt
+python -m pyflakes kpviz tests tools app.py
+python -m pytest tests -q -rs
 ```
 
-The tests generate their own data, check every SQL score against an
-independent implementation and a hand-computed oracle, verify that worker
-count and incremental scans never change a number, and compile every export
-inside article, IEEEtran, llncs and acmart. Every export bundle carries a
-`provenance.json` (code, schema and catalog versions, input fingerprint).
-`tools/kpviz_scaling_benchmark.py` is the benchmark behind Table 2 of the
-paper; `docs/PERFORMANCE_PLAN.md` records the performance work.
+The tests generate their own data, check every score against an independent
+implementation, verify that worker count and incremental scans never change a
+number, and compile every export in article, IEEEtran, llncs and acmart.
+[docs/architecture.md](docs/architecture.md) describes the scanner, the store
+and the app; [docs/design.md](docs/design.md) the interface conventions;
+[docs/demo.md](docs/demo.md) a five-minute demo. Contributions:
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Citation
 
@@ -237,4 +223,4 @@ paper; `docs/PERFORMANCE_PLAN.md` records the performance work.
 
 ## License
 
-See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE)

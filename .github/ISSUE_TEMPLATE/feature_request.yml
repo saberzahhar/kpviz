@@ -1,0 +1,19 @@
+name: Idea or request
+description: A question KPViz should answer, a figure, a data format.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What are you trying to find out or produce?
+      description: The research question or the figure for your paper, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: What do you do today?
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?

@@ -148,6 +148,10 @@ def human_duration(s: float | None) -> str:
     return f"{h} h {m:02d} min"
 
 
+# a cost unit as a column header (the card's unit tokens are for machines)
+UNIT_HEAD = {"usd": "Cost (USD)", "kwh": "Energy (kWh)", "time": "Time"}
+
+
 def human_cost(unit: str, value) -> str:
     """A cost as a human reads it: $0.09 · 0.39 kWh · 1 hr 07 min.
 
@@ -206,6 +210,10 @@ def human_count(n) -> str:
     if n is None:
         return "—"
     n = float(n)
+    if abs(n) >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f} B"
+    if abs(n) >= 100_000_000:
+        return f"{n / 1_000_000:.0f} M"
     if abs(n) >= 1_000_000:
         return f"{n / 1_000_000:.2f} M"
     if abs(n) >= 10_000:

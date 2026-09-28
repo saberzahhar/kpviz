@@ -87,14 +87,33 @@ def arch_shape(arch: str) -> tuple[str, str]:
     return PLOTLY_SHAPES[i], MPL_SHAPES[i]
 
 
+# ---- PRMU: green → yellow → orange → red, by how much of the phrase the
+# document holds (P verbatim … U none of it). Validated as a set: lightness
+# band, chroma floor, colour-vision separation of neighbours (worst ΔE 13.5)
+# and normal-vision separation. Every chip also prints its letter, so the
+# class never rests on the colour alone (assets/kpviz.css mirrors these
+# values; a test keeps the two in step).
+PRMU_COLORS = {"P": "#2e9158", "R": "#d7ad1d", "M": "#d6601a", "U": "#a82424"}
+# ---- conditions compared inside one run (all documents vs. a subset, all
+# gold vs. the gold inside the window): neutral greys, darker = the subset
+# under test, so hue keeps meaning "which model" on every figure
+CONDITION = {"context": "#c2c1ba", "kept": "#8a8983", "focus": "#4d4c47"}
+
+PRMU_NAMES = {"P": "Present", "R": "Reordered", "M": "Mixed", "U": "Unseen"}
+
+
 # ---- splits: one colour and one order, everywhere ------------------------
 # A split means the same thing on every page, so it gets a fixed hue and a
 # fixed reading order (the pipeline order: you train, you tune, you test).
+# Validated as a categorical set on the light surface: lightness band,
+# chroma floor, colour-vision separation (worst pair ΔE 13.8, protan) and
+# 3:1 contrast all pass.
+_TRAIN, _VALID, _TEST = "#1a9e8f", "#c2761c", "#5b50c8"
 SPLIT_COLORS = {
-    "training": "#3AA6A0", "train": "#3AA6A0",
-    "validation": "#9B7EDE", "valid": "#9B7EDE", "val": "#9B7EDE",
-    "dev": "#9B7EDE", "development": "#9B7EDE",
-    "testing": "#5B8DEF", "test": "#5B8DEF", "eval": "#5B8DEF",
+    "training": _TRAIN, "train": _TRAIN,
+    "validation": _VALID, "valid": _VALID, "val": _VALID,
+    "dev": _VALID, "development": _VALID,
+    "testing": _TEST, "test": _TEST, "eval": _TEST,
 }
 _SPLIT_RANK = {
     "training": 0, "train": 0,
@@ -293,21 +312,37 @@ def encode_runs(idx: CardIndex, runs: list[dict]) -> dict[str, dict]:
     return out
 
 
-def legend_items(enc: dict[str, dict], keys=None, lines: bool = False) -> list[dict]:
+def arch_label(idx, token: str) -> str:
+    """How an architecture is named to a reader: its card's name ("OpenAI
+    API"), never the folder token; a run declared without one ("n.a") is
+    "no architecture"."""
+    from .cards import is_unknown_token
+    if is_unknown_token(token):
+        return "no architecture"
+    card = idx.arch(token) if idx is not None else None
+    return card.name if card is not None and card.known else token
+
+
+def legend_items(enc: dict[str, dict], keys=None, lines: bool = False,
+                 arch_names=None) -> list[dict]:
     """Legend entries for an encoding: one per model (its hue) and, when
     the marks come from several architectures, one per architecture (its
-    shape, in grey). `keys` restricts to the runs actually drawn."""
+    shape, in grey), each block under its own title so the legend teaches
+    the encoding. `keys` restricts to the runs actually drawn; `arch_names`
+    (a card index) gives architectures their card names."""
     vals = [enc[k] for k in (keys if keys is not None else enc) if k in enc]
     models: dict[str, dict] = {}
     for e in sorted(vals, key=lambda e: natural_key(e["model_name"])):
         models.setdefault(e["model"], {
             "name": e["model_name"], "color": e["base"], "group": e["model"],
-            "shape": "circle", "mpl_marker": "o", "line": lines})
+            "shape": "circle", "mpl_marker": "o", "line": lines,
+            "block": "model (colour)"})
     items = list(models.values())
     archs = {e["arch"]: (e["shape"], e["mpl_marker"]) for e in vals}
     if len(archs) > 1 and not lines:
         for a in sorted(archs, key=natural_key):
-            items.append({"name": a, "color": OTHER_GRAY, "group": f"arch:{a}",
-                          "shape": archs[a][0], "mpl_marker": archs[a][1],
-                          "line": False})
+            items.append({"name": arch_label(arch_names, a), "color": OTHER_GRAY,
+                          "group": f"arch:{a}", "shape": archs[a][0],
+                          "mpl_marker": archs[a][1], "line": False,
+                          "block": "architecture (shape)"})
     return items

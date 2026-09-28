@@ -1,8 +1,5 @@
-# Tests and benchmarks (not needed to run the app)
--r requirements.txt
-pytest>=8
-scipy>=1.11        # the statistics tests compare every kernel with SciPy (required, not skipped)
-pyflakes>=3.2      # CI static check
-psutil>=5.9        # tools/bench/scan_profile.py (RSS/PSS/USS per phase)
+# Tests and benchmarks (not needed to run the app): KPViz plus its "dev" extra.
+#   pip install -r requirements-dev.txt -c constraints.txt
+-e .[dev]
 # playwright>=1.45 # tools/bench/probe_ui.py, tools/screenshot.py (then: playwright install chromium)
 # nltk>=3.8        # tools/kpviz_scaling_benchmark.py (baselines)

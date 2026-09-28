@@ -1,9 +1,10 @@
-"""RQ4 — Cost–performance Pareto frontier.
+"""RQ4 — Which runs offer the best quality–cost trade-off?
 
 Only (model, architecture, run) triples present on every selected dataset
-enter the chart (consistent representation). Runs whose selected cost unit
-cannot be resolved anywhere are drawn as dashed performance-only lines;
-incomplete runs fade with their document coverage."""
+enter the chart (consistent representation). A run whose cost cannot be
+resolved is listed beside the figure, not drawn as a point it does not
+have; a run with a partial cost or missing documents is drawn open (as
+provisional) and never defines the frontier."""
 from __future__ import annotations
 
 from dash import Input, Output, State, dcc, html
@@ -13,12 +14,12 @@ from ... import scanner, ui
 from ...metrics import metric_label, run_scores_many
 from ...naming import (encode_runs, group_key, legend_items, run_labels,
                        run_rows)
-from ..insights_common import (ann_options, datasets_with_runs,
-                               default_datasets,
-                               effective_runs, figure_block, gate,
-                               gold_controls, metric_caption, metric_control,
-                               models_control, prmu_arg, resolve_ann,
-                               rq_header, runs_control, selected_runs,
+from ..insights_common import (NO_PRMU, ann_options, datasets_with_runs,
+                               default_datasets, effective_runs, empty_result,
+                               figure_block, gate, gold_controls, gold_phrase,
+                               metric_caption, metric_control, models_control,
+                               prmu_arg, prmu_empty, resolve_ann, rq_header,
+                               runs_control, scope_line, selected_runs,
                                split_metric, stats_cfg, stats_inputs,
                                value_cell, vis, shown)
 from .rq3 import _ci_hover
@@ -27,18 +28,16 @@ RQ = "rq4"
 
 UNIT_LABEL = {"usd": "cost (USD)", "kwh": "energy (kWh)",
               "time": "wall-clock time (s)"}
+UNIT_SHORT = {"usd": "USD", "kwh": "kWh", "time": "s"}
 
 
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("What does a point of quality cost?",
-                  "Each mark is one run (colour = model, shape = "
-                  "architecture), averaged over the selected datasets. The "
-                  "grey staircase is the Pareto frontier: nothing is both "
-                  "cheaper and better. Faded marks are provisional (partial "
-                  "cost or missing documents); dashed lines are runs whose "
-                  "cost is unknown."),
+        rq_header("Which runs offer the best quality–cost trade-off?",
+                  "Each mark is a run, averaged over the selected datasets; "
+                  "the grey staircase is the frontier of complete runs — no "
+                  "run is both cheaper and better than a point on it."),
         ui.filter_row([
             ui.control("Datasets", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds, value=default_datasets(3), multi=True,
@@ -47,27 +46,61 @@ def layout():
             ui.control("Cost", dcc.Dropdown(
                 id=f"{RQ}-unit",
                 options=[{"label": v, "value": u} for u, v in UNIT_LABEL.items()],
-                value="usd", clearable=False, className="dash-dropdown"), 170),
+                value="usd", clearable=False, searchable=False,
+                className="dash-dropdown"), 170),
         ]),
         ui.more([
-            ui.control("Normalisation", dcc.Dropdown(
+            ui.control("Cost basis", dcc.Dropdown(
                 id=f"{RQ}-norm",
                 options=[{"label": "per document", "value": "per_doc"},
-                         {"label": "total", "value": "total"}],
-                value="per_doc", clearable=False, className="dash-dropdown"), 150),
-            ui.control("x scale", dcc.Dropdown(
-                id=f"{RQ}-xscale", options=["linear", "log"], value="log",
-                clearable=False, className="dash-dropdown"), 110),
+                         {"label": "run total", "value": "total"}],
+                value="per_doc", clearable=False, searchable=False,
+                className="dash-dropdown"), 150),
+            ui.control("Cost axis", dcc.Dropdown(
+                id=f"{RQ}-xscale", options=[{"label": "log", "value": "log"},
+                                            {"label": "linear", "value": "linear"}],
+                value="log", clearable=False, searchable=False,
+                className="dash-dropdown"), 110),
             ui.control("Point labels", dcc.RadioItems(
-                id=f"{RQ}-labels", value="frontier", className="kp-check kp-inline",
-                options=[{"label": " frontier", "value": "frontier"},
-                         {"label": " all", "value": "all"},
-                         {"label": " none", "value": "none"}]), 220),
+                id=f"{RQ}-labels", value="frontier", className="segmented",
+                inline=True,
+                options=[{"label": "frontier", "value": "frontier"},
+                         {"label": "all", "value": "all"},
+                         {"label": "none", "value": "none"}]), 220),
             *gold_controls(RQ), models_control(RQ),
             runs_control(RQ, 460, "all consistent runs of the selected models"),
         ]),
-        figure_block(RQ, height=500),
+        figure_block(RQ, height=480,
+                     label="Quality against cost, one mark per run, with the "
+                           "Pareto frontier"),
     ])
+
+
+def cost_scale(values: list[float], norm: str) -> tuple[float, str]:
+    """(multiplier, basis) so that per-document costs read as ordinary
+    numbers — "USD per 1,000 documents" instead of 9.13e-06 per document.
+    Totals are left as they are."""
+    if norm != "per_doc":
+        return 1.0, "per run"
+    pos = sorted(v for v in values if v and v > 0)
+    if not pos:
+        return 1.0, "per document"
+    median = pos[len(pos) // 2]
+    for mult, basis in ((1.0, "per document"), (1e3, "per 1,000 documents"),
+                        (1e6, "per million documents")):
+        if median * mult >= 0.01:
+            return mult, basis
+    return 1e6, "per million documents"
+
+
+def fmt_cost(v, unit: str) -> str:
+    """Plain decimals with three significant digits, the unit's symbol."""
+    if v is None:
+        return "—"
+    txt = f"{v:,.3g}" if abs(v) >= 1e-3 or v == 0 else f"{v:.2g}"
+    if "e" in txt:                      # beyond any sensible scale
+        txt = f"{v:,.6f}".rstrip("0").rstrip(".")
+    return ("$" + txt) if unit == "usd" else f"{txt} {UNIT_SHORT.get(unit, unit)}"
 
 
 def _frontier(pts: list[tuple[float, float]]):
@@ -105,7 +138,7 @@ def register(app):
     @app.callback(
         Output({"type": "rq-graph", "rq": RQ}, "figure"),
         Output({"type": "fig-spec", "rq": RQ}, "data"),
-        Output({"type": "caption", "rq": RQ}, "value"),
+        Output({"type": "rq-head", "rq": RQ}, "children"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -127,17 +160,21 @@ def register(app):
 
     def _update(ds_sel, metric, prmu_sel, ann_choice, unit, norm, xscale,
                 models_sel, runs_sel, labels_on, *stat_vals):
-        from ...figures import to_plotly
+        from ...figures import empty_figure, to_plotly
         measure, k = split_metric(metric)
         ds_sel = ds_sel or []
-        empty = to_plotly({"kind": "scatter", "series": []})
         if not ds_sel:
-            return empty, None, "", html.Div("select at least one dataset",
-                                             className="muted small")
+            return (empty_figure(), None,
+                    empty_result("Pick at least one dataset."), None)
+        if prmu_empty(prmu_sel):
+            return empty_figure(), None, empty_result(NO_PRMU), None
         idx = scanner.cards()
         rows_meta = run_rows(ds_sel)
         chosen = effective_runs(ds_sel, models_sel, runs_sel, require_all=True)
-        eligible = chosen
+        if not chosen:
+            return (empty_figure(), None, empty_result(
+                f"No run is evaluated on all {len(ds_sel)} selected datasets.",
+                "Remove a dataset, or clear the model and run filters."), None)
         keys = selected_runs(chosen)
         prmu = prmu_arg(prmu_sel)
         shown = [r for r in rows_meta
@@ -163,16 +200,11 @@ def register(app):
         for r in rows_meta:
             run_info[(r["dataset"], r["model"], r["arch"], r["run_id"])] = r
 
-        series, hlines, table_rows = [], [], []
-        known_pts = []            # (x, perf, series index) — frontier candidates
-        n_provisional = 0
-        label_mode = ("all" if labels_on in (["y"], "all") else
-                      "none" if labels_on in ([], None, "none") else "frontier")
-        cost_vals = []
+        # pass 1: quality and cost per run
+        points, unknown = [], []
         for key in keys:
             gk = group_key(*key)
             lab = labels.get(gk, key[0])
-            e = enc.get(gk, {})
             perfs, costs_t, docs_t, covs, flags, complete_t = [], [], [], [], [], []
             per_ds_txt, per_doc_arrays = [], []
             ok = True
@@ -187,9 +219,8 @@ def register(app):
                     per_doc_arrays.append(sc["per_doc"].vals)
                 covs.append(info["coverage"] if info["coverage"] is not None else 1.0)
                 c = (info["costs"] or {}).get(unit)
-                per_ds_txt.append(f"{ds}: {sc['mean']:.3f}"
-                                  + (f" · {c['total']:.3g} {unit}"
-                                     if c and c.get("known") else " · cost —"))
+                per_ds_txt.append((ds, sc["mean"],
+                                   c["total"] if c and c.get("known") else None))
                 if c and c.get("known"):
                     costs_t.append(c["total"])
                     docs_t.append(info["n_docs"] or 0)
@@ -203,59 +234,82 @@ def register(app):
             perf = sum(perfs) / len(perfs)
             ci = cfg.macro_ci(per_doc_arrays) if want_ci else (None, None)
             cov = min(covs) if covs else 1.0
-            alpha = max(0.15, min(1.0, cov))
             cost_known = all(c is not None for c in costs_t)
             total = sum(costs_t) if cost_known else None
             x = None if total is None else (
                 (total / max(1, sum(docs_t))) if norm == "per_doc" else total)
-            if x is not None and xscale == "log" and x <= 0:
-                cost_known = False           # a zero cost has no log position
-                flags.append(f"zero {unit}: not placeable on a log axis")
-            if cost_known:
-                # a partial cost total, or a run that skipped documents, is
-                # not comparable to complete ones: shown, never on the frontier
-                provisional = not all(complete_t) or cov < 0.999
-                n_provisional += provisional
-                if not provisional:
-                    known_pts.append((x, perf, len(series)))
-                cost_vals.append(x)
-                hover = (f"<b>{lab}</b>" + (" (provisional)" if provisional else "")
-                         + f"<br>{mlab} = {perf:.3f} "
-                         + _ci_hover(ci) + "(macro over "
-                         f"{len(ds_sel)} datasets)<br>{UNIT_LABEL[unit]} = "
-                         f"{x:.3g} ({norm.replace('_', ' ')})<br>"
-                         f"coverage = {100 * cov:.0f}%<br>"
-                         + "<br>".join(per_ds_txt)
-                         + (("<br>⚠ " + ", ".join(sorted(set(flags))))
-                            if flags else ""))
-                series.append({
-                    "name": lab, "x": [x], "y": [perf],
-                    "color": e.get("color", "#2a78d6"),
-                    "shape": e.get("shape", "circle"),
-                    "mpl_marker": e.get("mpl_marker", "o"),
-                    "size": e.get("size", 10),
-                    "legendgroup": e.get("model"),
-                    "alpha": min(alpha, 0.35) if provisional else alpha,
-                    "text": [lab], "show_text": False,
-                    "hover": [hover], "in_legend": True,
-                    "err": [ci] if ci[0] is not None else None,
-                })
-                pc = value_cell(perf, None, ci=ci if ci[0] is not None else None)
-                note_bits = sorted(set(flags))
-                if provisional:
-                    note_bits.insert(0, "provisional: " + (
-                        "partial cost" if not all(complete_t) else
-                        f"{100 * cov:.0f}% coverage"))
-                table_rows.append([lab, pc, x, ui.pct(cov, 0),
-                                   ", ".join(note_bits) or "—"])
+            item = {"key": key, "gk": gk, "lab": lab, "perf": perf, "ci": ci,
+                    "cov": cov, "x": x, "flags": sorted(set(flags)),
+                    "complete": all(complete_t), "per_ds": per_ds_txt,
+                    "e": enc.get(gk, {})}
+            if not cost_known:
+                item["why"] = f"{UNIT_SHORT.get(unit, unit)} not resolvable"
+                unknown.append(item)
+            elif xscale == "log" and x <= 0:
+                # a real zero, not a missing cost: it has no place on a log
+                # axis, and the reader is told how to see it
+                item["why"] = "zero cost — switch the cost axis to linear"
+                unknown.append(item)
             else:
-                hlines.append({"y": perf, "label": f"{lab} — no {unit}",
-                               "color": e.get("base", "#898781"), "dash": True,
-                               "alpha": max(0.35, alpha)})
-                pc = value_cell(perf, None, ci=ci if ci[0] is not None else None)
-                table_rows.append([lab, pc, None, ui.pct(cov, 0),
-                                   ", ".join(sorted(set(flags))) or
-                                   f"no {unit} cost resolvable"])
+                points.append(item)
+        if not points and not unknown:
+            return (empty_figure(), None, empty_result(
+                "No selected run has scores on every selected dataset."), None)
+
+        mult, basis = cost_scale([p_["x"] for p_ in points], norm)
+        unit_txt = UNIT_LABEL.get(unit, unit).split(" (")[0]
+        axis_unit = f"{UNIT_SHORT.get(unit, unit)} {basis}"
+        label_mode = ("all" if labels_on in (["y"], "all") else
+                      "none" if labels_on in ([], None, "none") else "frontier")
+
+        # pass 2: marks. A partial cost total, or a run that skipped
+        # documents, is not comparable to complete ones: it is drawn open
+        # (provisional) and never defines the frontier
+        series, known_pts, table_rows = [], [], []
+        n_provisional = 0
+        for it in points:
+            x = it["x"] * mult
+            provisional = not it["complete"] or it["cov"] < 0.999
+            n_provisional += provisional
+            if not provisional:
+                known_pts.append((x, it["perf"], len(series)))
+            e = it["e"]
+            hover = (f"<b>{it['lab']}</b>" + (" (provisional)" if provisional else "")
+                     + f"<br>{mlab} = {it['perf']:.3f} " + _ci_hover(it["ci"])
+                     + f"(mean over {len(ds_sel)} datasets)<br>{unit_txt} = "
+                     + fmt_cost(x, unit) + f" {basis}<br>"
+                     + f"coverage {100 * it['cov']:.0f}%<br>"
+                     + "<br>".join(f"{d}: {m:.3f}"
+                                   + (f" · {fmt_cost(c, unit)} total"
+                                      if c is not None else "")
+                                   for d, m, c in it["per_ds"])
+                     + (("<br>⚠ " + ", ".join(it["flags"])) if it["flags"] else ""))
+            series.append({
+                "name": it["lab"], "x": [x], "y": [it["perf"]],
+                "color": e.get("color", "#2a78d6"),
+                "edge": e.get("base"),
+                "shape": e.get("shape", "circle"),
+                "mpl_marker": e.get("mpl_marker", "o"),
+                "size": e.get("size", 10), "open": provisional,
+                "legendgroup": e.get("model"),
+                "text": [it["lab"]], "show_text": False,
+                "hover": [hover], "in_legend": True,
+                "err": [it["ci"]] if it["ci"][0] is not None else None,
+            })
+            pc = value_cell(it["perf"], None,
+                            ci=it["ci"] if it["ci"][0] is not None else None)
+            notes = list(it["flags"])
+            if provisional:
+                notes.insert(0, "provisional: " + (
+                    "partial cost" if not it["complete"] else
+                    f"{100 * it['cov']:.0f}% of the documents"))
+            table_rows.append([it["lab"], pc, fmt_cost(x, unit),
+                               ui.pct(it["cov"], 0), ", ".join(notes) or "—"])
+        for it in unknown:
+            pc = value_cell(it["perf"], None,
+                            ci=it["ci"] if it["ci"][0] is not None else None)
+            table_rows.append([it["lab"], pc, "—", ui.pct(it["cov"], 0),
+                               ", ".join([it["why"]] + it["flags"])])
 
         fx, fy = _frontier([(x, y) for x, y, _i in known_pts])
         # labels: frontier points only by default (the rest on hover); points
@@ -279,56 +333,71 @@ def register(app):
                        else f"{names[0]} +{len(idxs) - 1}")
                 first["text"], first["show_text"] = [txt], True
 
-        # one number format per column: scientific throughout when any cost
-        # is below 10⁻³ (9.24e-06 next to 0.000471 read as different scales)
-        sci = any(0 < v < 1e-3 for v in cost_vals)
-        fmt_cost = (lambda v: "—" if v is None else
-                    (f"{v:.2e}" if sci else f"{v:.3g}"))
-        table_rows = [[r[0], r[1], fmt_cost(r[2]), *r[3:]] for r in table_rows]
-        enc_note = ("colour = model (lighter = another run of it), "
-                    "shape = architecture")
+        unknown_txt = ""
+        if unknown:
+            by_model: dict[str, list] = {}
+            for it in unknown:
+                by_model.setdefault(idx.model(it["key"][0]).name, []).append(it)
+            unknown_txt = "; ".join(
+                f"{m} ({len(v)} run{'s' if len(v) > 1 else ''}, "
+                f"{mlab} {min(i['perf'] for i in v):.3f}"
+                + (f"–{max(i['perf'] for i in v):.3f}" if len(v) > 1 else "")
+                + f", {v[0]['why']})" for m, v in sorted(by_model.items()))
         spec = {
             "kind": "scatter", "size": "2col", "xscale": xscale,
-            "xlabel": f"{UNIT_LABEL.get(unit, unit)} — "
-                      f"{'per document' if norm == 'per_doc' else 'total'}"
-                      + (", log scale" if xscale == "log" else ""),
-            "ylabel": f"{mlab} (macro over {len(ds_sel)} datasets)",
-            "series": series, "hlines": hlines,
-            "legend_items": legend_items(enc, [group_key(*key) for key in keys]),
+            "xplain": True,
+            "xlabel": f"{unit_txt}, {axis_unit}"
+                      + (" (log scale)" if xscale == "log" else ""),
+            "ylabel": f"{mlab} (mean over {len(ds_sel)} datasets)",
+            "series": series,
+            "legend_items": legend_items(enc, [it["gk"] for it in points],
+                                         arch_names=idx),
             "frontier": {"x": fx, "y": fy},
             "name": f"pareto-{unit}-{'-'.join(ds_sel)}",
-            "caption": (f"Cost–performance trade-off over {', '.join(ds_sel)}: "
-                        f"{mlab} macro-averaged across datasets against "
-                        f"{UNIT_LABEL.get(unit, unit)} "
-                        f"({'per document' if norm == 'per_doc' else 'run total'}, "
-                        f"resolved through each architecture's declared linear "
-                        f"rate model). Only (model, run) pairs evaluated on all "
-                        f"datasets are shown ({len(series) + len(hlines)}); "
-                        "dashed horizontal lines carry runs with no resolvable "
-                        "cost; marker transparency encodes document coverage"
-                        + (f"; {enc_note}" if enc_note else "") + ". The grey "
-                        "staircase is the Pareto frontier over runs with a "
-                        "complete cost and full coverage"
-                        + (f" ({n_provisional} provisional run(s), with a "
-                           "partial cost or missing documents, are drawn faded "
-                           "and excluded from it)" if n_provisional else "")
+            "caption": (f"Quality against {unit_txt} over {', '.join(ds_sel)}: "
+                        f"{mlab} averaged across datasets against "
+                        f"{unit_txt} ({axis_unit}, resolved through each "
+                        "architecture's declared linear rate model). Only runs "
+                        f"evaluated on all datasets are shown ({len(points)}); "
+                        "colour = model (lighter = another run of it), shape "
+                        "= architecture. The grey staircase is the Pareto "
+                        "frontier over runs with a complete cost and full "
+                        "coverage"
+                        + (f"; {n_provisional} provisional run(s), with a "
+                           "partial cost or missing documents, are drawn open "
+                           "and excluded from it" if n_provisional else "")
                         + (f"; vertical whiskers: {cfg.ci_text()} of the "
-                           "macro-average" if want_ci else "") + ". "
+                           "mean" if want_ci else "")
+                        + (f". Not drawn — {unit_txt} unknown: {unknown_txt}"
+                           if unknown else "") + ". "
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          ds_sel)),
         }
-        headers = ["Run", mlab, UNIT_LABEL.get(unit, unit), "Coverage", "Notes"]
+        headers = ["Run", mlab, f"{unit_txt} ({axis_unit})", "Coverage", "Notes"]
         spec["table"] = {"headers": headers,
                          "rows": [[r[0], r[1][1], *[str(c) for c in r[2:]]]
                                   for r in table_rows],
                          "label": f"pareto-{unit}"}
-        note = html.Div(
-            f"{len(eligible)} consistent (model, arch, run) triples across "
-            f"{len(ds_sel)} dataset(s); {len(hlines)} without resolvable "
-            f"{unit}.", className="muted small", style={"margin": "6px 0"})
         table = ui.table(headers, [[r[0], r[1][0], *r[2:]] for r in table_rows],
                          num_cols={1, 2, 3})
-        return (to_plotly(spec), spec, spec["caption"],
-                html.Div([note, ui.fold(table, len(table_rows),
-                                        f"Table · {len(table_rows)} runs · "
-                                        f"{len(fx)} on the frontier")]))
+        head = scope_line(
+            f"{mlab} against {unit_txt} {axis_unit}",
+            f"{len(ds_sel)} dataset{'s' if len(ds_sel) > 1 else ''}",
+            f"{len(points)} runs evaluated on all of them",
+            f"{len(fx)} on the frontier" if fx else None,
+            f"{n_provisional} provisional (drawn open)" if n_provisional else None,
+            "colour = model, shape = architecture",
+            gold_phrase(ann_choice, ds_sel))
+        side = (html.Div([html.B(f"Not drawn — {unit_txt} unknown: "),
+                          unknown_txt], className="small muted unknown-list")
+                if unknown else None)
+        if not points:
+            return (empty_figure(), None, empty_result(
+                f"No selected run has a known {unit_txt}.",
+                "Their scores are in the table; pick another cost unit, or "
+                "declare the missing variables in the architecture card."),
+                html.Div([side, table]))
+        return (to_plotly(spec), spec, html.Div([head, side]),
+                ui.fold(table, len(table_rows),
+                        f"Table · {len(table_rows)} runs · "
+                        f"{len(fx)} on the frontier"))

@@ -31,7 +31,8 @@ SURFACE = "#fcfcfb"
 PAGE = "#f9f9f7"
 INK = "#0b0b0b"
 INK2 = "#52514e"
-MUTED = "#898781"
+MUTED = "#898781"        # marks (rules, the frontier); never text
+TICK = "#64635f"         # axis and colour-bar text: 5.9:1 on the surface
 GRID = "#e1e0d9"
 BASELINE = "#c3c2b7"
 SEQ_RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
@@ -230,6 +231,12 @@ def place_labels(spec: dict, geom: str = "plotly") -> dict:
             # at least half a line box tall, so no label can run through a mark
             blocked.append((nx - 0.008, ny - line_h * 0.62,
                             nx + 0.008, ny + line_h * 0.62))
+        # the interval whiskers too: a label across one hides it
+        for xv, e in zip(s.get("x") or [], s.get("err") or []):
+            lo, hi = (e or (None, None))[:2] if e else (None, None)
+            nx, nlo, nhi = sx_(xv), sy_(lo), sy_(hi)
+            if None not in (nx, nlo, nhi):
+                blocked.append((nx - 0.006, min(nlo, nhi), nx + 0.006, max(nlo, nhi)))
     for h in spec.get("hlines") or []:
         ny = sy_(h.get("y"))
         if ny is None:
@@ -296,36 +303,71 @@ def _has_err(err) -> bool:
     return bool(err) and any(e and e[0] is not None for e in err)
 
 
+def _bar_gap(spec: dict) -> float:
+    """A gap that keeps each bar at most ~26 px wide on the plot's usual
+    width: three categories across a 1 000 px card otherwise draw 100 px
+    slabs that outweigh the data they carry."""
+    horiz = spec.get("orientation") == "h"
+    key = "y" if horiz else "x"
+    cats = {c for s_ in spec.get("series", []) for c in s_.get(key, [])}
+    n_cat = max(1, len(cats))
+    n_ser = 1 if spec.get("barmode") == "stack" else max(1, len(spec.get("series", [])))
+    width = 480.0 if spec.get("size") == "1col" else 1000.0
+    if horiz:
+        width = 26.0 * n_cat * n_ser / 0.65      # rows get the height they need
+    slot = width / n_cat
+    return round(min(0.85, max(0.3, 1 - 26.0 * n_ser / slot)), 3)
+
+
 def _plotly_layout(spec: dict) -> dict:
-    n_series = len(spec.get("legend_items") or spec.get("series", []))
+    items = spec.get("legend_items") or []
+    n_series = len(items or spec.get("series", []))
+    kind = spec.get("kind")
     show_legend = spec.get("show_legend",
-                           (n_series >= 2 or spec.get("kind") == "dumbbell")
-                           and spec.get("kind") != "heatmap")
+                           (n_series >= 2 or kind == "dumbbell")
+                           and kind != "heatmap")
+    # a legend with an architecture block says what each channel encodes
+    legend_title = spec.get("legend_title") or (
+        "colour = model · shape = architecture"
+        if any(i.get("block", "").startswith("architecture") for i in items)
+        else "")
+    horiz_bar = kind == "bar" and spec.get("orientation") == "h"
+    # gridlines on the value axis only: a line between two categories (or at
+    # every minor tick of a log axis) turns a plot into graph paper
+    x_grid = kind == "scatter" and not spec.get("xticks") or horiz_bar
+    y_grid = not horiz_bar and kind != "dumbbell"
     lay = dict(
         paper_bgcolor=SURFACE, plot_bgcolor=SURFACE,
-        font=dict(family=FONT_STACK, size=13, color=INK),
-        margin=dict(l=56, r=24, t=30 if spec.get("title") else 12, b=48),
+        font=dict(family=FONT_STACK, size=13.5, color=INK),
+        margin=dict(l=60, r=24, t=30 if spec.get("title") else 12, b=52),
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=12, color=INK2),
-                    title=dict(text=spec.get("legend_title") or "")),
-        xaxis=dict(title=dict(text=spec.get("xlabel") or "", font=dict(size=12, color=INK2)),
-                   gridcolor=GRID, gridwidth=1, zeroline=False,
+                    font=dict(size=12.5, color=INK2),
+                    # no title on screen: Plotly indents a horizontal row of
+                    # items by the title's width and the row overflows a
+                    # narrow card; the scope line above the figure says what
+                    # colour and shape encode (the exports keep the title)
+                    itemclick="toggle", itemdoubleclick="toggleothers"),
+        xaxis=dict(title=dict(text=spec.get("xlabel") or "", font=dict(size=13, color=INK2)),
+                   showgrid=x_grid, gridcolor=GRID, gridwidth=1, zeroline=False,
                    linecolor=BASELINE, linewidth=1,
-                   tickfont=dict(size=11, color=MUTED)),
-        yaxis=dict(title=dict(text=spec.get("ylabel") or "", font=dict(size=12, color=INK2)),
-                   gridcolor=GRID, gridwidth=1, zeroline=False,
+                   tickfont=dict(size=12, color=TICK)),
+        yaxis=dict(title=dict(text=spec.get("ylabel") or "", font=dict(size=13, color=INK2)),
+                   showgrid=y_grid, gridcolor=GRID, gridwidth=1, zeroline=False,
                    linecolor=BASELINE, linewidth=1,
-                   tickfont=dict(size=11, color=MUTED)),
+                   tickfont=dict(size=12, color=TICK)),
         hoverlabel=dict(bgcolor="#ffffff", bordercolor=GRID,
-                        font=dict(family=FONT_STACK, size=12, color=INK)),
+                        font=dict(family=FONT_STACK, size=12.5, color=INK)),
     )
+    if spec.get("hovermode") == "x":
+        lay["hovermode"] = "x unified"
     if spec.get("legend") == "right" and show_legend:
         # many series: a column beside the plot reads better than a block of
         # rows above it that eats half the height
         lay["legend"] = dict(orientation="v", yanchor="top", y=1, x=1.01,
-                             xanchor="left", font=dict(size=11, color=INK2),
-                             title=dict(text=spec.get("legend_title") or ""),
+                             xanchor="left", font=dict(size=12, color=INK2),
+                             title=dict(text=legend_title,
+                                        font=dict(size=11.5, color=TICK)),
                              groupclick="toggleitem")
         lay["margin"]["r"] = 12
     # axis scale only when explicitly requested (never force 'linear' onto
@@ -337,12 +379,22 @@ def _plotly_layout(spec: dict) -> dict:
         lay["xaxis"]["type"] = spec["xscale"]
     if spec.get("yscale"):
         lay["yaxis"]["type"] = spec["yscale"]
-    # log axes read 10^-6, not "1µ" dollars — and match the Matplotlib export
     for ax in ("xaxis", "yaxis"):
         if lay[ax].get("type") == "log":
-            lay[ax].update(exponentformat="power", showexponent="all")
+            # one tick and one gridline per decade; plain decimals when the
+            # values were scaled to a readable unit ("per 1,000 documents"),
+            # 10^n otherwise — the Matplotlib export does the same
+            lay[ax].update(dtick=1, minor=dict(showgrid=False))
+            if spec.get(ax[0] + "plain"):
+                lay[ax].update(exponentformat="none", tickformat=",~g")
+            else:
+                lay[ax].update(exponentformat="power", showexponent="all")
     # keep the user's zoom and legend toggles across updates of the same view
     lay["uirevision"] = spec.get("name") or spec.get("kind")
+    # a changed metric, cost unit or filter moves the marks to their new
+    # place instead of redrawing the plot (same traces only; Plotly skips it
+    # otherwise)
+    lay["transition"] = dict(duration=350, easing="cubic-in-out")
     if len(spec.get("series", [])) >= 2 and spec.get("barmode") == "stack":
         lay["legend"]["traceorder"] = "normal"
     if spec.get("title"):
@@ -355,18 +407,17 @@ def _plotly_layout(spec: dict) -> dict:
         lay["xaxis"]["range"] = spec["xrange"]
     if spec.get("yrange"):
         lay["yaxis"]["range"] = spec["yrange"]
-    if spec.get("kind") == "bar":
+    if kind == "bar":
         lay["barmode"] = spec.get("barmode", "group")
-        lay["bargap"] = 0.35
-        lay["bargroupgap"] = 0.12
-        if spec.get("orientation") == "h":
+        lay["bargap"] = _bar_gap(spec)
+        lay["bargroupgap"] = 0.1
+        if horiz_bar:
             cats = {c for s_ in spec.get("series", []) for c in s_.get("y", [])}
             lay["yaxis"]["autorange"] = "reversed"      # first run on top
-            lay["yaxis"]["tickfont"] = dict(size=11.5, color=INK2)
-            lay["yaxis"]["gridcolor"] = "rgba(0,0,0,0)"
-            n_s = max(1, len(spec.get("series", [])))
-            if len(cats) > 8:
-                lay["height"] = len(cats) * (9 * n_s + 10) + 150
+            lay["yaxis"]["tickfont"] = dict(size=12.5, color=INK2)
+            n_s = 1 if spec.get("barmode") == "stack" else max(1, len(spec.get("series", [])))
+            if len(cats) > 6:
+                lay["height"] = len(cats) * (12 * n_s + 12) + 150
     return lay
 
 
@@ -443,24 +494,42 @@ def to_plotly(spec: dict) -> go.Figure:
 
     if kind == "heatmap":
         h = spec["heat"]
-        colorscale = ([[0, DIV_LOW], [0.5, DIV_MID], [1, DIV_HIGH]]
-                      if h.get("diverging")
-                      else [[i / (len(SEQ_RAMP) - 1), c] for i, c in enumerate(SEQ_RAMP)])
-        text = h.get("text")
+        stops = ([DIV_LOW, DIV_MID, DIV_HIGH] if h.get("diverging") else SEQ_RAMP)
+        colorscale = [[i / (len(stops) - 1), c] for i, c in enumerate(stops)]
         fig.add_trace(go.Heatmap(
             z=h["z"], x=h["x"], y=h["y"],
             zmin=h.get("zmin"), zmax=h.get("zmax"), zmid=h.get("zmid"),
-            colorscale=colorscale, xgap=2, ygap=2,
-            text=text, texttemplate="%{text}" if text else None,
-            textfont=dict(size=11, color=INK),
+            colorscale=colorscale, xgap=3, ygap=3,
             customdata=h.get("customdata"),
             hovertemplate=h.get("hover", "%{y} × %{x}: %{z:.3f}<extra></extra>"),
-            colorbar=dict(thickness=10, outlinewidth=0,
-                          tickfont=dict(size=10, color=MUTED))))
+            # the colour bar sits under the matrix, where the eye already is
+            colorbar=dict(orientation="h", thickness=10, len=0.4, x=0.5,
+                          xanchor="center", y=-0.2, yanchor="top",
+                          outlinewidth=0, tickfont=dict(size=11, color=TICK))))
+        # cell text in white on dark cells, ink on light ones (a dark-blue
+        # cell with ink text is 4:1 at best)
+        zmin, zmax = h.get("zmin", 0), h.get("zmax", 1)
+        for i, row in enumerate(h.get("text") or []):
+            for j, t in enumerate(row):
+                if t in (None, ""):
+                    continue
+                v = (h["z"][i][j] if i < len(h["z"]) and j < len(h["z"][i])
+                     else None)
+                if v is None:
+                    col, frac = TICK, None
+                else:
+                    frac = (v - zmin) / (zmax - zmin) if zmax > zmin else 0.5
+                    col = "#ffffff" if _hex_dark(_ramp_at(stops, frac)) else INK
+                fig.add_annotation(x=h["x"][j], y=h["y"][i], text=str(t),
+                                   showarrow=False,
+                                   font=dict(size=14, color=col))
         # square cells: a 3 × 3 matrix is not a banner
         fig.update_yaxes(autorange="reversed", showgrid=False,
-                         scaleanchor="x", scaleratio=1, constrain="domain")
-        fig.update_xaxes(showgrid=False, constrain="domain")
+                         scaleanchor="x", scaleratio=1, constrain="domain",
+                         tickfont=dict(size=12.5, color=INK2))
+        fig.update_xaxes(showgrid=False, constrain="domain",
+                         tickfont=dict(size=12.5, color=INK2))
+        fig.update_layout(margin=dict(l=110, r=24, t=12, b=90))
         return fig
 
     if kind == "dumbbell":
@@ -474,12 +543,16 @@ def to_plotly(spec: dict) -> go.Figure:
                     x=[min(xs), max(xs)], y=[i, i], mode="lines",
                     line=dict(color=BASELINE, width=2),
                     showlegend=False, hoverinfo="skip"))
+        # the subsets of one row sit just above and below its line, so the
+        # three points and their whiskers never draw over each other
+        n_pts = len(points)
         for j, (kx, name, color) in enumerate(points):
+            off = (j - (n_pts - 1) / 2) * 0.16
             fig.add_trace(go.Scatter(
-                x=[r.get(kx) for r in rows], y=list(range(len(rows))),
+                x=[r.get(kx) for r in rows], y=[i + off for i in range(len(rows))],
                 mode="markers", name=name,
-                marker=dict(size=11, color=color,
-                            line=dict(color=SURFACE, width=2)),
+                marker=dict(size=10, color=color,
+                            line=dict(color=SURFACE, width=1.5)),
                 **({"error_x": dict(
                     type="data", symmetric=False, visible=True,
                     array=_err_arrays([r.get(kx) for r in rows],
@@ -495,9 +568,11 @@ def to_plotly(spec: dict) -> go.Figure:
                 hovertemplate="%{customdata}<extra>" + name + "</extra>"))
         fig.update_yaxes(tickvals=list(range(len(rows))), ticktext=ylabels,
                          showgrid=False, autorange="reversed",
-                         tickfont=dict(size=11.5, color=INK2))
-        if len(rows) > 12:          # one readable line per run
-            fig.update_layout(height=26 * len(rows) + 130)
+                         range=[len(rows) - 0.5, -0.5],
+                         tickfont=dict(size=12.5, color=INK2))
+        fig.update_xaxes(showgrid=True)
+        # 44 px per row: two rows no longer sit 300 px apart
+        fig.update_layout(height=max(180, 44 * len(rows) + 120))
         return fig
 
     # scatter / line / bar families ----------------------------------------
@@ -548,11 +623,15 @@ def to_plotly(spec: dict) -> go.Figure:
         mode = s.get("mode", "markers")
         if s.get("text") and s.get("show_text", True) and "text" not in mode:
             mode = mode + "+text"
-        marker = dict(size=s.get("size", 9),
+        # a light run of a model still reads: its mark is outlined in the
+        # model's full hue; a provisional mark is drawn open
+        edge = s.get("edge") or s.get("color", "#2a78d6")
+        opened = bool(s.get("open"))
+        marker = dict(size=s.get("size", 9) + (1 if opened else 0),
                       color=s.get("color", "#2a78d6"),
-                      symbol=s.get("shape", "circle"),
+                      symbol=s.get("shape", "circle") + ("-open" if opened else ""),
                       opacity=s.get("alpha", 1.0),
-                      line=dict(color=SURFACE, width=1.5))
+                      line=dict(color=edge, width=2 if opened else 1))
         line = dict(color=s.get("color", "#2a78d6"),
                     width=s.get("width", 1.8),
                     dash=_plotly_dash(s.get("dash")))
@@ -589,8 +668,8 @@ def to_plotly(spec: dict) -> go.Figure:
     if fr and fr.get("x"):
         fig.add_trace(go.Scatter(
             x=fr["x"], y=fr["y"], mode="lines", name="Pareto frontier",
-            line=dict(color=MUTED, width=1.4, shape="hv"),
-            opacity=0.85, showlegend=True, hoverinfo="skip"))
+            line=dict(color="#6f6e69", width=2, shape="hv"),
+            showlegend=True, hoverinfo="skip"))
 
     for hl in spec.get("hlines", []):
         fig.add_hline(y=hl["y"], line_color=hl.get("color", MUTED),
@@ -600,12 +679,14 @@ def to_plotly(spec: dict) -> go.Figure:
                       annotation_position="top left",
                       annotation_font=dict(size=11, color=INK2))
     for vl in spec.get("vlines", []):
+        # the label sits inside the plot, at the bottom: at the top it
+        # collided with the legend row
         fig.add_vline(x=vl["x"], line_color=vl.get("color", MUTED),
                       line_dash="dash" if vl.get("dash", True) else "solid",
                       line_width=1.4, opacity=vl.get("alpha", 0.9),
                       annotation_text=vl.get("label", ""),
-                      annotation_position="top",
-                      annotation_font=dict(size=11, color=INK2))
+                      annotation_position="bottom right",
+                      annotation_font=dict(size=11.5, color=INK2))
         if vl.get("shade_beyond"):
             xr = spec.get("xrange")
             x1 = xr[1] if xr else None
@@ -617,11 +698,46 @@ def to_plotly(spec: dict) -> go.Figure:
     return fig
 
 
+def empty_figure() -> go.Figure:
+    """No figure: no axes, no grid, nothing to misread as data. The
+    workbench hides the graph and shows the reason in its scope line."""
+    fig = go.Figure(layout=dict(paper_bgcolor=SURFACE, plot_bgcolor=SURFACE,
+                                meta="empty", xaxis=dict(visible=False),
+                                yaxis=dict(visible=False),
+                                margin=dict(l=0, r=0, t=0, b=0)))
+    return fig
+
+
 def plotly_config(name: str = "kpviz") -> dict:
-    return {"displaylogo": False,
-            "toImageButtonOptions": {"format": "png", "scale": 3,
-                                     "filename": name},
-            "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]}
+    """No mode bar: KPViz exports the publication figure itself (the camera
+    button would save the on-screen zoom instead, and the bar covered the
+    legend on hover). Double-click still resets a zoom."""
+    return {"displaylogo": False, "displayModeBar": False,
+            "scrollZoom": False, "doubleClick": "reset"}
+
+
+def _ramp_at(stops: list[str], t: float) -> str:
+    """The colour at t ∈ [0, 1] of a ramp of stops (linear in sRGB)."""
+    t = min(1.0, max(0.0, t))
+    pos = t * (len(stops) - 1)
+    i = min(len(stops) - 2, int(pos))
+    f = pos - i
+
+    def rgb(h):
+        h = h.lstrip("#")
+        return [int(h[k:k + 2], 16) for k in (0, 2, 4)]
+    a, b = rgb(stops[i]), rgb(stops[i + 1])
+    return "#" + "".join(f"{round(x + (y - x) * f):02x}" for x, y in zip(a, b))
+
+
+def _hex_dark(h: str) -> bool:
+    """Would white text read better than ink on this colour?"""
+    h = h.lstrip("#")
+    r, g, b = (int(h[k:k + 2], 16) / 255 for k in (0, 2, 4))
+    lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+           for c in (r, g, b)]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return lum < 0.2
 
 
 # ===========================================================================
@@ -725,7 +841,7 @@ def _mpl_rc(size, pgf: bool) -> dict:
         "axes.edgecolor": BASELINE, "axes.linewidth": 0.6,
         "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.5,
         "axes.axisbelow": True,
-        "xtick.color": MUTED, "ytick.color": MUTED,
+        "xtick.color": BASELINE, "ytick.color": BASELINE,
         "xtick.labelcolor": INK2, "ytick.labelcolor": INK2,
         "axes.labelcolor": INK2, "text.color": INK,
         "axes.spines.top": False, "axes.spines.right": False,
@@ -906,18 +1022,21 @@ def to_mpl(spec: dict, pgf: bool = False):
                 if len(xs) > 1:
                     ax.plot([min(xs), max(xs)], [i, i], color=BASELINE,
                             lw=1.4, zorder=1)
+            n_pts = len(points)
             for j, (kx, name, color) in enumerate(points):
+                off = (j - (n_pts - 1) / 2) * 0.16      # as on screen
+                yj = [y + off for y in ys]
                 errs = [(r.get("err") or {}).get(kx) for r in rows]
                 if _has_err(errs):
                     plus, minus = _err_arrays([r.get(kx) for r in rows], errs)
-                    ax.errorbar([_num(r.get(kx)) for r in rows], list(ys),
+                    ax.errorbar([_num(r.get(kx)) for r in rows], yj,
                                 xerr=[[_num(m) for m in minus],
                                       [_num(p) for p in plus]],
                                 fmt="none", ecolor=color, elinewidth=0.7,
                                 capsize=1.4, zorder=1 + j)
-                ax.scatter([_num(r.get(kx)) for r in rows], list(ys), s=42,
+                ax.scatter([_num(r.get(kx)) for r in rows], yj, s=36,
                            color=color, zorder=2 + j, label=name,
-                           edgecolors="white", linewidths=1.2)
+                           edgecolors="white", linewidths=1.0)
             ax.set_yticks(list(ys), [r["label"] for r in rows])
             ax.invert_yaxis()
             ax.grid(axis="y", visible=False)
@@ -1014,12 +1133,16 @@ def to_mpl(spec: dict, pgf: bool = False):
                             alpha=s.get("alpha", 1.0),
                             label=s.get("name", "") if s.get("in_legend", True) else None)
                 else:
+                    # outlined in the model's full hue; provisional = open
+                    opened = bool(s.get("open"))
+                    col = s.get("color", "#2a78d6")
                     ax.scatter(s["x"], s["y"],
                                s=(s.get("size", 9) ** 2) * 0.55,
-                               c=s.get("color", "#2a78d6"),
+                               c="none" if opened else col,
                                marker=s.get("mpl_marker", "o"),
                                alpha=s.get("alpha", 1.0),
-                               edgecolors="white", linewidths=1.0,
+                               edgecolors=s.get("edge") or col,
+                               linewidths=1.3 if opened else 0.8,
                                label=s.get("name", "") if s.get("in_legend", True) else None,
                                zorder=3)
                 if s.get("text") and s.get("show_text", True):
@@ -1035,16 +1158,24 @@ def to_mpl(spec: dict, pgf: bool = False):
                                     color=INK2)
             fr = spec.get("frontier")
             if fr and fr.get("x"):
-                ax.plot(fr["x"], fr["y"], drawstyle="steps-post", color=MUTED,
-                        lw=1.0, alpha=0.9, label="Pareto frontier", zorder=2)
+                ax.plot(fr["x"], fr["y"], drawstyle="steps-post", color="#6f6e69",
+                        lw=1.3, label="Pareto frontier", zorder=2)
             if spec.get("xscale") == "log":
                 ax.set_xscale("log")
-                ax.xaxis.set_major_formatter(_log_fmt())
+                if spec.get("xplain"):
+                    from matplotlib.ticker import FuncFormatter, NullFormatter
+                    ax.xaxis.set_major_formatter(
+                        FuncFormatter(lambda v, _p: f"{v:,g}"))
+                    ax.xaxis.set_minor_formatter(NullFormatter())
+                else:
+                    ax.xaxis.set_major_formatter(_log_fmt())
             if spec.get("yscale") == "log":
                 ax.set_yscale("log")
+            # gridlines on the value axis only (as on screen)
+            if kind == "line" or spec.get("xticks"):
+                ax.grid(axis="x", visible=False)
             if spec.get("xticks"):
                 ax.set_xticks(spec["xticks"]["vals"], spec["xticks"]["text"])
-                ax.grid(axis="x", visible=False)
             items = spec.get("legend_items") or []
             if items:
                 from matplotlib.lines import Line2D
@@ -1058,9 +1189,13 @@ def to_mpl(spec: dict, pgf: bool = False):
                                      drawstyle="steps-post"))
                     items = items + [{"name": "Pareto frontier"}]
                 if len(hs) >= 2:
+                    title = ("colour = model · shape = architecture"
+                             if any(str(it.get("block", "")).startswith("arch")
+                                    for it in items) else None)
                     _legend(ax, spec, len(hs), (0, 1.22),
                             2 if size == "1col" else 4,
-                            handles=hs, labels=[it["name"] for it in items])
+                            handles=hs, labels=[it["name"] for it in items],
+                            title=title)
             else:
                 handles, labels_ = ax.get_legend_handles_labels()
                 if len(labels_) >= 2:
@@ -1107,21 +1242,22 @@ def to_mpl(spec: dict, pgf: bool = False):
 
 
 def _legend(ax, spec: dict, n: int, anchor, ncols: int, handles=None,
-            labels=None):
+            labels=None, title=None):
     """Legend placement: above the axes (default), in a column to the right
     (many entries), or none (the caption carries it)."""
     where = spec.get("legend") or "auto"
     if where == "none":
         return
     hl = (handles, labels) if handles is not None else ()
+    tkw = dict(title=title, title_fontsize="x-small", alignment="left") if title else {}
     if where == "right":
         ax.legend(*hl, loc="upper left", bbox_to_anchor=(1.01, 1.0), ncols=1,
-                  fontsize="x-small", handlelength=1.6, borderaxespad=0)
+                  fontsize="x-small", handlelength=1.6, borderaxespad=0, **tkw)
         return
     rows = -(-n // max(1, ncols))
     ax.legend(*hl, loc="lower left", bbox_to_anchor=(0, 1.01), ncols=ncols,
               borderaxespad=0.2, handlelength=1.6, columnspacing=1.0,
-              fontsize="small" if rows > 2 else None)
+              fontsize="small" if rows > 2 else None, **tkw)
 
 
 def _log_fmt():

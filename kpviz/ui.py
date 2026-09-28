@@ -104,6 +104,14 @@ def meta_row(chips: list):
     return html.Div([c for c in chips if c is not None], className="mtag-row")
 
 
+class Wide:
+    """A table cell that fills the rest of its row: one sentence ("no
+    window: nothing to split") instead of a run of dashes."""
+
+    def __init__(self, child):
+        self.child = child
+
+
 def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
           row_ids: list | None = None, table_id: str | None = None,
           nowrap_cols: set[int] | None = None):
@@ -113,19 +121,25 @@ def table(headers: list, rows: list[list], num_cols: set[int] | None = None,
         html.Th(h, className="num" if i in num_cols else "")
         for i, h in enumerate(headers)]))
     body_rows = []
+    clickable = row_ids is not None and table_id is not None
     for ri, row in enumerate(rows):
-        tds = [html.Td(c if isinstance(c, (str, int, float)) or c is None
-                       else c, className=("num" if ci in num_cols else "")
-                       + (" nowrap" if ci in nowrap else ""))
-               for ci, c in enumerate(row)]
-        kw = {}
-        if row_ids is not None and table_id is not None:
-            # focusable and announced as a button; Enter/Space click it
-            # (assets/keys.js), so the keyboard reaches what the mouse does
-            kw = {"id": {"type": f"{table_id}-row", "key": str(row_ids[ri])},
-                  "className": "row-click", "n_clicks": 0, "tabIndex": 0,
-                  "role": "button"}
-        body_rows.append(html.Tr(tds, **kw))
+        cells = list(row)
+        if clickable and cells:
+            # the first cell holds a real button (keyboard, screen readers);
+            # the row stays a table row, and a click anywhere on it presses
+            # that button (assets/keys.js)
+            cells[0] = html.Button(cells[0], className="row-open", n_clicks=0,
+                                   id={"type": f"{table_id}-row",
+                                       "key": str(row_ids[ri])})
+        tds = []
+        for ci, c in enumerate(cells):
+            if isinstance(c, Wide):
+                tds.append(html.Td(c.child, colSpan=len(headers) - ci,
+                                   className="wide"))
+                break
+            tds.append(html.Td(c, className=("num" if ci in num_cols else "")
+                               + (" nowrap" if ci in nowrap else "")))
+        body_rows.append(html.Tr(tds, className="row-click" if clickable else None))
     # headers never wrap (they read as one phrase), so a wide table scrolls
     # inside its card instead of stretching the page
     return html.Div(html.Table([head, html.Tbody(body_rows)],
@@ -155,9 +169,9 @@ def section(title: str, note: str | None = None):
 
 
 def loading(child):
-    """Spinner overlay for real work only: shown after 300 ms, over the
+    """Spinner overlay for real work only: shown after 400 ms, over the
     previous content (kept visible, dimmed) rather than instead of it."""
-    return dcc.Loading(child, delay_show=300, type="dot", color="#2a78d6",
+    return dcc.Loading(child, delay_show=400, type="dot", color="#2a78d6",
                        overlay_style={"visibility": "visible",
                                       "opacity": 0.55})
 
@@ -173,15 +187,20 @@ def graph(id, figure=None, height: int = 420, config: dict | None = None,
                             else {"height": f"{height}px"}))
 
 
-def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
-    """One export bar per figure: the three exports people use (PDF, PNG,
-    the LaTeX figure snippet) in view; the caption, the paper and layout
-    options, the .pgf, the bundle, the LaTeX table and the print preview
-    folded under "Caption & options".
+def export_bar(rq: str, spec: dict | None = None, caption: str | None = None,
+               primary: bool = True):
+    """One export bar per figure: the three exports people use (Download
+    PDF, Download PNG, Copy LaTeX) in view, with a status line that answers
+    every click at once; the caption, the paper and layout options, the
+    .pgf, the bundle, the LaTeX table and the print-size preview folded
+    under "Caption & export options".
 
-    The figure/table spec is written to {'type':'fig-spec','rq':rq} by the
-    RQ callback — or given here for a figure drawn once (Datasets, Models);
-    global callbacks in appfactory handle rendering/downloads."""
+    Exports use the figure as computed (the publication specification),
+    not the on-screen zoom or hidden legend entries. The caption box is the
+    generated caption until someone edits it; an edited caption is never
+    overwritten by a recomputed figure (appfactory keeps it and offers the
+    new one). The spec is written to {'type':'fig-spec','rq':rq} by the
+    workbench callback — or given here for a figure drawn once."""
     clip_fig = clip_tab = hint = ""
     if spec:
         from .export import snippets
@@ -202,7 +221,7 @@ def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
                          className="dash-dropdown exp-dd")],
             className="exp-opt", style={"minWidth": f"{width}px"})
 
-    def clip(kind, label, title):
+    def clip(kind, title):
         # the label is drawn by CSS on the clipboard itself (::after), so a
         # click anywhere on the button copies
         return dcc.Clipboard(title=title, id={"type": f"exp-clip-{kind}", "rq": rq},
@@ -216,15 +235,27 @@ def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
         # fire the export callbacks of every workbench at page load
         dcc.Store(id={"type": "fig-spec", "rq": rq},
                   **({"data": spec} if spec else {})),
+        dcc.Store(id={"type": "cap-base", "rq": rq}),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
         html.Div([
-            b("pdf", "PDF", primary=True, title="vector PDF at the paper's size"),
-            b("png", "PNG", title="300 dpi PNG"),
-            clip("fig", "LaTeX", "copy the LaTeX figure environment"),
-            html.Span(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
-        ], className="export-bar"),
+            b("pdf", "Download PDF", primary=primary,
+              title="vector PDF at the paper's size, from the figure as "
+                    "computed (not the on-screen zoom)"),
+            b("png", "Download PNG", title="300 dpi PNG"),
+            clip("fig", "copy the LaTeX figure environment"),
+            html.Span(id={"type": "exp-status", "rq": rq}, className="exp-status",
+                      role="status", **{"aria-live": "polite"}),
+        ], id={"type": "exp-row", "rq": rq}, className="export-bar"),
         html.Details([
             html.Summary("Caption & export options"),
+            html.Div([
+                html.Span("Caption", className="exp-opt-label"),
+                html.Span(id={"type": "cap-note", "rq": rq}, className="cap-note",
+                          role="status", **{"aria-live": "polite"}),
+                html.Button("Restore the generated caption",
+                            id={"type": "cap-reset", "rq": rq},
+                            className="btn small ghost", n_clicks=0),
+            ], className="cap-head"),
             caption_editor(rq, caption or ""),
             html.Div([
                 opt("venue", "Paper", [{"label": v["label"], "value": k}
@@ -248,25 +279,29 @@ def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
                     {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
             ], className="exp-opts"),
             html.Div([
-                clip("tab", "LaTeX table", "copy the booktabs table"),
-                b("pgf", ".pgf", title="PGF picture, typeset by your paper"),
-                b("zip", "Bundle", title="PDF + PGF + PNG + .tex + data"),
-                html.Button("Preview", id={"type": "exp-prev", "rq": rq},
+                clip("tab", "copy the booktabs table"),
+                b("pgf", "Download .pgf", title="PGF picture, typeset by your paper"),
+                b("zip", "Download all formats",
+                  title="PDF + PGF + PNG + .tex + data + provenance"),
+                html.Button("Print-size preview", id={"type": "exp-prev", "rq": rq},
                             className="btn small ghost", n_clicks=0,
                             title="Show the exported figure at its printed size"),
             ], className="export-bar"),
+            html.Div(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
         ], className="exp-more"),
         loading(html.Div(id={"type": "exp-preview", "rq": rq},
                          className="exp-preview")),
-    ], className="exp-wrap")
+    ], id={"type": "exp-wrap", "rq": rq}, className="exp-wrap")
 
 
 def exportable(key: str, spec: dict, graph_component, title: str | None = None,
                **card_kw):
     """A card holding a figure drawn once (not by a workbench callback) with
-    its export bar (caption and options folded)."""
+    its export bar (caption and options folded; its PDF button is not the
+    page's primary action)."""
     return card([graph_component,
-                 export_bar(key, spec, caption=spec.get("caption", ""))],
+                 export_bar(key, spec, caption=spec.get("caption", ""),
+                            primary=False)],
                 title=title, **card_kw)
 
 
@@ -275,10 +310,11 @@ def caption_editor(rq: str, initial: str = ""):
     (n_blur), not on every keystroke; downloads read its current value."""
     return html.Div(dcc.Textarea(
         id={"type": "caption", "rq": rq}, value=initial,
-        placeholder="Caption used in exports…"), className="caption-box")
+        placeholder="Caption used in exports…"),
+        className="caption-box")
 
 
-def more(children, label: str = "More options", open_: bool = False):
+def more(children, label: str = "Filters & settings", open_: bool = False):
     """Secondary controls, folded: the page shows what most people change."""
     return html.Details([html.Summary(label),
                          html.Div(children, className="more-body")],

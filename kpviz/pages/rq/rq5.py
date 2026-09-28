@@ -20,12 +20,13 @@ from ...metrics import (PerDoc, common_ords, memo, metric_label,
 from ...naming import (DASHES, arch_shape, model_color, natural_key,
                        param_value_str, shade, value_key)
 from ...util import fmt_num
-from ..insights_common import (ann_options, effect_cell, figure_block, gate,
-                               gold_controls, metric_caption, metric_control,
-                               p_cells, p_headers, prmu_arg, resolve_ann,
-                               rq_header, split_metric, stats_cfg,
-                               stats_inputs, stats_note, value_cell, vis,
-                               shown)
+from ..insights_common import (NO_PRMU, ann_options, effect_cell,
+                               empty_result, figure_block, gate, gold_controls,
+                               gold_phrase, metric_caption, metric_control,
+                               p_cells, p_headers, prmu_arg, prmu_empty,
+                               resolve_ann, rq_header, scope_line,
+                               split_metric, stats_cfg, stats_inputs,
+                               stats_note, value_cell, vis, shown)
 from .rq3 import _ci_hover, _pmap
 
 RQ = "rq5"
@@ -87,12 +88,10 @@ def _runs_of(ds: str):
 
 def layout():
     return html.Div([
-        rq_header("How do hyperparameters move the needle?",
-                  "Runs grouped by the value of one inference parameter "
-                  "declared in the model cards (defaults fill the blanks). A "
-                  "controlled sweep compares runs that differ in this "
-                  "parameter alone; each row of the table is tested over the "
-                  "documents its values share."),
+        rq_header("Does a hyperparameter change the score?",
+                  "Runs that differ in one declared inference parameter "
+                  "alone, value by value; each row of the table tests whether "
+                  "the value matters on the documents all its values share."),
         ui.filter_row([
             ui.control("Parameter", dcc.Dropdown(
                 id=f"{RQ}-param", clearable=False,
@@ -106,16 +105,19 @@ def layout():
                 id=f"{RQ}-model", multi=True, placeholder="all models that vary it",
                 className="dash-dropdown"), 320),
             ui.control("Runs per value", dcc.RadioItems(
-                id=f"{RQ}-mode", value="controlled", className="kp-check kp-inline",
-                options=[{"label": " controlled sweep", "value": "controlled",
+                id=f"{RQ}-mode", value="controlled", className="segmented",
+                inline=True,
+                options=[{"label": "controlled sweep", "value": "controlled",
                           "title": "only runs that differ in this parameter "
                                    "alone; replicates averaged"},
-                         {"label": " best-run envelope", "value": "envelope",
+                         {"label": "best-run envelope", "value": "envelope",
                           "title": "the best run at each value, whatever else "
                                    "differs (descriptive)"}]), 300),
             *gold_controls(RQ),
         ]),
-        figure_block(RQ, height=420),
+        figure_block(RQ, height=400,
+                     label="Score by hyperparameter value, one line per "
+                           "configuration"),
     ])
 
 
@@ -178,7 +180,7 @@ def register(app):
     @app.callback(
         Output({"type": "rq-graph", "rq": RQ}, "figure"),
         Output({"type": "fig-spec", "rq": RQ}, "data"),
-        Output({"type": "caption", "rq": RQ}, "value"),
+        Output({"type": "rq-head", "rq": RQ}, "children"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -198,16 +200,17 @@ def register(app):
 
     def _update(param, models_sel, ds_sel, mode, metric, prmu_sel, ann_choice,
                 *stat_vals):
-        from ...figures import to_plotly
+        from ...figures import empty_figure, to_plotly
         measure, k = split_metric(metric)
-        empty = to_plotly({"kind": "bar", "series": []})
+        empty = empty_figure()
         var = _models_with_variation()
         if not param or not ds_sel:
-            return empty, None, "", html.Div(
-                "no inference parameter varies across any model's runs — "
+            return empty, None, empty_result(
+                "No inference parameter varies across any model's runs — "
                 "nothing to compare." if not var else
-                "pick a parameter and at least one dataset",
-                className="muted small")
+                "Pick a parameter and at least one dataset."), None
+        if prmu_empty(prmu_sel):
+            return empty, None, empty_result(NO_PRMU), None
         idx = scanner.cards()
         cfg = stats_cfg(*stat_vals)
         prmu = prmu_arg(prmu_sel)
@@ -321,13 +324,12 @@ def register(app):
                                     "illegal": illegal, "runs": rids}
                 cells[(ds, m, sig)] = by_value
         if not cells:
-            return (empty, None, "",
-                    html.Div(f"no configuration of the selected models varies "
-                             f"“{param}” alone on the selected datasets"
-                             + ("" if envelope else " — switch “Runs per value” "
-                                "to the best-run envelope to compare runs that "
-                                "also differ in other settings"),
-                             className="muted small"))
+            return (empty, None, empty_result(
+                f"No configuration of the selected models varies “{param}” "
+                "alone on the selected datasets.",
+                None if envelope else "Switch “Runs per value” (Filters & "
+                "settings) to the best-run envelope to compare runs that also "
+                "differ in other settings."), None)
 
         # every value seen anywhere, in value order — one column per value
         all_vals = {}
@@ -490,7 +492,8 @@ def register(app):
                        key=lambda m: natural_key(idx.model(m).name))
         spec = {
             "kind": "line", "size": "2col",
-            "xlabel": f"{param}" + (f"  ({' · '.join(rng)})" if rng else ""),
+            "xlabel": f"{param} — tested values, evenly spaced"
+                      + (f"  ({' · '.join(rng)})" if rng else ""),
             "xticks": {"vals": list(range(len(col_order))),
                        "text": [param_value_str(all_vals[vj]) for vj in col_order]},
             "xrange": [-0.4, len(col_order) - 0.6],
@@ -539,7 +542,19 @@ def register(app):
             "marks the highest (descriptive — the test asks whether the value "
             "matters at all).", className="muted small", style={"marginBottom": "6px"})
         n_sig = sum(1 for pj in p_adj if pj is not None and pj < cfg.alpha)
-        return (to_plotly(spec), spec, spec["caption"],
+        # the line's identity in words: with one model the legend is hidden,
+        # so the scope line names it (and the datasets behind each point)
+        names = [idx.model(m).name for m in drawn]
+        head = scope_line(
+            f"{mlab} by {param}",
+            ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else ""),
+            f"{len(series)} {'configuration' if not envelope else 'model'}"
+            f"{'s' if len(series) != 1 else ''}",
+            "mean over " + ", ".join(sorted(ds_sel)),
+            "controlled sweep" if not envelope else "best run per value",
+            f"{n_sig} of {tested} rows significant" if tested else None,
+            gold_phrase(ann_choice, sorted(ds_sel)))
+        return (to_plotly(spec), spec, head,
                 html.Div([note, ui.fold(ui.table(headers, trs,
                                                  num_cols=set(range(2, len(headers))),
                                                  nowrap_cols={0, 1}),

@@ -38,11 +38,11 @@ from .export import (export_bundle, export_name, fig_pdf, fig_pgf, fig_png,
 BUILD_ID = f"{__version__}+{uuid.uuid4().hex[:8]}"
 
 NAV = [
-    ("/", "Overview", "⌂"),
-    ("/datasets", "Datasets", "▤"),
-    ("/models", "Models", "◆"),
-    ("/architectures", "Architectures", "⚙"),
-    ("/insights", "Insights", "◈"),
+    ("/", "Overview", "home"),
+    ("/datasets", "Datasets", "data"),
+    ("/models", "Models", "model"),
+    ("/architectures", "Architectures", "chip"),
+    ("/insights", "Insights", "chart"),
 ]
 PAGES = [href for href, _l, _i in NAV]
 RQS = ["rq1", "rq2", "rq3", "rq4", "rq5"]
@@ -58,20 +58,26 @@ def vis_id(name: str) -> str:
 
 
 def _sidebar():
+    root = settings().data_root
     return html.Div([
+        html.A("Skip to content", href="#content", className="skip-link"),
         html.Div([
             html.Div(["KP", html.Span("Viz")], className="brand-name"),
-            html.Div("keyphrase evaluation cockpit", className="brand-sub"),
+            html.Div("keyphrase evaluation, from runs to paper",
+                     className="brand-sub"),
         ], className="brand"),
-        *[dcc.Link([html.Span(ico, className="nav-ico"), label],
-                   href=href, id=f"nav-{page_key(href)}",
-                   className="nav-link") for href, label, ico in NAV],
+        html.Nav([dcc.Link([html.Span(className=f"nav-ico i-{ico}",
+                                      **{"aria-hidden": "true"}), label],
+                           href=href, id=f"nav-{page_key(href)}",
+                           className="nav-link") for href, label, ico in NAV],
+                 className="nav", **{"aria-label": "Pages"}),
         html.Div([
-            html.Div(id="sidebar-scan", children=_sidebar_status()),
-            html.Div(str(settings().data_root), style={
-                "overflow": "hidden", "textOverflow": "ellipsis",
-                "whiteSpace": "nowrap", "marginTop": "4px"},
-                title=str(settings().data_root)),
+            # the catalog state first (what a glance should tell), then the
+            # data root by its last component — the full path is a tooltip
+            html.Div(id="sidebar-scan", children=_sidebar_status(),
+                     role="status", **{"aria-live": "polite"}),
+            html.Div(root.name or str(root), className="sidebar-root",
+                     title=str(root)),
         ], className="sidebar-foot"),
     ], className="sidebar")
 
@@ -85,7 +91,7 @@ def _sidebar_status():
     if snap.get("error"):
         return [html.Span(className="scan-dot err"), "last scan failed"]
     if snap.get("cancelled"):
-        return [html.Span(className="scan-dot"), "last scan cancelled"]
+        return [html.Span(className="scan-dot warn"), "last scan cancelled"]
     v = db.scan_version()
     return [html.Span(className="scan-dot ok" if v else "scan-dot"),
             f"catalog v{v}" if v else "no scan yet"]
@@ -95,11 +101,12 @@ def build_app() -> dash.Dash:
     from .pages import architectures, datasets, home, insights, models
 
     from pathlib import Path
-    assets = Path(__file__).resolve().parent.parent / "assets"
+    assets = Path(__file__).resolve().parent / "assets"
     app = dash.Dash(__name__, title="KPViz",
                     assets_folder=str(assets),
                     suppress_callback_exceptions=True,
-                    update_title="Updating… · KPViz")
+                    # no "Updating…" flicker in the browser tab on every click
+                    update_title=None)
     start_tex_probe()
     db.mark_missing_optional_modules()
     from .metrics import enable_warm, warm_async
@@ -131,11 +138,11 @@ def build_app() -> dash.Dash:
             dcc.Interval(id="scan-poll", interval=1000, n_intervals=0,
                          disabled=not running),
             _sidebar(),
-            html.Div([
+            html.Main([
                 html.Div([html.Div(pages[href](), id=f"page-{page_key(href)}",
                                    style={"display": "none"})
                           for href in pages]),
-            ], className="main"),
+            ], className="main", id="content", tabIndex=-1),
         ], className="app-frame")
 
     app.layout = layout
@@ -145,6 +152,8 @@ def build_app() -> dash.Dash:
     _install_timing(app)
 
     # ---- routing + visibility: entirely in the browser -------------------
+    # the Insights workbench is the URL hash (/insights#rq3): reloads, the
+    # Back button and pasted links all open the same one
     app.clientside_callback(
         ClientsideFunction(namespace="kpviz", function_name="route"),
         [Output(f"page-{page_key(h)}", "style") for h in PAGES]
@@ -152,8 +161,12 @@ def build_app() -> dash.Dash:
         + [Output(vis_id(page_key(h)), "data") for h in PAGES]
         + [Output(vis_id(rq), "data") for rq in RQS]
         + [Output(f"shown-{page_key(h)}", "data") for h in PAGES]
-        + [Output(f"shown-{rq}", "data") for rq in RQS],
-        Input("url", "pathname"), Input("ins-active", "data"),
+        + [Output(f"shown-{rq}", "data") for rq in RQS]
+        + [Output(f"panel-{rq}", "style") for rq in RQS]
+        + [Output(f"tab-{rq}", "className") for rq in RQS]
+        + [Output("ins-active", "data")],
+        Input("url", "pathname"), Input("url", "hash"),
+        State("ins-active", "data"),
         [State(vis_id(page_key(h)), "data") for h in PAGES]
         + [State(vis_id(rq), "data") for rq in RQS]
         + [State(f"shown-{page_key(h)}", "data") for h in PAGES]
@@ -304,9 +317,68 @@ def _register_exports(app):
             return "", "", ""
         return snippets(_with_opts(spec, *opts), caption)
 
+    # the caption box: the generated caption until someone edits it. A
+    # recomputed figure never overwrites an edit (the new generated caption
+    # is kept aside and one click restores it); with no figure, there is
+    # nothing to export and the bar steps aside
+    app.clientside_callback(
+        """function (spec, nReset, cur, base) {
+            var dc = window.dash_clientside, nu = dc.no_update;
+            var ctx = dc.callback_context;
+            var trig = (ctx.triggered && ctx.triggered.length)
+                       ? ctx.triggered[0].prop_id : "";
+            var wrap = spec ? {} : {display: "none"};
+            var gen = (spec && spec.caption) ? spec.caption : "";
+            if (trig.indexOf("cap-reset") >= 0) return [gen, gen, "", wrap];
+            if (!spec) return [nu, nu, nu, wrap];
+            var edited = !!cur && base !== null && base !== undefined &&
+                         cur !== base && cur !== gen;
+            if (edited) {
+                return [nu, gen, "edited — the figure changed since; " +
+                        "your caption is kept", wrap];
+            }
+            return [gen, gen, "", wrap];
+        }""",
+        Output({"type": "caption", "rq": MATCH}, "value"),
+        Output({"type": "cap-base", "rq": MATCH}, "data"),
+        Output({"type": "cap-note", "rq": MATCH}, "children"),
+        Output({"type": "exp-wrap", "rq": MATCH}, "style"),
+        Input({"type": "fig-spec", "rq": MATCH}, "data"),
+        Input({"type": "cap-reset", "rq": MATCH}, "n_clicks"),
+        State({"type": "caption", "rq": MATCH}, "value"),
+        State({"type": "cap-base", "rq": MATCH}, "data"))
+
+    # every export click is answered at once, in the browser; the server
+    # replaces the line when the file is ready (or says why it is not)
+    app.clientside_callback(
+        """function (clicks) {
+            var ctx = window.dash_clientside.callback_context;
+            if (!ctx.triggered || !ctx.triggered.length ||
+                !ctx.triggered[0].value) return window.dash_clientside.no_update;
+            var id = JSON.parse(ctx.triggered[0].prop_id.split(".")[0]);
+            var what = {pdf: "PDF", png: "PNG", pgf: ".pgf",
+                        zip: "all formats"}[id.what] || id.what;
+            return "Preparing " + what + "…";
+        }""",
+        Output({"type": "exp-status", "rq": MATCH}, "children", allow_duplicate=True),
+        Input({"type": "exp-btn", "rq": MATCH, "what": ALL}, "n_clicks"),
+        prevent_initial_call=True)
+    app.clientside_callback(
+        """function (nFig, nTab) {
+            var ctx = window.dash_clientside.callback_context;
+            var p = (ctx.triggered && ctx.triggered.length)
+                    ? ctx.triggered[0].prop_id : "";
+            return p.indexOf("exp-clip-tab") >= 0 ? "LaTeX table copied"
+                                                  : "LaTeX figure copied";
+        }""",
+        Output({"type": "exp-status", "rq": MATCH}, "children", allow_duplicate=True),
+        Input({"type": "exp-clip-fig", "rq": MATCH}, "n_clicks"),
+        Input({"type": "exp-clip-tab", "rq": MATCH}, "n_clicks"),
+        prevent_initial_call=True)
+
     @app.callback(
         Output({"type": "exp-dl", "rq": MATCH}, "data"),
-        Output({"type": "exp-hint", "rq": MATCH}, "children", allow_duplicate=True),
+        Output({"type": "exp-status", "rq": MATCH}, "children", allow_duplicate=True),
         Input({"type": "exp-btn", "rq": MATCH, "what": ALL}, "n_clicks"),
         State({"type": "fig-spec", "rq": MATCH}, "data"),
         State({"type": "caption", "rq": MATCH}, "value"),
@@ -319,30 +391,35 @@ def _register_exports(app):
         from .pages.insights_common import catalog_unavailable
         why = catalog_unavailable()
         if why:
-            return no_update, ("export paused — " + (
-                "a scan is updating the catalog" if why == "scanning" else
-                "the last scan did not complete; rescan first"))
+            return no_update, ("Export paused: " + (
+                "a scan is updating the catalog." if why == "scanning" else
+                "the last scan did not complete — scan again first."))
         spec = _with_opts(spec, *opts)
         if caption:
             spec["caption"] = caption
         slug, _ref = export_name(spec)
         try:
             if what == "png":
-                return dcc.send_bytes(fig_png(spec), f"{slug}.png"), no_update
+                return (dcc.send_bytes(fig_png(spec), f"{slug}.png"),
+                        f"Downloaded {slug}.png")
             if what == "pdf":
                 pdf, method, note = fig_pdf(spec)
                 return (dcc.send_bytes(pdf, f"{slug}.pdf"),
-                        f"PDF via {method}" + (f" — {note}" if note else ""))
+                        f"Downloaded {slug}.pdf ({method})"
+                        + (f" — {note}" if note else ""))
             if what == "pgf":
                 pgf, err = fig_pgf(spec)
                 if pgf is None:
-                    return no_update, f".pgf unavailable — {err}; use PDF or PNG"
-                return dict(content=pgf, filename=f"{slug}.pgf"), no_update
+                    return no_update, (f"No .pgf: {err}. PDF and PNG work "
+                                       "without TeX.")
+                return (dict(content=pgf, filename=f"{slug}.pgf"),
+                        f"Downloaded {slug}.pgf")
             if what == "zip":
                 return (dcc.send_bytes(export_bundle(spec), f"{slug}.zip"),
-                        no_update)
+                        f"Downloaded {slug}.zip")
         except Exception as e:           # say what failed, never a dead button
-            return no_update, f"{what} export failed: {type(e).__name__}: {e}"[:200]
+            return no_update, (f"The {what.upper()} export failed "
+                               f"({type(e).__name__}: {e})"[:200])
         return no_update, no_update
 
     @app.callback(
@@ -358,14 +435,14 @@ def _register_exports(app):
         standard screen). Toggled by the button; while open it follows the
         figure and the options."""
         if not n or n % 2 == 0 or not spec:
-            return None, "Preview"
+            return None, "Print-size preview"
         import base64
         spec = _with_opts(spec, *opts)
         w, h, pt = geometry(spec)
         try:
             png = fig_png(spec, dpi=192)
         except Exception as e:
-            return (html.Div(f"preview failed: {type(e).__name__}: {e}",
+            return (html.Div(f"The preview failed ({type(e).__name__}: {e})",
                              className="muted small"), "Hide preview")
         from .figures import VENUES
         v = VENUES.get((spec.get("export") or {}).get("venue") or "generic",
@@ -376,5 +453,7 @@ def _register_exports(app):
                      f"{pt:g} pt labels · shown at print size",
                      className="paper-meta"),
             html.Img(src="data:image/png;base64," + base64.b64encode(png).decode(),
+                     alt=f"Print-size preview of the exported figure "
+                         f"({w:.2f} × {h:.2f} in)",
                      style={"width": f"{w * 96:.0f}px", "maxWidth": "none"}),
         ]), "Hide preview"

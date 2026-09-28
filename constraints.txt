@@ -1,6 +1,6 @@
 # The environment the test suite was last run in (Python 3.11, Linux x86-64).
 # Install with:  pip install -r requirements.txt -c constraints.txt
-# requirements.txt keeps the supported ranges; this file pins what was tested.
+# pyproject.toml keeps the supported ranges; this file pins what was tested.
 blis==1.3.3
 cymem==2.0.13
 dash==4.4.1

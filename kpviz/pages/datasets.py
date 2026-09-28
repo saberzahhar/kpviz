@@ -16,16 +16,11 @@ from .. import db, scanner, ui
 from ..figures import MUTED, PATTERNS, to_plotly
 from ..metrics import memo
 from ..textproc import fix_text
-from ..naming import (group_key, limit_str, natural_key, order_splits,
-                      parse_group_key, run_labels, run_rows, split_color,
-                      split_rank, tokenizer_label)
+from ..naming import (PRMU_COLORS, PRMU_NAMES, group_key,
+                      limit_str, natural_key, order_splits, parse_group_key,
+                      run_labels, run_rows, split_color, split_rank,
+                      tokenizer_label)
 from ..util import declared_langs, human_count, mean_sd
-
-# P green · R yellow · M orange · U red
-# one hue, ordered by how much of the phrase the document contains: dark =
-# verbatim (P) → light = none of it (U); no traffic-light judgement
-PRMU_COLORS = {"P": "#0b4a6f", "R": "#3b7fa8", "M": "#8ab6d3", "U": "#cfe0ec"}
-PRMU_NAMES = {"P": "Present", "R": "Reordered", "M": "Mixed", "U": "Unseen"}
 WORDS_TOK = "words"
 COMBINED = "@combined"
 # splits carry their own fixed hue everywhere in the app (naming.SPLIT_COLORS);
@@ -92,40 +87,44 @@ def _group_series(data: dict[tuple[str, str], dict], cats: list,
 
 def layout():
     return html.Div([
-        html.H2("Datasets", className="page-title"),
-        html.P("What each collection contains: splits, lengths, how much of "
-               "the gold occurs in the text, and every document, read from "
-               "your files.", className="page-desc"),
+        html.H1("Datasets", className="page-title"),
+        html.P(["What each collection contains — splits, lengths, how much of "
+                "the gold occurs in the text — and every document, read from "
+                "your files. ",
+                html.A("Browse the documents ↓", href="#ds-browser")],
+               className="page-desc"),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id="ds-pick", options=[], clearable=False,
                 placeholder="scan first…", className="dash-dropdown"), 210),
             ui.control("Split", dcc.Dropdown(
-                id="ds-split", clearable=False, className="dash-dropdown"), 150),
+                id="ds-split", clearable=False, searchable=False,
+                className="dash-dropdown"), 150),
             ui.control("Annotation sets", dcc.Dropdown(
-                id="ds-ann", clearable=False, className="dash-dropdown"), 200),
+                id="ds-ann", clearable=False, searchable=False,
+                className="dash-dropdown"), 200),
             ui.control("Length in", dcc.Dropdown(
-                id="ds-tok", clearable=False, className="dash-dropdown"), 230),
+                id="ds-tok", clearable=False, searchable=False,
+                className="dash-dropdown"), 230),
         ]),
         ui.loading(html.Div(id="ds-body")),
         # the browser lives outside ds-body: changing the split, annotation or
-        # tokenizer re-renders the statistics, not the search you typed
+        # tokenizer re-renders the statistics, not the search you typed. The
+        # opened document appears right under the list (and scrolls into
+        # view), then the explanation of a run's score on it.
         ui.card([
             html.Div([
-                dcc.Input(id="ds-search", type="text", debounce=True,
-                          placeholder="search document ids…",
-                          style={"border": "1px solid var(--border)",
-                                 "borderRadius": "8px", "padding": "7px 11px",
-                                 "fontSize": "13px", "width": "260px"}),
-                dcc.Dropdown(id="ds-flagged", multi=True, options=[],
-                             placeholder="data quality flags (all documents)",
-                             className="dash-dropdown",
-                             style={"minWidth": "420px", "flex": "1"}),
-            ], className="flex", style={"marginBottom": "8px"}),
+                ui.control("Search document ids", dcc.Input(
+                    id="ds-search", type="search", debounce=True,
+                    placeholder="e.g. C-41", className="text-input"), 240),
+                ui.control("Quality flags (all must apply)", dcc.Dropdown(
+                    id="ds-flagged", multi=True, options=[],
+                    placeholder="any document", className="dash-dropdown"), 380),
+            ], className="flex browser-controls"),
             dcc.Store(id="ds-page", data=0),
             html.Div(id="ds-doc-list"),
-        ], title="Document browser"),
-        html.Div(id="ds-doc-view"),
+            html.Div(id="ds-doc-view"),
+        ], title="Documents", id="ds-browser"),
         dcc.Store(id="ds-doc-id"),
         # why a run scored what it did on the open document
         html.Div(ui.card([
@@ -136,26 +135,29 @@ def layout():
                     className="dash-dropdown"), 460),
                 ui.control("Annotation set", dcc.Dropdown(
                     id="ds-explain-ann", options=[], clearable=False,
-                    className="dash-dropdown"), 200),
+                    searchable=False, className="dash-dropdown"), 200),
             ]),
             ui.loading(html.Div(id="ds-explain")),
-        ], title="Explain a run's score on this document"),
+        ], title="Why this run scored what it did on this document"),
             id="ds-explain-card", style={"display": "none"}),
     ], className="page")
 
 
 # ---------------------------------------------------------------------------
 
-def _hist_bins(inner_sql: str, args: list, nbins: int = 24):
+def _hist_bins(inner_sql: str, args: list, nbins: int | None = None):
     """Per-group histogram of `inner_sql`'s (v, g) rows, binned in DuckDB —
     a training split of millions of documents is never fetched row by row.
     The range stops at the 99.5th percentile (the last bin holds the longest
     0.5 %), so one 40 000-word outlier does not squeeze every other document
     into the first bar. Returns (centers, {group: counts}, clipped?)."""
-    got = db.q1(f"""SELECT min(v), quantile_cont(v, 0.995), max(v)
+    got = db.q1(f"""SELECT min(v), quantile_cont(v, 0.995), max(v), count(v)
                     FROM ({inner_sql}) WHERE v IS NOT NULL""", *args)
     if not got or got[0] is None:
         return [], {}, False
+    if nbins is None:
+        # about √n bins, 8 to 24: 24 bins over 60 documents draw noise
+        nbins = int(min(24, max(8, round(float(got[3]) ** 0.5))))
     # lengths are whole numbers: bins are whole numbers of words or tokens
     # (a 0.6-word bin is empty every other time and draws a comb)
     import math
@@ -202,17 +204,21 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
     def _by_ann(fmt):
         return " · ".join(f"{a} {fmt(per_ann[a])}" for a in anns if a in per_ann)
 
+    # the identifying facts as chips; the schema (sections, annotation sets,
+    # metadata) as one line of text — colour is kept for the data
+    schema = [("sections", ", ".join(card.sections)),
+              ("annotation sets", ", ".join(card.annotations)),
+              ("metadata", ", ".join(m for m in card.metadata_spec if m != "split"))]
     header = ui.card([
         html.Div([html.B(card.description or ds)], style={"marginBottom": "9px"}),
         ui.meta_row([
             ui.meta_chip("domain", card.domain) if card.domain else None,
             ui.meta_chip("sub-domain", card.subdomain) if card.subdomain else None,
-            *[ui.meta_chip("lang", l) for l in card.languages],
-            *[ui.meta_chip("section", sec) for sec in card.sections],
-            *[ui.meta_chip("annotation", a) for a in card.annotations],
-            *[ui.meta_chip("metadata", m) for m in card.metadata_spec
-              if m != "split"],
+            ui.meta_chip("lang", " · ".join(card.languages))
+            if card.languages else None,
         ]),
+        html.Div(" · ".join(f"{k}: {v}" for k, v in schema if v),
+                 className="schema-line muted small"),
     ])
 
     # Three of the four tiles are per-document facts, so they are computed
@@ -246,7 +252,8 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                                 sorted(((r[0], r[1]) for r in split_rows),
                                        key=lambda t: split_rank(t[0])))),
         ui.stat_tile("Unique keyphrases", human_count(n_unique),
-                     ("distinct stemmed forms, union of " + ", ".join(anns))
+                     (f"distinct stemmed forms, union of {len(anns)} "
+                      "annotation sets: " + ", ".join(anns))
                      if len(anns) > 1 else "distinct stemmed forms"),
         ui.stat_tile("Keyphrases per document", mean_sd(n_kp_doc, 1), basis),
         ui.stat_tile("Present (P) per document",
@@ -441,17 +448,29 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
             for pos, n in counts.items():
                 d.setdefault(pos if pos in top else "Other", 0)
                 d[pos if pos in top else "Other"] += n
+        # most frequent pattern on top, "Other" (the fold-in) last
         spec = {"kind": "bar", "barmode": "group", "orientation": "h",
                 "xlabel": "% of the group's tagged gold",
-                "series": _group_series(folded, list(reversed(cats)), anns,
+                "series": _group_series(folded, cats, anns,
                                         splits, horizontal=True),
                 "size": "1col", "name": f"kp-pos-{ds}",
                 "caption": (f"Part-of-speech patterns of the gold keyphrases of "
                             f"{ds} (spaCy tagger; the {POS_TOP_N} most frequent "
                             "patterns, the rest as Other), per annotation set "
                             "and split.")}
+        # per-keyphrase rows exist for evaluation splits (and flagged
+        # documents) under the default gold scope: say which splits this
+        # panel covers when the length panel beside it covers more
+        have = order_splits({sp for _a, sp in data})
+        missing = [sp for sp in order_splits(splits) if sp not in have]
+        note = (html.Div(f"Tagged gold is stored for {', '.join(have)} "
+                         f"(not {', '.join(missing)}); scan with --gold-scope "
+                         "all to include every split.",
+                         className="muted small panel-note")
+                if missing else None)
         c2 = ui.exportable("ds-pos", spec,
-                           ui.graph("ds-g-pos", to_plotly(spec), PANEL_H),
+                           html.Div([ui.graph("ds-g-pos", to_plotly(spec), PANEL_H),
+                                     note]),
                            title="Keyphrase POS tags", style={"minWidth": 0})
     else:
         c2 = ui.card(html.Div("No POS-tagged keyphrases here yet — install the "
@@ -551,10 +570,13 @@ def register(app):
         # natural order (kp20k_testing_2 before _10) over *every* match, in
         # SQL, paged — sorting the first 50 000 unordered ids made the "first
         # 25" arbitrary on large collections
-        per = 12
+        per = 15
         total = db.q1(f"SELECT count(*) FROM documents WHERE {where}", *args)[0]
         if not total:
-            return html.Div("no matching documents", className="muted small"), 0
+            return html.Div(["No document matches these filters. ",
+                             html.Span("Clear the search or the flags.",
+                                       className="muted")],
+                            className="small empty-inline"), 0
         page = min(page, (total - 1) // per)
         rows = db.q(f"""SELECT doc_id, coalesce(split,'?'), n_words, flags
                         FROM documents WHERE {where}
@@ -579,9 +601,8 @@ def register(app):
                         style={"marginLeft": "6px"}),
         ], style={"marginLeft": "10px"})
         return html.Div([
-            html.Div([f"{first:,}–{first + len(rows) - 1:,} of {total:,} matching "
-                      "documents, in natural order — click a row (or focus it "
-                      "and press Enter) to open it", pager],
+            html.Div([f"{first:,}–{first + len(rows) - 1:,} of {total:,} "
+                      "documents", pager],
                      className="muted small", style={"marginBottom": "4px"}),
             ui.table(["Document", "Split", "Words", "Flags"], table_rows,
                      num_cols={2}, row_ids=ids, table_id="ds-doc")]), page
@@ -621,9 +642,14 @@ def register(app):
 
     @app.callback(Output("ds-doc-view", "children"), Output("ds-doc-id", "data"),
                   Input({"type": "ds-doc-row", "key": ALL}, "n_clicks"),
-                  State("ds-pick", "value"),
+                  Input("ds-pick", "value"),
                   prevent_initial_call=True)
     def doc_view(clicks, ds):
+        """The opened document belongs to one dataset: switching the dataset
+        closes it (and its explanation) instead of leaving another
+        collection's document under the new charts."""
+        if ctx.triggered_id == "ds-pick":
+            return None, None
         if not any(c for c in clicks if c):
             return no_update, no_update
         doc_id = ctx.triggered_id["key"]
@@ -644,54 +670,96 @@ def register(app):
             src_note = ("the source file changed since the last scan (this "
                         "offset now holds another document); rescan to refresh")
             obj = {}
-        secs = []
-        for s in obj.get("sections", []):
-            secs.append(html.Div([
-                html.Div(f"{s.get('field')} · "
-                         f"{','.join(declared_langs(s)) or 'language from the card'}",
-                         className="doc-field"),
-                # Windows-1252 bytes read as Latin-1 ("d\x92analyse") shown
-                # as the characters they were
-                html.Div(fix_text(s.get("content", "")), className="doc-text"),
-            ], className="doc-section"))
         gold_rows = db.q("""SELECT g.ann_key, coalesce(g.surface, g.display),
-                                   g.prmu, k.pos, g.n_words
+                                   g.prmu, k.pos, g.n_words, g.lang
                             FROM gold g LEFT JOIN keyphrases k ON k.kp=g.display
                               AND k.lang = left(coalesce(g.lang, 'en'), 2)
                             WHERE g.dataset=? AND g.doc_id=?
                               AND g.ann_key <> '@combined'
                             ORDER BY g.ann_key, g.kp_idx""", ds, doc_id)
+        # present gold, marked where the scorer finds it (every occurrence)
+        present = list(dict.fromkeys(r[1] for r in gold_rows if r[2] == "P"))
+        card_langs = scanner.cards().dataset(ds).languages
+        secs = []
+        for s in obj.get("sections", []):
+            text = fix_text(s.get("content", ""))
+            langs = declared_langs(s) or card_langs or ["en"]
+            secs.append(html.Div([
+                html.Div(f"{s.get('field')} · "
+                         f"{', '.join(declared_langs(s)) or 'language from the card'}",
+                         className="doc-field"),
+                html.Div(_marked(text, present, langs[0]), className="doc-text",
+                         tabIndex=0, role="region",
+                         **{"aria-label": f"{s.get('field')} text"}),
+            ], className="doc-section"))
         by_ann: dict[str, list] = {}
-        for ak, disp, prmu, pos, nw in gold_rows:
+        for ak, disp, prmu, pos, nw, _lang in gold_rows:
+            c = prmu or "U"
             by_ann.setdefault(ak, []).append(
-                html.Span([html.Span(className=f"prmu-dot prmu-{prmu or 'U'}"),
+                html.Span([html.Span(c, className=f"prmu-chip prmu-{c}",
+                                     title=PRMU_NAMES.get(c, "?")),
                            disp, html.Span(pos or "", className="muted small")],
                           className="kp-gold",
-                          title=f"{PRMU_NAMES.get(prmu, '?')}"))
+                          title=f"{PRMU_NAMES.get(c, '?')}"
+                                + (f" · {pos}" if pos else "")))
         ann_blocks = [html.Div([html.Div(ak, className="doc-field"),
                                 html.Div(chips)], className="doc-section")
                       for ak, chips in by_ann.items()]
-        if not ann_blocks:
+        if ann_blocks:
+            ann_blocks.insert(0, _prmu_key(bool(present)))
+        else:
             counts = json.loads(row[5] or "{}")
-            note = ("no annotations on this document" if not counts else
-                    "gold instances are stored for eval splits and flagged "
-                    "documents (run with --gold-scope all to browse all "
-                    "training gold) — counts: "
+            note = ("No annotations on this document." if not counts else
+                    "Gold keyphrases are stored for evaluation splits and "
+                    "flagged documents (scan with --gold-scope all to browse "
+                    "training gold). Counts: "
                     + ", ".join(f"{k}: {v}" for k, v in counts.items()))
             ann_blocks = [html.Div(note, className="muted small")]
         flags = row[4] or []
-        return ui.card([
-            html.Div([html.B(doc_id), html.Span(f"  ·  split {row[3]}",
-                                                className="muted small"),
-                      html.Span([ui.tag_chip(f) for f in flags],
-                                style={"marginLeft": "10px"})],
-                     style={"marginBottom": "10px"}),
+        return html.Div([
+            html.H3([doc_id, html.Span(f"  ·  split {row[3]}",
+                                       className="muted small")],
+                    className="doc-title"),
+            html.Span([ui.tag_chip(f) for f in flags]) if flags else None,
             (html.Div(src_note, className="ins-banner", role="status")
              if src_note else None),
             html.Div([html.Div(secs, className="grow"),
                       html.Div(ann_blocks, className="doc-anns")],
                      className="flex doc-view", style={"alignItems": "flex-start"}),
-        ], title="Document")
+        ], className="doc-open")
+
+
+def _prmu_key(marked: bool):
+    """What the letters (and the marks in the text) mean — visible, not a
+    tooltip."""
+    return html.Div([
+        *[html.Span([html.Span(c, className=f"prmu-chip prmu-{c}"),
+                     f" {PRMU_NAMES[c]}"], className="prmu-key-item")
+          for c in "PRMU"],
+        html.Div("Marked in the text: every occurrence of a present keyphrase"
+                 if marked else "No present keyphrase occurs in this text",
+                 className="muted small"),
+    ], className="prmu-key")
+
+
+def _marked(text: str, phrases: list[str], lang: str | None):
+    """The text with each present-gold occurrence in a <mark>."""
+    from ..highlight import present_spans
+    try:
+        spans = present_spans(text, phrases, lang)
+    except Exception:                  # never lose the text over a highlight
+        spans = []
+    if not spans:
+        return text
+    out, at = [], 0
+    for a, b, ix in spans:
+        if a > at:
+            out.append(text[at:a])
+        out.append(html.Mark(text[a:b], className="kp-mark",
+                             title=" · ".join(phrases[i] for i in ix)))
+        at = b
+    out.append(text[at:])
+    return out
 
 
 def _explain(ds: str, doc_id: str, key: tuple, ann: str):
@@ -756,26 +824,35 @@ def _explain(ds: str, doc_id: str, key: tuple, ann: str):
     missed = [g for g in gold if g[0] not in set(gidx)]
     n_uniq, n_gold = int(m[2] or 0), int(m[3] or 0)
 
-    def score(k):
+    def tile(k):
+        """P, R and F1 at one cut-off, the same arithmetic as the scorer."""
         cut = n_gold if k == "O" else (max(n_uniq, 1) if k == "M" else int(k))
         tp = sum(1 for r in ranks if r < cut)
         dp = min(cut, n_uniq) if n_uniq else 0
         p_ = tp / dp if dp else 0.0
         r_ = tp / n_gold if n_gold else 0.0
         f_ = 2 * p_ * r_ / (p_ + r_) if p_ + r_ else 0.0
-        return f"@{k}: P {p_:.2f} · R {r_:.2f} · F1 {f_:.2f}"
+        return html.Div([
+            html.Div(f"F1@{k}", className="score-cut",
+                     title={"O": f"cut at the number of gold keyphrases ({n_gold})",
+                            "M": "every prediction"}.get(k, f"top {k}")),
+            html.Div(f"{f_:.2f}", className="score-f1", title="F1"),
+            html.Div(f"P {p_:.2f} · R {r_:.2f}", className="muted small"),
+        ], className="score-tile")
     return html.Div([
+        html.Div([tile(k) for k in ("5", "10", "O", "M")], className="score-tiles",
+                 **{"aria-label": "F1 at each cut-off, with precision and recall"}),
         html.Div(f"{len(raw)} predictions → {n_uniq} unique after normalisation "
-                 f"and stemming · {len(ranks)} of {n_gold} gold matched · "
-                 + "  |  ".join(score(k) for k in ("5", "10", "O", "M")),
-                 className="small", style={"marginBottom": "8px"}),
+                 f"and stemming · {len(ranks)} of {n_gold} gold keyphrases matched",
+                 className="muted small", style={"margin": "6px 0 10px"}),
         html.Div([
             html.Div([html.Div("Ranked predictions", className="doc-field"),
                       html.Ol(items, className="pred-list")], className="grow"),
             html.Div([html.Div(f"Missed gold ({len(missed)})", className="doc-field"),
-                      html.Div([html.Span([html.Span(className=f"prmu-dot prmu-{pr or 'U'}"),
+                      html.Div([html.Span([html.Span(pr or "U",
+                                                     className=f"prmu-chip prmu-{pr or 'U'}"),
                                            name], className="kp-gold",
-                                          title=PRMU_NAMES.get(pr, "?"))
+                                          title=PRMU_NAMES.get(pr or "U", "?"))
                                 for _i, name, pr in missed]
                                or [html.Span("none", className="muted small")])],
                      className="doc-anns"),

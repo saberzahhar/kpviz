@@ -1,8 +1,9 @@
-"""RQ1 — Are datasets linearly correlated?
+"""RQ1 — Do scores on one dataset track scores on another?
 
 A dataset-by-dataset correlation matrix where each underlying vector holds
-one score per (model, run) pair — only pairs evaluated on *every* selected
-dataset enter the matrix (consistent representation)."""
+one score per system (a model, its runs averaged; or every run) — only
+systems evaluated on *every* selected dataset enter the matrix (consistent
+representation)."""
 from __future__ import annotations
 
 from dash import Input, Output, State, dcc, html
@@ -14,14 +15,14 @@ from ...stats import (ADJUST, alpha_str, kendall_ci, kendall_tau_b, p_str,
                       pearson, sig_mark, spearman)
 from dash.exceptions import PreventUpdate
 
-from ..insights_common import (ann_options, datasets_with_runs,
-                               default_datasets,
-                               effective_runs, figure_block, gate,
-                               gold_controls, metric_caption, metric_control,
-                               models_control, p_cells, p_headers, prmu_arg,
+from ..insights_common import (NO_PRMU, ann_options, datasets_with_runs,
+                               default_datasets, effective_runs, empty_result,
+                               figure_block, gate, gold_controls, gold_phrase,
+                               metric_caption, metric_control, models_control,
+                               p_cells, p_headers, prmu_arg, prmu_empty,
                                resolve_ann, rq_header, runs_control,
-                               selected_runs, split_metric, stats_cfg,
-                               stats_inputs, value_cell, vis, shown)
+                               scope_line, selected_runs, split_metric,
+                               stats_cfg, stats_inputs, value_cell, vis, shown)
 
 METHODS = {"pearson": "Pearson r", "spearman": "Spearman ρ",
            "kendall": "Kendall τ-b"}
@@ -32,11 +33,10 @@ RQ = "rq1"
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("Do datasets rank systems the same way?",
-                  "Each cell correlates two datasets over the scores of the "
-                  "systems they share: a high value means the two benchmarks "
-                  "agree on which system is better. Every cell is tested (no "
-                  "association) and corrected as set under Statistics."),
+        rq_header("Do scores on one dataset track scores on another?",
+                  "Each cell correlates two datasets over the systems "
+                  "evaluated on both: a high value means the two benchmarks "
+                  "tell the same story about which system is better."),
         ui.filter_row([
             ui.control("Datasets (≥ 2)", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds, value=default_datasets(4), multi=True,
@@ -47,18 +47,21 @@ def layout():
                 options=[{"label": v, "value": k} for k, v in METHODS.items()],
                 value="pearson", clearable=False, className="dash-dropdown"), 140),
             ui.control("Systems", dcc.RadioItems(
-                id=f"{RQ}-unit", value="model", className="kp-check kp-inline",
-                options=[{"label": " one per model", "value": "model",
+                id=f"{RQ}-unit", value="model", className="segmented",
+                inline=True,
+                options=[{"label": "one per model (runs averaged)",
+                          "value": "model",
                           "title": "each model's runs averaged into one point: "
                                    "beam settings or seeds of one model are "
                                    "not independent systems"},
-                         {"label": " every run", "value": "run",
+                         {"label": "every run", "value": "run",
                           "title": "descriptive; many runs of one model "
-                                   "dominate the test"}]), 230),
+                                   "dominate the test"}]), 300),
         ]),
         ui.more([*gold_controls(RQ), models_control(RQ),
                  runs_control(RQ, 460, "all shared runs of the selected models")]),
-        figure_block(RQ, height=380),
+        figure_block(RQ, height=360,
+                     label="Correlation matrix between datasets"),
     ])
 
 
@@ -90,7 +93,7 @@ def register(app):
     @app.callback(
         Output({"type": "rq-graph", "rq": RQ}, "figure"),
         Output({"type": "fig-spec", "rq": RQ}, "data"),
-        Output({"type": "caption", "rq": RQ}, "value"),
+        Output({"type": "rq-head", "rq": RQ}, "children"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -112,13 +115,16 @@ def register(app):
 
     def _update(ds_sel, metric, prmu_sel, ann_choice, method, models_sel,
                 runs_sel, unit, *stat_vals):
-        from ...figures import to_plotly
+        from ...figures import empty_figure, to_plotly
         measure, k = split_metric(metric)
         ds_sel = [d for d in (ds_sel or [])]
         if len(ds_sel) < 2:
-            return (to_plotly({"kind": "bar", "series": []}), None,
-                    "", html.Div("select at least two datasets",
-                                 className="muted small"))
+            return (empty_figure(), None,
+                    empty_result("Pick at least two datasets to compare.",
+                                 "A correlation needs two score vectors."),
+                    None)
+        if prmu_empty(prmu_sel):
+            return empty_figure(), None, empty_result(NO_PRMU), None
         chosen = effective_runs(ds_sel, models_sel, runs_sel, require_all=True)
         keys = selected_runs(chosen)
         prmu = prmu_arg(prmu_sel)
@@ -150,6 +156,11 @@ def register(app):
             unit_names = [labels.get(chosen[i], chosen[i]) for i in range(len(keys))]
         n = len(keep)
         unit_txt = "models (each model's runs averaged)" if per_model else "(model, run) pairs"
+        if n < 3:
+            return (empty_figure(), None, empty_result(
+                f"Only {n} system{'s are' if n != 1 else ' is'} evaluated on "
+                f"all {len(ds_sel)} datasets — a correlation needs at least 3.",
+                "Remove a dataset, or include more models or runs."), None)
         # one test per unordered dataset pair; the family is corrected once
         pairs = [(i, j) for i in range(len(ds_sel))
                  for j in range(i + 1, len(ds_sel))]
@@ -176,7 +187,9 @@ def register(app):
                 r, p, lo, hi = res[pq]
                 mark = sig_mark(p_adj[pq], cfg.alpha)
                 row.append(r)
-                trow.append("" if r is None else f"{r:.2f}{mark}")
+                # an undefined coefficient (a constant score vector) is
+                # labelled, not left blank like the omitted upper triangle
+                trow.append("n/a" if r is None else f"{r:.2f}{mark}")
                 hrow.append(f"{da} × {dbs}: {METHODS[method]} = "
                             + ("—" if r is None else f"{r:.3f}")
                             + (f" [{lo:.2f}, {hi:.2f}]" if lo is not None else "")
@@ -239,13 +252,23 @@ def register(app):
             [[unit_names[i]] + [f"{vectors[ds][i]:.3f}" for ds in ds_sel]
              for i in keep],
             num_cols=set(range(1, 1 + len(ds_sel))))
-        note = html.Div(f"n = {n} shared {unit_txt} — runs missing on any "
-                        "dataset are excluded (consistent representation)."
+        any_ci = any(res[pq][2] is not None for pq in pairs)
+        note = html.Div(f"n = {n} shared {unit_txt}; runs missing on any "
+                        "dataset are left out (consistent representation)."
                         + (" With fewer than 10 systems every coefficient is "
-                           "fragile; read the intervals." if n < 10 else ""),
+                           "fragile" + ("; read the intervals." if any_ci else ".")
+                           if n < 10 else ""),
                         className="muted small", style={"margin": "6px 0"})
         pairs_tab = ui.table(headers, rows_h, num_cols={2, 3, 4})
-        return (to_plotly(spec), spec, spec["caption"],
+        head = scope_line(f"{mname} of {metric_label(measure, k, prmu)}",
+                          f"{len(ds_sel)} datasets",
+                          f"n = {n} {'models' if per_model else 'runs'} "
+                          "evaluated on all of them",
+                          gold_phrase(ann_choice, ds_sel),
+                          f"† p < {alpha_str(cfg.alpha)}"
+                          + (f", {ADJUST[cfg.adjust]}" if cfg.adjust != "none"
+                             else ""))
+        return (to_plotly(spec), spec, head,
                 html.Div([pairs_tab, note,
                           ui.fold(detail, len(keep),
                                   f"Scores behind the matrix ({len(keep)} "

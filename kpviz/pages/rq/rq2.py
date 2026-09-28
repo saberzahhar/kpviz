@@ -11,13 +11,14 @@ from dash import Input, Output, State, dcc, html
 from ... import db, scanner, ui
 from ...scanner import TRAIN_SPLIT_SQL
 from ...metrics import memo, metric_label, run_scores
-from ...naming import run_labels, run_rows
+from ...naming import CONDITION, run_labels, run_rows
 from ...stats import fmt_effect, p_str, sig_mark
 from dash.exceptions import PreventUpdate
 
-from ..insights_common import (ann_options, best_per_model,
+from ..insights_common import (NO_PRMU, ann_options, best_per_model,
                                datasets_with_runs, effective_runs, effect_cell,
-                               figure_block, gate, gold_controls,
+                               empty_result, figure_block, gate, gold_controls,
+                               gold_phrase, prmu_empty, scope_line,
                                metric_caption, metric_control, models_control,
                                p_cells, p_headers, prmu_arg, resolve_ann,
                                rq_header, runs_control, selected_runs,
@@ -29,27 +30,27 @@ from .rq3 import _ci_hover, _pmap
 RQ = "rq2"
 
 CRITERIA = [
-    {"label": " language mismatch (any section/annotation)", "value": "lang"},
+    {"label": " detected language differs from the declared one",
+     "value": "lang"},
     {"label": " similar to the model's own training data", "value": "sup_leak"},
-    {"label": " similar to any other document (any pair)", "value": "any_leak"},
+    {"label": " similar to any other document", "value": "any_leak"},
 ]
 
 
 def layout():
     ds = datasets_with_runs()
     return html.Div([
-        rq_header("Does poor input data move the scores?",
-                  "Documents flagged by a data-quality check (language "
-                  "disagreeing with the declared one, or similarity to a "
-                  "model's own training data) are removed and the metric "
-                  "recomputed: the shift is how much they move the reported "
-                  "score. A flag is evidence to inspect, not proof."),
+        rq_header("How do flagged documents change the score?",
+                  "Each row shows a system's score on all documents, without "
+                  "the flagged ones, and on the flagged ones alone; the "
+                  "dagger tests flagged against unflagged. A flag is "
+                  "evidence to inspect, not proof of bad data."),
         ui.filter_row([
             ui.control("Dataset", dcc.Dropdown(
                 id=f"{RQ}-ds", options=ds, value=_default_ds(ds),
                 clearable=False, className="dash-dropdown"), 200),
             metric_control(RQ),
-            ui.control("Quality criteria", dcc.Checklist(
+            ui.control("Flag documents whose", dcc.Checklist(
                 id=f"{RQ}-crit", options=CRITERIA,
                 value=["lang", "sup_leak"], className="kp-check"), 360),
             systems_control(RQ),
@@ -64,7 +65,8 @@ def layout():
                 clearable=False, className="dash-dropdown"), 190),
             *gold_controls(RQ), models_control(RQ), runs_control(RQ, 460),
         ]),
-        figure_block(RQ, height=400),
+        figure_block(RQ, height=200,
+                     label="Scores with and without flagged documents"),
     ])
 
 
@@ -144,7 +146,7 @@ def register(app):
     @app.callback(
         Output({"type": "rq-graph", "rq": RQ}, "figure"),
         Output({"type": "fig-spec", "rq": RQ}, "data"),
-        Output({"type": "caption", "rq": RQ}, "value"),
+        Output({"type": "rq-head", "rq": RQ}, "children"),
         Output({"type": "rq-table", "rq": RQ}, "children"),
         Output({"type": "fig-sig", "rq": RQ}, "data"),
         State(vis(RQ), "data"), Input(shown(RQ), "data"),
@@ -167,11 +169,17 @@ def register(app):
 
     def _update(ds, metric, prmu_sel, ann_choice, models_sel, runs_sel,
                 crit, thr, label, unit, *stat_vals):
-        from ...figures import to_plotly
+        from ...figures import empty_figure, to_plotly
         measure, k = split_metric(metric)
         if not ds:
-            return (to_plotly({"kind": "bar", "series": []}), None, "",
-                    html.Div("no dataset", className="muted small"))
+            return (empty_figure(), None,
+                    empty_result("No dataset with runs yet — scan first."), None)
+        if prmu_empty(prmu_sel):
+            return empty_figure(), None, empty_result(NO_PRMU), None
+        if not crit:
+            return (empty_figure(), None, empty_result(
+                "No quality check is selected.",
+                "Tick at least one reason to flag documents."), None)
         idx = scanner.cards()
         cfg = stats_cfg(*stat_vals)
         chosen = effective_runs([ds], models_sel, runs_sel)
@@ -242,8 +250,10 @@ def register(app):
             shift = ((excl["mean"] - base["mean"])
                      if excl["mean"] is not None else None)
             short = idx.model(model).name if unit != "run" else lab
+            # the row says how many documents the flag removes: a large
+            # shift on 3 flagged documents is not a large finding
             rows_out.append({
-                "label": short + (f" {mark}" if mark else ""),
+                "label": f"{short} · {len(fl)} flagged" + (f" {mark}" if mark else ""),
                 "x0": base["mean"], "x1": excl["mean"],
                 "x2": only["mean"] if only else None,
                 "err": {"x0": st["ci_all"], "x1": st["ci_cl"], "x2": st["ci_fl"]},
@@ -297,9 +307,9 @@ def register(app):
             # blue = the unflagged documents, orange = the flagged ones (no
             # green/red: a flag is evidence to inspect, not a judgement)
             "points": [
-                {"key": "x0", "name": "all documents", "color": "#3d3c39"},
-                {"key": "x1", "name": "unflagged", "color": "#2a78d6"},
-                {"key": "x2", "name": "flagged", "color": "#eb6834"},
+                {"key": "x0", "name": "all documents", "color": CONDITION["context"]},
+                {"key": "x1", "name": "unflagged", "color": CONDITION["kept"]},
+                {"key": "x2", "name": "flagged", "color": CONDITION["focus"]},
             ],
             "xlabel": mlab, "name": f"quality-impact-{ds}",
             "caption": (f"Score change after excluding flagged documents, {mlab} "
@@ -312,8 +322,8 @@ def register(app):
                         "difficulty. "
                         + (f"Whiskers: {ci_txt}. " if ci_txt else "")
                         + "The dagger marks a significant difference between "
-                        "the clean and the flagged documents themselves "
-                        f"({methods}). "
+                        "the unflagged and the flagged documents themselves "
+                        f"({methods}), not between all and unflagged. "
                         + metric_caption(measure, k, prmu_sel, ann_choice,
                                          [ds])),
         }
@@ -323,11 +333,25 @@ def register(app):
                          "label": f"quality-{ds}",
                          "notes": f"Statistics: {methods}"
                                   + (f"; {ci_txt}" if ci_txt else "") + "."}
+        if not rows_out:
+            return (empty_figure(), None, empty_result(
+                "No selected run has scored documents on this dataset.",
+                "Pick another dataset, or clear the model and run filters."),
+                None)
+        n_sig = sum(1 for r in rows_out if r["label"].endswith("†"))
         table = html.Div([ui.fold(ui.table(headers, table_rows,
                                            num_cols=set(range(1, len(headers)))),
                                   len(table_rows),
-                                  f"Table · {len(table_rows)} runs · "
-                                  f"{sum(1 for r in rows_out if r['label'].endswith('†'))}"
-                                  " significant"),
+                                  f"Table · {len(table_rows)} "
+                                  f"{'models' if unit != 'run' else 'runs'} · "
+                                  f"{n_sig} significant"),
                           stats_note(cfg, "indep", n_tests)])
-        return to_plotly(spec), spec, spec["caption"], table
+        n_flag = sorted({len(it[2]) for it in items})
+        head = scope_line(f"{mlab} on {ds}",
+                          f"{len(rows_out)} {'models (best run each)' if unit != 'run' else 'runs'}",
+                          "flagged: " + "; ".join(crit_txt),
+                          (f"{n_flag[0]} flagged documents" if len(n_flag) == 1
+                           else f"{n_flag[0]}–{n_flag[-1]} flagged documents per system")
+                          if n_flag else None,
+                          gold_phrase(ann_choice, [ds]))
+        return to_plotly(spec), spec, head, table

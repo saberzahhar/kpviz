@@ -7,3 +7,7 @@ sample_data/
 sample_src/
 scaled_data/
 .pytest_cache/
+build/
+dist/
+*.egg-info/
+shots/
