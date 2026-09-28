@@ -18,7 +18,7 @@ PyStemmer==3.1.0
 snowballstemmer==3.1.1
 spacy==3.8.16
 srsly==2.5.3
-thinc==8.3.13
+thinc==9.1.1
 tiktoken==0.14.0
 tokenizers==0.23.2
 Werkzeug==3.1.8
