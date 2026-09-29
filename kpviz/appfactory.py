@@ -28,7 +28,7 @@ from . import __version__, db, scanner
 from .config import settings
 from .figures import geometry
 from .export import (export_bundle, export_name, fig_pdf, fig_pgf, fig_png,
-                     figure_env, snippets, start_tex_probe)
+                     figure_env, preview_png, snippets, start_tex_probe)
 
 # Identifies this server process. A browser tab holds the callback signatures
 # of the build that rendered it, so a tab left open across an upgrade posts a
@@ -356,7 +356,7 @@ def _register_exports(app):
             if (!ctx.triggered || !ctx.triggered.length ||
                 !ctx.triggered[0].value) return window.dash_clientside.no_update;
             var id = JSON.parse(ctx.triggered[0].prop_id.split(".")[0]);
-            var what = {pdf: "PDF", png: "PNG", pgf: ".pgf",
+            var what = {pdf: "PDF", png: "PNG", pgf: ".pgf", tex: ".tex",
                         zip: "all formats"}[id.what] || id.what;
             return "Preparing " + what + "…";
         }""",
@@ -414,6 +414,11 @@ def _register_exports(app):
                                        "without TeX.")
                 return (dict(content=pgf, filename=f"{slug}.pgf"),
                         f"Downloaded {slug}.pgf")
+            if what == "tex":
+                fig_tex, tab_tex, _hint = snippets(spec, caption)
+                body = fig_tex + ("\n\n" + tab_tex if tab_tex else "") + "\n"
+                return (dict(content=body, filename=f"{slug}.tex"),
+                        f"Downloaded {slug}.tex")
             if what == "zip":
                 return (dcc.send_bytes(export_bundle(spec), f"{slug}.zip"),
                         f"Downloaded {slug}.zip")
@@ -422,38 +427,83 @@ def _register_exports(app):
                                f"({type(e).__name__}: {e})"[:200])
         return no_update, no_update
 
-    @app.callback(
-        Output({"type": "exp-preview", "rq": MATCH}, "children"),
-        Output({"type": "exp-prev", "rq": MATCH}, "children"),
-        Input({"type": "exp-prev", "rq": MATCH}, "n_clicks"),
+    # a figure with several formats switches in the browser: every variant
+    # came with the page, and the export follows the one on screen
+    app.clientside_callback(
+        """function (fmt, variants, shown) {
+            var nu = window.dash_clientside.no_update;
+            if (!fmt || !variants || !variants[fmt]) return [nu, nu];
+            // already on screen (the page came with it): nothing to redraw
+            if (shown && JSON.stringify(shown) ===
+                         JSON.stringify(variants[fmt].spec)) return [nu, nu];
+            // a new format is a new chart (pies have no axes to animate
+            // from): drawn afresh, not transitioned
+            var fig = JSON.parse(JSON.stringify(variants[fmt].figure));
+            if (fig.layout) { delete fig.layout.transition; }
+            return [fig, variants[fmt].spec];
+        }""",
+        Output({"type": "fig-graph", "rq": MATCH}, "figure"),
+        Output({"type": "fig-spec", "rq": MATCH}, "data", allow_duplicate=True),
+        Input({"type": "fig-format", "rq": MATCH}, "value"),
+        State({"type": "fig-variants", "rq": MATCH}, "data"),
+        State({"type": "fig-spec", "rq": MATCH}, "data"),
+        prevent_initial_call="initial_duplicate")
+
+    # the view (interactive, paper, both) is a class on the frame; the
+    # printed figure is asked for only while it is on screen, and again
+    # whenever the figure, an export option or the caption changes
+    app.clientside_callback(
+        """function (view) {
+            var v = view || "interactive";
+            var want = v === "interactive" ? window.dash_clientside.no_update
+                                           : Date.now();
+            return ["fig-frame view-" + v, want];
+        }""",
+        Output({"type": "fig-frame", "rq": MATCH}, "className"),
+        Output({"type": "exp-want", "rq": MATCH}, "data"),
+        Input({"type": "fig-view", "rq": MATCH}, "value"),
         Input({"type": "fig-spec", "rq": MATCH}, "data"),
         *opt_in,
+        Input({"type": "caption", "rq": MATCH}, "n_blur"))
+
+    @app.callback(
+        Output({"type": "exp-preview", "rq": MATCH}, "children"),
+        Input({"type": "exp-want", "rq": MATCH}, "data"),
+        State({"type": "fig-spec", "rq": MATCH}, "data"),
+        State({"type": "caption", "rq": MATCH}, "value"),
+        *opt_st,
         prevent_initial_call=True)
-    def preview(n, spec, *opts):
-        """The exported figure as it will print: rendered by the export
-        engine at the venue's width, shown at 96 px per inch (1:1 on a
-        standard screen). Toggled by the button; while open it follows the
-        figure and the options."""
-        if not n or n % 2 == 0 or not spec:
-            return None, "Print-size preview"
+    def preview(_want, spec, caption, *opts):
+        """The figure as it will print: the PDF the export gives, typeset
+        by TeX in the venue's fonts when TeX is installed (else the
+        Matplotlib rendering the PDF falls back to), at the venue's width,
+        shown at 96 px per inch — 1:1 on a standard screen — with its
+        caption set below it as in the paper."""
+        if not spec:
+            return html.Div("Nothing to print for this selection.",
+                            className="muted small")
         import base64
         spec = _with_opts(spec, *opts)
         w, h, pt = geometry(spec)
         try:
-            png = fig_png(spec, dpi=192)
+            png, how = preview_png(spec)
         except Exception as e:
-            return (html.Div(f"The preview failed ({type(e).__name__}: {e})",
-                             className="muted small"), "Hide preview")
+            return html.Div(f"The printed figure could not be rendered "
+                            f"({type(e).__name__}: {e})"[:240],
+                            className="muted small")
         from .figures import VENUES
         v = VENUES.get((spec.get("export") or {}).get("venue") or "generic",
                        VENUES["generic"])
         env = figure_env(spec)
+        cap = (caption or spec.get("caption") or "").strip()
         return html.Div([
             html.Div(f"{v['label']} · {env} · {w:.2f} × {h:.2f} in · "
-                     f"{pt:g} pt labels · shown at print size",
-                     className="paper-meta"),
-            html.Img(src="data:image/png;base64," + base64.b64encode(png).decode(),
-                     alt=f"Print-size preview of the exported figure "
-                         f"({w:.2f} × {h:.2f} in)",
-                     style={"width": f"{w * 96:.0f}px", "maxWidth": "none"}),
-        ]), "Hide preview"
+                     f"{pt:g} pt · {how}", className="paper-meta"),
+            html.Figure([
+                html.Img(src="data:image/png;base64," + base64.b64encode(png).decode(),
+                         alt=f"The exported figure at print size "
+                             f"({w:.2f} × {h:.2f} in)"),
+                html.Figcaption([html.Span("Figure 1: ", className="paper-fig"),
+                                 cap]) if cap else None,
+            ], className="paper-sheet", style={"width": f"{w * 96:.0f}px"}),
+        ])

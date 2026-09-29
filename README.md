@@ -43,8 +43,8 @@ is no `data/`, and opens the app in the browser. Arguments are passed on:
 
 Manual install: `python -m venv .venv`, activate it, then
 `pip install -r requirements.txt -c constraints.txt` and `kpviz`.
-Optional: a TeX distribution for PGF export, and `HF_TOKEN` for gated
-Hugging Face tokenizers. The full demo tree (5 datasets, 7 models,
+Optional: a TeX distribution (PGF export and TeX-typeset figures), and
+`HF_TOKEN` for gated Hugging Face tokenizers. The full demo tree (5 datasets, 7 models,
 3 architectures, 75 runs) is on
 [Zenodo](https://doi.org/10.5281/zenodo.22789345); place it as `data/`.
 
@@ -147,6 +147,12 @@ What KPViz does with them:
 
 ![Quality vs. cost workbench](docs/img/insights.png)
 
+- **Figures.** Each figure can be shown interactive, as printed, or both
+  side by side. The printed view is the exported PDF (typeset by TeX in the
+  venue's fonts when TeX is installed) at the paper's column width, with its
+  caption. Some figures have alternative formats: document lengths as
+  overlaid or side-by-side histograms or outlines, PRMU classes as stacked
+  bars or pies, model scores as bars or dots.
 - **Encoding.** A model keeps one colour on every page and in every export;
   its runs are shades of it; an architecture keeps one marker shape. PRMU
   classes are green, yellow, orange and red (present → unseen).
@@ -157,9 +163,11 @@ What KPViz does with them:
   (Wilcoxon, Mann–Whitney, Friedman), mean tests (paired t, Welch t,
   RM-ANOVA) or resampling (permutation, bootstrap); Holm, Bonferroni or
   Benjamini–Hochberg; 95 % intervals; effect sizes. Checked against SciPy.
-- **Export.** PDF, PNG, PGF, booktabs table or a zip bundle with
-  provenance, at the real column width of article, *ACL, ACM, IEEE, LNCS
-  or NeurIPS/ICLR. Captions are generated from the configuration and stay
+- **Export.** The *Export* menu under each figure downloads PDF, PNG, PGF,
+  the LaTeX figure environment (`.tex`) or everything as a zip with
+  provenance, and copies the LaTeX figure or booktabs table. Figures are
+  drawn at the real column width of article, *ACL, ACM, IEEE, LNCS or
+  NeurIPS/ICLR; captions are generated from the configuration and stay
   editable.
 
 ## How scores are computed

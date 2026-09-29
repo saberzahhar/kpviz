@@ -69,6 +69,7 @@
   --sp-6: 32px;
   --radius: 10px;
   --radius-sm: 7px;
+  --gap: 18px;
   --sidebar-w: 232px;
 
   /* Dash 4 components take their accent from these */
@@ -96,7 +97,7 @@ body.present {
 }
 body.present .sidebar-root,
 body.present .brand-sub,
-body.present .exp-hint,
+body.present .hint,
 body.present .page-desc a { display: none; }
 
 * { box-sizing: border-box; }
@@ -119,11 +120,11 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
 .skip-link {
   position: fixed; left: var(--sp-2); top: var(--sp-2); z-index: 50;
-  transform: translateY(-200%);
+  transform: translateY(-200%); opacity: 0;
   background: var(--accent-ink); color: #fff; padding: var(--sp-2) var(--sp-3);
   border-radius: var(--radius-sm); font-weight: 600; text-decoration: none;
 }
-.skip-link:focus { transform: none; }
+.skip-link:focus { transform: none; opacity: 1; }
 
 /* ---------- app frame ---------- */
 .app-frame { display: flex; min-height: 100vh; }
@@ -205,9 +206,9 @@ code { font-family: var(--mono); font-size: 0.92em; }
 /* minmax(0,1fr), not 1fr: a Plotly panel with long tick labels reports a wide
    min-content size and would otherwise push its column past the page edge */
 .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 14px; margin-top: 14px; align-items: start; }
+  gap: var(--gap); margin-bottom: var(--gap); align-items: start; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px; margin-top: 14px; align-items: start; }
+  gap: var(--gap); margin-bottom: var(--gap); align-items: start; }
 .action-row { margin-bottom: var(--sp-4); align-items: center; }
 
 /* ---------- cards & tiles ---------- */
@@ -215,14 +216,24 @@ code { font-family: var(--mono); font-size: 0.92em; }
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); padding: var(--sp-4) 18px;
 }
-.card + .card { margin-top: 14px; }
-/* grid cells are aligned by the grid, not pushed down by the rule above */
-.grid-2 > .card, .grid-3 > .card { margin-top: 0; }
+/* one rhythm between every card, whatever wraps it (a card inside a Div
+   that a callback fills is still spaced from the next one); grid cells are
+   spaced by the grid */
+.card { margin-bottom: var(--gap); }
+.grid-2 > .card, .grid-3 > .card { margin-bottom: 0; }
 .card-title { font-size: var(--fs-sm); font-weight: 650; color: var(--ink-2);
   text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 10px; }
+/* title left, the figure's format and view right */
+.card-head { display: flex; flex-wrap: wrap; align-items: center;
+  justify-content: space-between; gap: 8px 16px; margin-bottom: 10px; }
+.card-head .card-title, .card-head .panel-title { margin: 0; }
+.card-head-scope { align-items: flex-start; flex-wrap: nowrap; }
+.card-head-scope .rq-head { flex: 1 1 auto; min-width: 0; margin: 4px 0 0; }
+.card-head-scope .fig-controls { flex: 0 0 auto; }
+@media (max-width: 900px) { .card-head-scope { flex-wrap: wrap; } }
 
 /* tiles keep one width (they never stretch into 600 px cards) and wrap */
-.kpi-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 14px 0; }
+.kpi-row { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 0 0 var(--gap); }
 .stat-tile { flex: 0 1 240px; min-width: 190px; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 13px 16px 11px; }
@@ -552,11 +563,11 @@ mark.kp-mark { background: rgba(46, 145, 88, 0.15); color: inherit;
 .guide-body dd { display: inline; margin: 0; line-height: 1.45; }
 
 /* ---------- folds ---------- */
-.exp-more, .more-opts, .fold { margin-top: 8px; }
-.exp-more > summary, .more-opts > summary, .fold > summary, .engine-fold > summary {
+.more-opts, .fold { margin-top: 8px; }
+.more-opts > summary, .fold > summary, .engine-fold > summary {
   cursor: pointer; font-size: var(--fs-sm); font-weight: 600; color: var(--accent-ink);
   padding: 3px 0; list-style-position: inside; width: max-content; max-width: 100%; }
-.exp-more[open] > summary, .more-opts[open] > summary, .fold[open] > summary {
+.more-opts[open] > summary, .fold[open] > summary {
   margin-bottom: 6px; }
 .more-opts { margin: -8px 0 var(--sp-4); }
 .more-body { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: flex-start;
@@ -565,27 +576,75 @@ mark.kp-mark { background: rgba(46, 145, 88, 0.15); color: inherit;
 .engine-fold { margin: 22px 0 0; }
 .fold > summary { margin-top: 2px; }
 
-/* ---------- export bar, caption, preview ---------- */
-.exp-wrap { margin-top: 6px; }
-.export-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  margin-top: 10px; }
-.exp-status { font-size: var(--fs-xs); color: var(--ink-2); }
+/* ---------- figure controls, views, the printed figure ---------- */
+.fig-controls { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.seg-group { display: inline-flex; align-items: center; gap: 7px; }
+.segmented.seg-sm { min-height: 28px; }
+.segmented.seg-sm label { min-height: 26px; padding: 0 10px; font-size: var(--fs-xs); }
+
+.fig-frame.view-interactive .fig-paper { display: none; }
+.fig-frame.view-paper .fig-screen { display: none; }
+.fig-frame.view-both { display: grid; gap: var(--sp-4); align-items: start;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+/* each side keeps its own loading overlay */
+.fig-screen, .fig-paper { min-width: 0; position: relative; }
+
+/* the figure as printed: a white sheet on a grey desk, at print size,
+   with its caption set as in the paper */
+.paper-view { background: #ebeae5; border-radius: 8px; padding: 14px 16px 18px;
+  overflow-x: auto; min-height: 120px; }
+.paper-meta { font-size: var(--fs-2xs); color: var(--ink-2); margin-bottom: 10px; }
+.paper-sheet { margin: 0 auto; max-width: 100%; background: #fff;
+  padding: 14px 16px 16px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08),
+  0 4px 14px rgba(0, 0, 0, 0.06); box-sizing: content-box; }
+.paper-sheet img { display: block; width: 100%; height: auto; }
+.paper-sheet figcaption { margin-top: 8px; color: #111; text-align: justify;
+  font: 12.5px/1.4 "Latin Modern Roman", "CMU Serif", "Computer Modern",
+        "Nimbus Roman", "Times New Roman", Georgia, serif;
+  hyphens: auto; }
+.view-both .paper-sheet { box-sizing: border-box; }
+
+/* ---------- the Export menu ---------- */
+.exp-wrap { margin-top: 10px; }
+.exp-menu > summary { list-style: none; display: inline-flex; align-items: center;
+  gap: 6px; cursor: pointer; font-size: var(--fs-sm); font-weight: 600;
+  color: var(--ink); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 12px; user-select: none; }
+.exp-menu > summary::-webkit-details-marker { display: none; }
+.exp-menu > summary::after { content: "▾"; font-size: 11px; color: var(--muted);
+  transition: transform 0.15s; }
+.exp-menu[open] > summary::after { transform: rotate(180deg); }
+.exp-menu > summary:hover { background: var(--hover); border-color: var(--baseline); }
+.exp-menu[open] > summary { background: var(--accent-tint); color: var(--accent-ink);
+  border-color: rgba(42, 120, 214, 0.35); }
+.exp-body { margin-top: 10px; padding: 12px 14px 14px; background: var(--raised);
+  border: 1px solid var(--border); border-radius: var(--radius); }
+.export-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.exp-group-label { font-size: var(--fs-2xs); font-weight: 600; color: var(--muted);
+  letter-spacing: 0.02em; }
+.exp-group-label + .btn { margin-left: 2px; }
+.export-bar .exp-group-label:not(:first-child) { margin-left: 10px; }
+.exp-status { display: block; margin-top: 8px; font-size: var(--fs-xs); color: var(--ink-2); }
 .exp-status:empty { display: none; }
 .clip-btn { gap: 5px; }
-.clip-btn.clip-fig::after { content: "Copy LaTeX"; }
-.clip-btn.clip-tab::after { content: "Copy LaTeX table"; }
+.clip-btn.clip-fig::after { content: "LaTeX figure"; }
+.clip-btn.clip-tab::after { content: "LaTeX table"; }
 .clip-btn.clip-bib::after { content: "Copy BibTeX"; }
 .cap-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
-  margin: 6px 0 4px; }
+  margin: 12px 0 4px; }
 .cap-note { font-size: var(--fs-xs); color: var(--warning-text); }
 .cap-note:empty { display: none; }
 .exp-opts { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
-  margin: 10px 0 2px; padding-top: 10px; border-top: 1px dashed var(--grid); }
+  margin: 12px 0 2px; padding-top: 12px; border-top: 1px dashed var(--grid); }
 .exp-opt { display: flex; align-items: center; gap: 6px; }
 .exp-opt-label { font-size: var(--fs-2xs); font-weight: 600; color: var(--ink-2);
   white-space: nowrap; }
 .exp-opt .exp-dd { flex: 1; font-size: var(--fs-xs); }
 .hint { font-size: var(--fs-2xs); color: var(--muted); margin-top: 8px; }
+
+/* anything being recomputed fades at once; the new version replaces it */
+.js-plotly-plot[data-dash-is-loading="true"], .paper-view[data-dash-is-loading="true"] {
+  opacity: 0.45; transition: opacity 0.15s; }
 
 /* the caption editor grows with the caption: field-sizing does it natively
    where supported; assets/autosize.js does the same for other engines */
@@ -597,12 +656,6 @@ mark.kp-mark { background: rgba(46, 145, 88, 0.15); color: inherit;
 }
 .caption-box textarea:focus { outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(42, 120, 214, 0.15); }
-
-.exp-preview:empty { display: none; }
-.exp-preview { margin-top: 10px; padding: 14px; background: var(--raised);
-  border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; }
-.exp-preview .paper-meta { font-size: var(--fs-2xs); color: var(--muted); margin-bottom: 8px; }
-.exp-preview img { display: block; box-shadow: 0 0 0 1px var(--grid); }
 
 .mono-block { font-family: var(--mono); font-size: var(--fs-2xs); background: var(--raised);
   border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
@@ -618,6 +671,7 @@ mark.kp-mark { background: rgba(46, 145, 88, 0.15); color: inherit;
 /* ---------- responsive frame ---------- */
 @media (max-width: 1100px) {
   .grid-2, .grid-3 { grid-template-columns: minmax(0, 1fr); }
+  .fig-frame.view-both { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 900px) {
   /* the sidebar becomes a top bar */

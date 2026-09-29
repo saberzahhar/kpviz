@@ -13,7 +13,7 @@ from dash import ALL, Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import MUTED, PATTERNS, to_plotly
+from ..figures import MUTED, PATTERNS
 from ..metrics import memo
 from ..textproc import fix_text
 from ..naming import (PRMU_COLORS, PRMU_NAMES, group_key,
@@ -315,38 +315,50 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         # each split is normalised to its own 100%: collections are wildly
         # unbalanced (1.3 M training vs 100 k testing), and the question here
         # is whether the *shapes* differ, not which split is bigger
-        # one outline per split (a frequency polygon), not 24 × 3 bars: the
-        # shapes are compared, and three thin lines read at a glance
+        bw = (centers[1] - centers[0]) if len(centers) > 1 else 1
         series = []
         for sp in order_splits(groups):
             ys = groups[sp]
             tot = sum(ys) or 1
             series.append({
-                "name": sp, "x": centers, "mode": "lines", "width": 1.8,
+                "name": sp, "x": centers,
                 "y": [round(100.0 * y / tot, 2) for y in ys],
                 "color": split_color(sp),
-                "hover": [f"{sp}<br>~{c:g} · {y} docs ({100.0 * y / tot:.1f}%)"
+                "hover": [f"{sp} · {c - bw / 2 + 0.5:g}–{c + bw / 2 - 0.5:g}: "
+                          f"{y} docs ({100.0 * y / tot:.1f}%)"
                           for c, y in zip(centers, ys)]})
-        spec = {"kind": "line", "xlabel": xlabel,
-                "ylabel": "% of the split's documents",
-                "series": series, "vlines": inside, "size": "2col",
-                "name": f"doc-length-{ds}",
-                "caption": (f"Document length distribution of {ds} per split, "
-                            + ("in words" if tok == WORDS_TOK
-                               else f"in {tokenizer_label(tok)} tokens")
-                            + (" (approximate)" if approx and approx[0] else "")
-                            + ("; dashed lines mark the input windows of the "
-                               "models that count in this tokenizer"
-                               if tok != WORDS_TOK else "")
-                            + (" (beyond the axis: " + "; ".join(
-                                v["label"] for v in beyond) + ")" if beyond else "")
-                            + ".")}
+        unit = "in words" if tok == WORDS_TOK else f"in {tokenizer_label(tok)} tokens"
+        base = {"xlabel": xlabel, "ylabel": "% of the split's documents",
+                "vlines": inside, "size": "2col", "hovermode": "x",
+                "name": f"doc-length-{ds}", "height": PANEL_H}
+
+        def caption(form):
+            return (f"Document length distribution of {ds} per split, {unit}"
+                    + (" (approximate)" if approx and approx[0] else "")
+                    + f", {form}; each split sums to 100 %"
+                    + ("; dashed lines mark the input windows of the models "
+                       "that count in this tokenizer" if tok != WORDS_TOK else "")
+                    + (" (beyond the axis: " + "; ".join(
+                        v["label"] for v in beyond) + ")" if beyond else "")
+                    + ".")
+        variants = {
+            "overlay": dict(base, kind="hist", histmode="overlay", bin_width=bw,
+                            series=series, caption=caption(
+                                "as overlaid histograms")),
+            "group": dict(base, kind="hist", histmode="group", bin_width=bw,
+                          series=series, caption=caption(
+                              "as side-by-side histograms")),
+            "lines": dict(base, kind="line", caption=caption(
+                "as frequency polygons (one outline per split)"),
+                series=[dict(sr, mode="lines", width=1.8) for sr in series]),
+        }
         note = (html.Div("beyond the axis: " + " · ".join(
             v["label"] for v in beyond), className="muted small")
             if beyond else None)
         charts.append(ui.exportable(
-            "ds-len", spec, html.Div([ui.graph("ds-g-len", to_plotly(spec), PANEL_H),
-                                      note]), title=title))
+            "ds-len", variants["overlay"], title=title, variants=variants,
+            formats=[("overlay", "Overlaid"), ("group", "Side by side"),
+                     ("lines", "Outlines")], note=note))
 
     # ---- PRMU: one aligned 100 % bar per (annotation set, split) -----------
     # (aligned bars, not pies: the P share of two splits is compared on a
@@ -383,21 +395,34 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
             series.append({"name": f"{pr} — {PRMU_NAMES[pr]}",
                            "x": ys, "y": list(cats), "hover": hv,
                            "color": PRMU_COLORS[pr]})
-        spec = {"kind": "bar", "barmode": "stack", "orientation": "h",
+        what = ("PRMU classes of the gold keyphrases of " + ds
+                + " per annotation set and split (Boudin & Gallina, 2021, on "
+                "stemmed tokens: P = the keyphrase occurs contiguously in the "
+                "document, R = all its words occur but not as that sequence, "
+                "M = some occur, U = none do)")
+        bars = {"kind": "bar", "barmode": "stack", "orientation": "h",
                 "xlabel": "% of the gold keyphrases", "xrange": [0, 100],
                 "series": series, "size": "2col",
                 "aspect": min(1.2, 0.18 + 0.07 * len(cats)),
-                "name": f"prmu-{ds}",
-                "caption": (f"PRMU classes of the gold keyphrases of {ds} per "
-                            "annotation set and split (Boudin & Gallina, 2021, "
-                            "on stemmed tokens: P = the keyphrase occurs "
-                            "contiguously in the document, R = all its words "
-                            "occur but not as that sequence, M = some occur, "
-                            "U = none do).")}
+                "name": f"prmu-{ds}", "height": max(200, 44 * len(cats) + 110),
+                "caption": what + ", as 100 % stacked bars."}
+        panels = []
+        for a in rows_used:
+            for sp in cols_used:
+                c = cell.get((a, sp), {})
+                panels.append({"title": sp, "col": sp,
+                               "labels": [f"{pr} — {PRMU_NAMES[pr]}" for pr in order],
+                               "values": [int(c.get(pr, 0)) for pr in order],
+                               "colors": [PRMU_COLORS[pr] for pr in order]})
+        pies = {"kind": "pie_grid", "panels": panels, "ncols": len(cols_used),
+                "row_titles": rows_used if len(rows_used) > 1 else [],
+                "size": "2col", "name": f"prmu-{ds}",
+                "height": 90 + 230 * len(rows_used),
+                "caption": what + ", as one ring per group."}
         charts.append(ui.exportable(
-            "ds-prmu", spec,
-            ui.graph("ds-g-prmu", to_plotly(spec), max(200, 44 * len(cats) + 110)),
-            title="Keyphrase PRMU distribution"))
+            "ds-prmu", bars, title="Keyphrase PRMU distribution",
+            variants={"bars": bars, "pies": pies},
+            formats=[("bars", "Stacked bars"), ("pies", "Pies")]))
 
     # ---- keyphrase length + POS tags, split-coloured ------------------------
     rows = db.q(f"""SELECT ann_key, coalesce(split,'?'), n_words_b, sum(n)
@@ -412,15 +437,22 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
         cats = sorted({k for d in data.values() for k in d}, key=natural_key)
         # keyphrase length is in words; the tokenizer selector drives the
         # *document* length panel only
-        spec = {"kind": "bar", "barmode": "group",
-                "xlabel": f"length ({WORDS_TOK})",
+        series = _group_series(data, cats, anns, splits)
+        base = {"kind": "bar", "xlabel": f"length ({WORDS_TOK})",
                 "ylabel": "% of the group's gold", "yrange": [0, 100],
-                "series": _group_series(data, cats, anns, splits),
-                "size": "1col", "name": f"kp-length-{ds}",
-                "caption": (f"Length of the gold keyphrases of {ds} in words, per annotation set and split.")}
-        c1 = ui.exportable("ds-kplen", spec,
-                           ui.graph("ds-g-kplen", to_plotly(spec), PANEL_H),
-                           title="Keyphrase length", style={"minWidth": 0})
+                "size": "1col", "name": f"kp-length-{ds}", "height": PANEL_H}
+        what = f"Length of the gold keyphrases of {ds} in words, per annotation set and split"
+        variants = {
+            "group": dict(base, barmode="group", series=series,
+                          caption=what + ", side by side."),
+            "overlay": dict(base, barmode="overlay",
+                            series=[dict(sr, alpha=0.5) for sr in series],
+                            caption=what + ", overlaid."),
+        }
+        c1 = ui.exportable("ds-kplen", variants["group"], title="Keyphrase length",
+                           variants=variants,
+                           formats=[("group", "Side by side"), ("overlay", "Overlaid")],
+                           style={"minWidth": 0})
     rows = db.q(f"""SELECT g.ann_key, coalesce(d.split,'?'), k.pos, count(*)
                     FROM gold g
                     JOIN documents d USING (dataset, doc_id)
@@ -468,10 +500,9 @@ def _body(ds: str, ann: str, split: str | None, tok: str | None):
                          "all to include every split.",
                          className="muted small panel-note")
                 if missing else None)
-        c2 = ui.exportable("ds-pos", spec,
-                           html.Div([ui.graph("ds-g-pos", to_plotly(spec), PANEL_H),
-                                     note]),
-                           title="Keyphrase POS tags", style={"minWidth": 0})
+        c2 = ui.exportable("ds-pos", dict(spec, height=PANEL_H),
+                           title="Keyphrase POS tags", note=note,
+                           style={"minWidth": 0})
     else:
         c2 = ui.card(html.Div("No POS-tagged keyphrases here yet — install the "
                               "spaCy model for this language and re-scan, or "
@@ -736,9 +767,8 @@ def _prmu_key(marked: bool):
         *[html.Span([html.Span(c, className=f"prmu-chip prmu-{c}"),
                      f" {PRMU_NAMES[c]}"], className="prmu-key-item")
           for c in "PRMU"],
-        html.Div("Marked in the text: every occurrence of a present keyphrase"
-                 if marked else "No present keyphrase occurs in this text",
-                 className="muted small"),
+        None if marked else html.Div("No present keyphrase occurs in this text",
+                                     className="muted small"),
     ], className="prmu-key")
 
 

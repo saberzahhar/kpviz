@@ -61,7 +61,9 @@ the same view.
 **One figure, two renderers.** A workbench computes a *figure spec*, a plain
 JSON description of the chart (`figures.py`). The screen draws it with
 Plotly; an export draws the same spec with Matplotlib at the venue's real
-column width. What you download is what you saw, with fonts sized for print.
+column width, through PGF and TeX when TeX is installed. The *Paper* view
+shows that exported file, rasterised, next to the interactive figure: what
+you download is what you saw, with fonts sized for print.
 
 **Statistics are shared.** One Methods setting (tests, correction,
 intervals, resamples) applies to every workbench, its captions and its

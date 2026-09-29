@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -363,6 +364,56 @@ def fig_pdf(spec: dict) -> tuple[bytes, str, str]:
     if provisional:
         note[0] = note[0] or "TeX check still running — Matplotlib PDF for now"
     return payload, "Matplotlib", note[0]
+
+
+_RASTERIZERS = (("pdftocairo", ["-png", "-singlefile", "-r"]),
+                 ("pdftoppm", ["-png", "-singlefile", "-r"]))
+
+
+def _rasterize(pdf: bytes, dpi: int) -> bytes | None:
+    """A one-page PDF as PNG (poppler's pdftocairo or pdftoppm, else
+    Ghostscript); None when no rasteriser is installed or it fails."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="kpviz-prev-") as d:
+        src, out = os.path.join(d, "f.pdf"), os.path.join(d, "f")
+        with open(src, "wb") as fh:
+            fh.write(pdf)
+        cmds = [[tool, *args, str(dpi), src, out]
+                for tool, args in _RASTERIZERS if shutil.which(tool)]
+        gs = shutil.which("gs") or shutil.which("gswin64c")
+        if gs:
+            cmds.append([gs, "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE",
+                         "-sDEVICE=png16m", f"-r{dpi}", "-dTextAlphaBits=4",
+                         "-dGraphicsAlphaBits=4", f"-sOutputFile={out}.png", src])
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, check=True, timeout=60,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(out + ".png", "rb") as fh:
+                    return fh.read()
+            except Exception:
+                continue
+    return None
+
+
+def preview_png(spec: dict, dpi: int = 192) -> tuple[bytes, str]:
+    """(png, how it was typeset) — the figure as it will print.
+
+    With a working TeX engine the preview is the PDF that "Download PDF"
+    gives, typeset by TeX through PGF in the venue's fonts, rasterised; while
+    the TeX check runs, or without TeX or a rasteriser, it is the Matplotlib
+    rendering that the PDF then falls back to. Never waits on the probe."""
+    status, eng = tex_status()
+    if status == "ready" and eng:
+        pdf, method, _note = fig_pdf(spec)
+        if method.startswith("TeX"):
+            png = _cached(f"prev-{eng}-{dpi}", spec,
+                          lambda: _rasterize(pdf, dpi))
+            if png:
+                return png, method
+    how = ("Matplotlib (TeX check still running)" if status == "probing"
+           else "Matplotlib")
+    return fig_png(spec, dpi=dpi), how
 
 
 def fig_pgf(spec: dict) -> tuple[str | None, str]:

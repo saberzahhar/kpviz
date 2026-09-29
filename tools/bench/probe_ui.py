@@ -177,9 +177,11 @@ def main() -> int:
                 page.click("#tab-rq1" if rq != "rq1" else "#tab-rq2"),
                 page.click(f"#tab-{rq}")))
 
-        # exports on the visible workbench (rq5 is last shown)
+        # exports on the visible workbench (rq5 is last shown), from its
+        # Export menu
         page.click("#tab-rq4")
         settle(0.6)
+        page.click('[id=\'{"rq":"rq4","type":"exp-wrap"}\'] summary')
         for what in ("png", "pdf"):
             t = time.time()
             try:

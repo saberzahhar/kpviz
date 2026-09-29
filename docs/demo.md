@@ -12,15 +12,16 @@ to a room. The script uses the demo tree from
 - [ ] Warm the tokenizer cache on the demo machine (one online scan), then
       check *Overview → Engine*: every tokenizer **exact**. Offline without a
       cache, windows become flagged approximations.
-- [ ] Start with `python app.py --no-browser` and open
+- [ ] Start with `./run.sh --no-browser` and open
       `http://127.0.0.1:8050/insights?present#rq4`. Presentation mode (the
       **P** key) enlarges the page and the figures; it is remembered.
 - [ ] Pre-open one browser tab per workbench as a safety net:
       `/insights#rq1` … `/insights#rq5`.
 - [ ] Keep a run folder aside (for example one extra `num_beams` value) to
       drop into `inferences/` during step 6.
-- [ ] Check the export once: *Caption & export options → Print-size preview*.
-      Without TeX, PDF and PNG still work; PGF needs `pdflatex`.
+- [ ] Check the export once: *View → Paper* shows the figure as printed
+      (typeset by TeX when it is installed). Without TeX, PDF and PNG still
+      work; PGF needs `pdflatex`.
 - [ ] Rehearse at the projector's resolution, in presentation mode.
 
 ## The five minutes
@@ -31,7 +32,7 @@ to a room. The script uses the demo tree from
 | 0:50 | RQ3 Context windows | "A bounded input window puts gold out of reach: the gap is what truncation costs, before any model runs." | Point at the † in the table: the difference is significant after correction. |
 | 1:40 | RQ2 Data quality | "Documents whose language contradicts their card change the score." | Toggle one flag criterion. |
 | 2:20 | Datasets › a flagged document | "The marks in the text are the present gold, found exactly as the scorer finds it." | Open a document, pick a run under *Why this run scored…*: ✓/✗ per prediction, four cut-offs. |
-| 3:20 | Back to RQ4 › export | "Every figure is ready for the paper." | *Caption & export options → Print-size preview* at an ACL column, then *Download PDF*. |
+| 3:20 | Back to RQ4 › export | "Every figure is ready for the paper." | *View → Both*: the interactive figure beside the printed one; *Export → Paper: ACL*, then *PDF*. |
 | 4:10 | Overview | "And it keeps itself honest." | Drop the spare run folder in, *Scan for changes*: one new run, everything else unchanged; *Needs attention* lists what is off. |
 
 ## If something goes wrong
