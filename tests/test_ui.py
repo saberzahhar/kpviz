@@ -176,3 +176,63 @@ def test_inspector_explains_a_runs_score(app_ctx):
     out = str(_explain("kp20k", d, (m, a, r), "author").to_plotly_json())
     assert out.count("'✓'") == len(ranks)
     assert f"{len(ranks)} of" in out and "Missed gold" in out
+
+
+def _find(node, pred, out=None):
+    """Every component in a Dash tree for which pred(component) holds."""
+    out = [] if out is None else out
+    if pred(node):
+        out.append(node)
+    kids = getattr(node, "children", None)
+    for k in (kids if isinstance(kids, (list, tuple)) else [kids]):
+        if hasattr(k, "to_plotly_json"):
+            _find(k, pred, out)
+    return out
+
+
+def test_dataset_figures_offer_formats(app_ctx):
+    """Document length (overlaid, side by side, outlines), PRMU (bars,
+    pies) and keyphrase length (side by side, overlaid) each carry every
+    variant, and the export follows the one on screen."""
+    from kpviz.pages.datasets import _body
+    body = _body("kp20k", "(each)", None, None)
+    stores = {n.id["rq"]: n.data for n in _find(
+        body, lambda n: isinstance(getattr(n, "id", None), dict)
+        and n.id.get("type") == "fig-variants")}
+    assert set(stores["ds-len"]) == {"overlay", "group", "lines"}
+    assert set(stores["ds-prmu"]) == {"bars", "pies"}
+    assert set(stores["ds-kplen"]) == {"group", "overlay"}
+    assert stores["ds-len"]["overlay"]["spec"]["kind"] == "hist"
+    assert stores["ds-prmu"]["pies"]["spec"]["kind"] == "pie_grid"
+    for variants in stores.values():
+        for v in variants.values():
+            assert v["figure"]["data"] and v["spec"]["caption"]
+
+
+def test_paper_preview_and_tex_download(app):
+    """The printed figure is rendered at the venue's width with its caption,
+    and the TeX download is the figure environment the snippet copies."""
+    from kpviz.pages.datasets import _body
+    body = _body("kp20k", "(each)", None, None)
+    spec = [n.data for n in _find(
+        body, lambda n: getattr(n, "id", None) == {"type": "fig-spec", "rq": "ds-len"})][0]
+    prev = _cb(app, '"type":"exp-preview"')
+    out = prev(1, spec, "My caption.", "acl", "col", "std", "auto", "ci")
+    js = str(out.to_plotly_json())
+    assert "data:image/png;base64," in js and "My caption." in js
+    from kpviz.figures import geometry
+    w = geometry(dict(spec, export={"venue": "acl", "span": "col"}))[0]
+    assert "ACL" in js and f"{w:.2f} ×" in js and f"{w * 96:.0f}px" in js
+    dl = _cb(app, '"type":"exp-dl"')
+    from contextvars import copy_context
+    from dash._callback_context import context_value
+    from dash._utils import AttributeDict
+
+    def run():
+        context_value.set(AttributeDict(**{"triggered_inputs": [
+            {"prop_id": '{"rq":"ds-len","type":"exp-btn","what":"tex"}.n_clicks',
+             "value": 1}]}))
+        return dl([0, 0, 0, 1, 0], spec, "My caption.", None, None, None, None, None)
+    got, status = copy_context().run(run)
+    assert got["filename"].endswith(".tex") and "\\begin{figure" in got["content"]
+    assert "My caption." in got["content"] and status.startswith("Downloaded")

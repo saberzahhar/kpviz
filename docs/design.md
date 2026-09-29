@@ -66,6 +66,18 @@ stylesheet.
 
 ## Interaction
 
+- Every figure has a view switch: *Interactive*, *Paper* (the exported PDF,
+  typeset by TeX in the venue's fonts when TeX is installed, at print size
+  with its caption) or *Both* side by side. The printed view follows every
+  change of the figure, the export options and the caption; while it
+  re-renders, the previous version stays on screen, faded.
+- Figures with more than one sensible form have a format switch: document
+  lengths as overlaid or side-by-side histograms or outlines, PRMU classes
+  as stacked bars or pies, keyphrase lengths side by side or overlaid, a
+  model's scores as bars or dots. Every format comes with the page, so the
+  switch is instant; the export follows the format on screen.
+- Downloads and copies live in one *Export* menu per figure: open it, pick
+  PDF, PNG, PGF, TeX or everything as a zip.
 - Hovering a series fades the others: a model with all its runs, a split,
   or a PRMU class can be followed across a crowded figure.
 - A changed setting moves the marks to their new place (350 ms) instead of

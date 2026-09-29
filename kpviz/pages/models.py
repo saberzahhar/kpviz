@@ -7,7 +7,6 @@ from dash import Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 
 from .. import db, scanner, ui
-from ..figures import to_plotly
 from ..metrics import run_scores
 from ..naming import arch_label, natural_key, window_str
 from ..util import UNIT_HEAD, fmt_num, human_cost, human_count
@@ -193,27 +192,34 @@ def _quality_glance(model):
                        "hover": [f"{lab}<br>{d}: F1@O = {per_ds[d]:.3f}"
                                  for d in datasets if d in per_ds]})
     top = max(max(s_["y"]) for s_ in series)
-    spec = {"kind": "scatter", "xlabel": "dataset",
-            "ylabel": "F1@O", "series": series, "size": "2col",
+    base = {"ylabel": "F1@O", "size": "2col", "height": 340,
             # from zero, so a 0.03 gap looks like 0.03 on every model's page
             "yrange": [0, min(1.0, round(top * 1.15 + 0.005, 2)) or 1.0],
-            "xticks": {"vals": list(range(len(datasets))), "text": datasets},
-            "xrange": [-0.6, len(datasets) - 0.4],
             "legend": "right" if n > 6 else "top",
-            "name": f"quality-{model}",
-            "caption": (f"F1@O of every run of {name} per dataset, against the "
-                        "union of the dataset's annotation sets (or its only "
-                        "one), macro-averaged over documents.")}
+            "name": f"quality-{model}"}
+    what = (f"F1@O of every run of {name} per dataset, against the union of "
+            "the dataset's annotation sets (or its only one), macro-averaged "
+            "over documents")
+    dots = dict(base, kind="scatter", xlabel="dataset", series=series,
+                xticks={"vals": list(range(len(datasets))), "text": datasets},
+                xrange=[-0.6, len(datasets) - 0.4],
+                caption=what + "; one mark per run, shape = architecture.")
+    bars = dict(base, kind="bar", barmode="group", xlabel="dataset",
+                caption=what + "; one bar per run.",
+                series=[{"name": sr["name"], "color": sr["color"],
+                         "x": [d for d in datasets if d in by_run[k]],
+                         "y": [by_run[k][d] for d in datasets if d in by_run[k]],
+                         "hover": sr["hover"]}
+                        for k, sr in zip(ordered, series)])
     n_runs = len(ordered)
+    lead = html.Div(f"{n_runs} run{'s' if n_runs > 1 else ''} of {name} on "
+                    f"{len(datasets)} dataset{'s' if len(datasets) > 1 else ''} · "
+                    "macro-averaged over documents · colour = run",
+                    className="rq-head")
     return ui.exportable(
-        "md-quality", spec,
-        html.Div([html.Div(f"{n_runs} run{'s' if n_runs > 1 else ''} of {name} on "
-                           f"{len(datasets)} dataset{'s' if len(datasets) > 1 else ''} · "
-                           "macro-averaged over documents · colour = run, "
-                           "shape = architecture", className="rq-head"),
-                  ui.graph("md-quality", to_plotly(spec), 320)],
-                 role="figure", **{"aria-label": f"F1@O of every run of {name}"}),
-        title="How it scores — F1@O per dataset")
+        "md-quality", bars, title="How it scores — F1@O per dataset",
+        variants={"bars": bars, "dots": dots},
+        formats=[("bars", "Bars"), ("dots", "Dots")], lead=lead)
 
 
 def _body(model):

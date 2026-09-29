@@ -311,7 +311,8 @@ def _bar_gap(spec: dict) -> float:
     key = "y" if horiz else "x"
     cats = {c for s_ in spec.get("series", []) for c in s_.get(key, [])}
     n_cat = max(1, len(cats))
-    n_ser = 1 if spec.get("barmode") == "stack" else max(1, len(spec.get("series", [])))
+    n_ser = (1 if spec.get("barmode") in ("stack", "overlay")
+             else max(1, len(spec.get("series", []))))
     width = 480.0 if spec.get("size") == "1col" else 1000.0
     if horiz:
         width = 26.0 * n_cat * n_ser / 0.65      # rows get the height they need
@@ -407,6 +408,13 @@ def _plotly_layout(spec: dict) -> dict:
         lay["xaxis"]["range"] = spec["xrange"]
     if spec.get("yrange"):
         lay["yaxis"]["range"] = spec["yrange"]
+    if kind == "hist":
+        # bins touch when overlaid (one shape per split, seen through each
+        # other); side by side, each bin holds one thin bar per split
+        overlay = spec.get("histmode", "overlay") == "overlay"
+        lay["barmode"] = "overlay" if overlay else "group"
+        lay["bargap"] = 0.04 if overlay else 0.16
+        lay["bargroupgap"] = 0.0 if overlay else 0.08
     if kind == "bar":
         lay["barmode"] = spec.get("barmode", "group")
         lay["bargap"] = _bar_gap(spec)
@@ -593,6 +601,21 @@ def to_plotly(spec: dict) -> go.Figure:
         common = dict(name=s.get("name", ""),
                       showlegend=bool(s.get("in_legend", True)) and not items)
         hover = s.get("hover")
+        if kind == "hist":
+            col = s.get("color", "#2a78d6")
+            overlay = spec.get("histmode", "overlay") == "overlay"
+            bw = spec.get("bin_width")
+            fig.add_trace(go.Bar(
+                x=s["x"], y=s["y"],
+                width=(bw if overlay and bw else None),
+                marker=dict(color=_rgba(col, 0.38) if overlay else col,
+                            line=dict(color=col, width=1.4 if overlay else 0)),
+                customdata=hover,
+                hovertemplate=("%{customdata}<extra></extra>" if hover
+                               else "%{x}: %{y:.2f}<extra>"
+                               + s.get("name", "") + "</extra>"),
+                **common))
+            continue
         if kind == "bar":
             horiz = spec.get("orientation") == "h"
             fig.add_trace(go.Bar(
@@ -714,6 +737,14 @@ def plotly_config(name: str = "kpviz") -> dict:
     legend on hover). Double-click still resets a zoom."""
     return {"displaylogo": False, "displayModeBar": False,
             "scrollZoom": False, "doubleClick": "reset"}
+
+
+def _rgba(h: str, a: float) -> str:
+    """"#2a78d6", 0.4 -> "rgba(42,120,214,0.4)" (a fill that shows what is
+    behind it, under an opaque outline of the same hue)."""
+    h = h.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{a:g})"
 
 
 def _ramp_at(stops: list[str], t: float) -> str:
@@ -1041,6 +1072,29 @@ def to_mpl(spec: dict, pgf: bool = False):
             ax.invert_yaxis()
             ax.grid(axis="y", visible=False)
             _legend(ax, spec, len(points), (0, 1.12), min(3, len(points)))
+        elif kind == "hist":
+            series = spec.get("series", [])
+            bw = float(spec.get("bin_width") or 1.0)
+            overlay = spec.get("histmode", "overlay") == "overlay"
+            n = max(1, len(series))
+            for si, s in enumerate(series):
+                xs = [_num(v) for v in s["x"]]
+                ys = [_num(v) for v in s["y"]]
+                col = s.get("color", "#2a78d6")
+                if overlay:
+                    ax.bar(xs, ys, width=bw, color=col, alpha=0.38,
+                           linewidth=0, label=s.get("name", ""))
+                    edges = [x - bw / 2 for x in xs] + [xs[-1] + bw / 2] if xs else []
+                    if xs:
+                        ax.stairs(ys, edges, color=col, lw=0.9)
+                else:
+                    w = bw * 0.84 / n
+                    offs = [x - bw * 0.42 + w * (si + 0.5) for x in xs]
+                    ax.bar(offs, ys, width=w * 0.9, color=col, linewidth=0,
+                           label=s.get("name", ""))
+            ax.grid(axis="x", visible=False)
+            if len(series) >= 2:
+                _legend(ax, spec, len(series), (0, 1.16), min(4, len(series)))
         elif kind == "bar":
             horiz = spec.get("orientation") == "h"
             cat_key, val_key = ("y", "x") if horiz else ("x", "y")
@@ -1051,11 +1105,12 @@ def to_mpl(spec: dict, pgf: bool = False):
                         cats.append(xv)
             n = max(1, len(spec.get("series", [])))
             stacked = spec.get("barmode") == "stack"
-            width = 0.72 / (1 if stacked else n)
+            overlaid = spec.get("barmode") == "overlay"
+            width = 0.72 / (1 if stacked or overlaid else n)
             bottoms = {c: 0.0 for c in cats}
             for si, s in enumerate(spec.get("series", [])):
                 pos = [cats.index(xv) for xv in s[cat_key]]
-                offs = ([p for p in pos] if stacked else
+                offs = ([p for p in pos] if stacked or overlaid else
                         [p - 0.36 + width * (si + 0.5) for p in pos])
                 bots = [bottoms[xv] for xv in s[cat_key]] if stacked else None
                 hatch = _MPL_HATCH.get(s.get("pattern", ""), None)

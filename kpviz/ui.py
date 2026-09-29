@@ -187,13 +187,60 @@ def graph(id, figure=None, height: int = 420, config: dict | None = None,
                             else {"height": f"{height}px"}))
 
 
-def export_bar(rq: str, spec: dict | None = None, caption: str | None = None,
-               primary: bool = True):
-    """One export bar per figure: the three exports people use (Download
-    PDF, Download PNG, Copy LaTeX) in view, with a status line that answers
-    every click at once; the caption, the paper and layout options, the
-    .pgf, the bundle, the LaTeX table and the print-size preview folded
-    under "Caption & export options".
+VIEWS = [("interactive", "Interactive"), ("paper", "Paper"), ("both", "Both")]
+
+
+def segmented(id, options, value, persist: bool = True):
+    """A small segmented control (RadioItems drawn as one row of buttons),
+    remembered per browser."""
+    return dcc.RadioItems(id=id, value=value, inline=True,
+                          options=[{"label": lab, "value": v} for v, lab in options],
+                          className="segmented seg-sm",
+                          **({"persistence": True, "persistence_type": "local"}
+                             if persist else {}))
+
+
+def fig_controls(key: str, formats: list | None = None,
+                 default: str | None = None):
+    """Top-right of a figure card: the figure's format (when it has more
+    than one) and the view — interactive, as printed (Paper), or both side
+    by side."""
+    kids = []
+    if formats and len(formats) > 1:
+        kids.append(html.Div(
+            segmented({"type": "fig-format", "rq": key}, formats,
+                      default or formats[0][0]),
+            className="seg-group", role="group", title="Figure format",
+            **{"aria-label": "Figure format"}))
+    kids.append(html.Div(
+        segmented({"type": "fig-view", "rq": key}, VIEWS, "interactive"),
+        className="seg-group", role="group",
+        title="Interactive figure, the figure as printed, or both",
+        **{"aria-label": "View"}))
+    return html.Div(kids, className="fig-controls")
+
+
+def figure_frame(key: str, screen):
+    """The interactive figure and, beside or instead of it, the figure as it
+    will print (appfactory renders it when the view asks for it, and while
+    a new rendering is on its way the previous one stays, faded)."""
+    paper = dcc.Loading(
+        html.Div(html.Div("Typesetting the figure…", className="muted small"),
+                 id={"type": "exp-preview", "rq": key}, className="paper-view"),
+        delay_show=0, type="dot", color="#2a78d6",
+        overlay_style={"visibility": "visible", "opacity": 0.35})
+    return html.Div([
+        dcc.Store(id={"type": "exp-want", "rq": key}),
+        html.Div(screen, className="fig-screen"),
+        html.Div(paper, className="fig-paper"),
+    ], id={"type": "fig-frame", "rq": key}, className="fig-frame view-interactive")
+
+
+def export_bar(rq: str, spec: dict | None = None, caption: str | None = None):
+    """One Export menu per figure, folded: open it, then one click on the
+    format. Inside: downloads (PDF, PNG, PGF, TeX, everything as a zip),
+    the LaTeX figure and table to copy, the paper and layout options, and
+    the caption. A status line answers every click at once.
 
     Exports use the figure as computed (the publication specification),
     not the on-screen zoom or hidden legend entries. The caption box is the
@@ -237,72 +284,97 @@ def export_bar(rq: str, spec: dict | None = None, caption: str | None = None,
                   **({"data": spec} if spec else {})),
         dcc.Store(id={"type": "cap-base", "rq": rq}),
         dcc.Download(id={"type": "exp-dl", "rq": rq}),
-        html.Div([
-            b("pdf", "Download PDF", primary=primary,
-              title="vector PDF at the paper's size, from the figure as "
-                    "computed (not the on-screen zoom)"),
-            b("png", "Download PNG", title="300 dpi PNG"),
-            clip("fig", "copy the LaTeX figure environment"),
-            html.Span(id={"type": "exp-status", "rq": rq}, className="exp-status",
-                      role="status", **{"aria-live": "polite"}),
-        ], id={"type": "exp-row", "rq": rq}, className="export-bar"),
         html.Details([
-            html.Summary("Caption & export options"),
+            html.Summary("Export", className="exp-summary"),
             html.Div([
-                html.Span("Caption", className="exp-opt-label"),
-                html.Span(id={"type": "cap-note", "rq": rq}, className="cap-note",
+                html.Div([
+                    html.Span("Download", className="exp-group-label"),
+                    b("pdf", "PDF", primary=True,
+                      title="vector PDF at the paper's size, from the figure "
+                            "as computed (not the on-screen zoom)"),
+                    b("png", "PNG", title="300 dpi PNG"),
+                    b("pgf", "PGF", title="PGF picture, typeset by your paper"),
+                    b("tex", "TeX", title="the LaTeX figure environment (and "
+                                          "the table) as a .tex file"),
+                    b("zip", "All (.zip)",
+                      title="PDF + PGF + PNG + .tex + data + provenance"),
+                    html.Span("Copy", className="exp-group-label"),
+                    clip("fig", "copy the LaTeX figure environment"),
+                    clip("tab", "copy the booktabs table"),
+                ], className="export-bar"),
+                html.Span(id={"type": "exp-status", "rq": rq}, className="exp-status",
                           role="status", **{"aria-live": "polite"}),
-                html.Button("Restore the generated caption",
-                            id={"type": "cap-reset", "rq": rq},
-                            className="btn small ghost", n_clicks=0),
-            ], className="cap-head"),
-            caption_editor(rq, caption or ""),
-            html.Div([
-                opt("venue", "Paper", [{"label": v["label"], "value": k}
-                                       for k, v in VENUES.items()], "generic", 250),
-                opt("span", "Width", [{"label": "as designed", "value": "auto"},
-                                      {"label": "one column", "value": "col"},
-                                      {"label": "full text width", "value": "full"}],
-                    "auto", 150),
-                opt("height", "Height", [{"label": "compact", "value": "compact"},
-                                         {"label": "standard", "value": "std"},
-                                         {"label": "tall", "value": "tall"}],
-                    "std", 115),
-                opt("legend", "Legend", [{"label": "auto", "value": "auto"},
-                                         {"label": "above", "value": "top"},
-                                         {"label": "right", "value": "right"},
-                                         {"label": "none (in caption)", "value": "none"}],
-                    "auto", 150),
-                opt("cells", "Table cells", [
-                    {"label": "value", "value": "value"},
-                    {"label": "value [CI]", "value": "ci"},
-                    {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
-            ], className="exp-opts"),
-            html.Div([
-                clip("tab", "copy the booktabs table"),
-                b("pgf", "Download .pgf", title="PGF picture, typeset by your paper"),
-                b("zip", "Download all formats",
-                  title="PDF + PGF + PNG + .tex + data + provenance"),
-                html.Button("Print-size preview", id={"type": "exp-prev", "rq": rq},
-                            className="btn small ghost", n_clicks=0,
-                            title="Show the exported figure at its printed size"),
-            ], className="export-bar"),
-            html.Div(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
-        ], className="exp-more"),
-        loading(html.Div(id={"type": "exp-preview", "rq": rq},
-                         className="exp-preview")),
+                html.Div([
+                    opt("venue", "Paper", [{"label": v["label"], "value": k}
+                                           for k, v in VENUES.items()], "generic", 250),
+                    opt("span", "Width", [{"label": "as designed", "value": "auto"},
+                                          {"label": "one column", "value": "col"},
+                                          {"label": "full text width", "value": "full"}],
+                        "auto", 150),
+                    opt("height", "Height", [{"label": "compact", "value": "compact"},
+                                             {"label": "standard", "value": "std"},
+                                             {"label": "tall", "value": "tall"}],
+                        "std", 115),
+                    opt("legend", "Legend", [{"label": "auto", "value": "auto"},
+                                             {"label": "above", "value": "top"},
+                                             {"label": "right", "value": "right"},
+                                             {"label": "none (in caption)", "value": "none"}],
+                        "auto", 150),
+                    opt("cells", "Table cells", [
+                        {"label": "value", "value": "value"},
+                        {"label": "value [CI]", "value": "ci"},
+                        {"label": "value [CI] (n)", "value": "ci_n"}], "ci", 140),
+                ], className="exp-opts"),
+                html.Div([
+                    html.Span("Caption", className="exp-opt-label"),
+                    html.Span(id={"type": "cap-note", "rq": rq}, className="cap-note",
+                              role="status", **{"aria-live": "polite"}),
+                    html.Button("Restore the generated caption",
+                                id={"type": "cap-reset", "rq": rq},
+                                className="btn small ghost", n_clicks=0),
+                ], className="cap-head"),
+                caption_editor(rq, caption or ""),
+                html.Div(hint, id={"type": "exp-hint", "rq": rq}, className="hint"),
+            ], className="exp-body"),
+        ], className="exp-menu"),
     ], id={"type": "exp-wrap", "rq": rq}, className="exp-wrap")
 
 
-def exportable(key: str, spec: dict, graph_component, title: str | None = None,
-               **card_kw):
-    """A card holding a figure drawn once (not by a workbench callback) with
-    its export bar (caption and options folded; its PDF button is not the
-    page's primary action)."""
-    return card([graph_component,
-                 export_bar(key, spec, caption=spec.get("caption", ""),
-                            primary=False)],
-                title=title, **card_kw)
+def exportable(key: str, spec: dict, title: str | None = None,
+               height: int = 420, variants: dict | None = None,
+               formats: list | None = None, note=None, lead=None, **card_kw):
+    """A card holding a figure drawn once (not by a workbench callback):
+    its title and controls, an optional scope line (`lead`), the figure
+    (interactive, as printed, or both), an optional note, and its Export
+    menu.
+
+    `variants` maps a format to its spec ({"overlay": spec, "group": …});
+    `formats` lists (format, label) in display order, the first being the
+    default. Switching format happens in the browser (every variant is
+    computed with the page), and the export follows the format shown."""
+    from .figures import to_plotly
+
+    def fig(sp):
+        f = to_plotly(sp)
+        if sp.get("height"):
+            f.update_layout(height=sp["height"])
+        return f.to_plotly_json()
+    store = None
+    if variants and formats:
+        spec = variants[formats[0][0]]
+        drawn = {k: {"figure": fig(sp), "spec": sp} for k, sp in variants.items()}
+        store = dcc.Store(id={"type": "fig-variants", "rq": key}, data=drawn)
+        first = drawn[formats[0][0]]["figure"]
+    else:
+        first = fig(spec)
+    screen = graph({"type": "fig-graph", "rq": key}, first,
+                   spec.get("height") or height, grow=True)
+    head = html.Div([html.Div(title or "", className="card-title"),
+                     fig_controls(key, formats if variants else None)],
+                    className="card-head")
+    return card([store, head, lead, figure_frame(key, screen), note,
+                 export_bar(key, spec, caption=spec.get("caption", ""))],
+                **card_kw)
 
 
 def caption_editor(rq: str, initial: str = ""):

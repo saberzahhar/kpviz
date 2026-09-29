@@ -493,12 +493,19 @@ def figure_block(rq: str, height: int = 470, with_table: bool = True,
     tab, which view is already on screen."""
     kids = [
         dcc.Store(id={"type": "fig-sig", "rq": rq}),
-        html.H3(title, className="panel-title") if title else None,
-        html.Div(id={"type": "rq-head", "rq": rq}, className="rq-head"),
-        html.Div(ui.loading(ui.graph({"type": "rq-graph", "rq": rq},
-                                     height=height, grow=True)),
-                 id={"type": "rq-gwrap", "rq": rq}, role="figure",
-                 **{"aria-label": label or title or "figure"}),
+        # a titled panel: title and controls, then the scope line; untitled:
+        # the scope line itself sits beside the controls
+        *([html.Div([html.H3(title, className="panel-title"), ui.fig_controls(rq)],
+                    className="card-head"),
+           html.Div(id={"type": "rq-head", "rq": rq}, className="rq-head")]
+          if title else
+          [html.Div([html.Div(id={"type": "rq-head", "rq": rq}, className="rq-head"),
+                     ui.fig_controls(rq)], className="card-head card-head-scope")]),
+        ui.figure_frame(rq, html.Div(
+            ui.loading(ui.graph({"type": "rq-graph", "rq": rq},
+                                height=height, grow=True)),
+            id={"type": "rq-gwrap", "rq": rq}, role="figure",
+            **{"aria-label": label or title or "figure"})),
         ui.export_bar(rq),
     ]
     if with_table:

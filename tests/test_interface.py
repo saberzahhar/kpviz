@@ -197,3 +197,24 @@ def test_point_labels_avoid_interval_whiskers():
     assert _overlap(box("middle right"), whisker) > 0      # the trap is real
     chosen = place_labels(spec)[(1, 0)]
     assert _overlap(box(chosen), whisker) == 0, chosen
+
+
+# ---------------------------------------------------------------- formats
+def test_histogram_and_overlay_formats_render_on_screen_and_paper():
+    """Overlaid and side-by-side histograms, and overlaid bars, draw in both
+    renderers (the screen and the exported file are one spec)."""
+    from kpviz.figures import render, to_plotly
+    series = [{"name": "training", "x": [10, 20, 30], "y": [20, 50, 30],
+               "color": "#1a9e8f"},
+              {"name": "testing", "x": [10, 20, 30], "y": [30, 40, 30],
+               "color": "#5b50c8"}]
+    for mode in ("overlay", "group"):
+        spec = {"kind": "hist", "histmode": mode, "bin_width": 10,
+                "series": series, "size": "2col", "xlabel": "words"}
+        fig = to_plotly(spec)
+        assert fig.layout.barmode == mode and len(fig.data) == 2
+        assert render(spec, False, "png").startswith(b"\x89PNG")
+    bars = {"kind": "bar", "barmode": "overlay", "size": "1col",
+            "series": [dict(s, x=["1", "2", "3"], alpha=0.5) for s in series]}
+    assert to_plotly(bars).layout.barmode == "overlay"
+    assert render(bars, False, "png").startswith(b"\x89PNG")
