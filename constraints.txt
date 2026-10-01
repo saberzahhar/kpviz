@@ -21,7 +21,7 @@ srsly==2.5.3
 thinc==8.3.13
 tiktoken==0.14.0
 tokenizers==0.23.2
-Werkzeug==3.1.8
+Werkzeug==3.1.9
 # development
 pyflakes==4.0.0
 psutil==7.2.2
